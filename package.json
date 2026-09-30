@@ -6,10 +6,10 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Veasna-Pen/Deployment-Master.git"
+    "url": "git+https://github.com/Veasna-Pen/icestack-dev.git"
   },
   "bugs": {
-    "url": "https://github.com/Veasna-Pen/Deployment-Master/issues"
+    "url": "https://github.com/Veasna-Pen/icestack-dev/issues"
   },
   "keywords": [
     "engineering-decisions",

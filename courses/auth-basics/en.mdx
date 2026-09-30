@@ -1,0 +1,23 @@
+---
+title: "Authentication basics"
+summary: "How a web app knows who is calling it: sessions and tokens, storing passwords safely, logging users out, and the CORS errors you meet when a frontend calls your API."
+level: beginner
+order: 6
+outcomes:
+  - "Choose between server sessions and JWTs for your app"
+  - "Store passwords so a database leak doesn't reveal them"
+  - "Log users out and revoke access, even with JWTs"
+  - "Read a CORS error and fix it without opening your API to everyone"
+prerequisites:
+  - "You have built a web page with a login form, or an API with a login endpoint"
+  - "You know what cookies and HTTP headers are"
+related: [tradeoffs/jwt-vs-session-tokens, problems/jwt-revocation, problems/cors-errors-in-production, patterns/rate-limiting]
+updated: "2026-09-30"
+contributors: [Veasna-Pen]
+---
+
+Almost every app needs a login, and almost every team copies the first tutorial they find. That is how apps end up storing passwords with a fast hash, issuing tokens that can't be revoked, or "fixing" CORS by allowing every website to call the API with the user's cookies.
+
+This course covers the basics you need to make those choices on purpose. You learn how a server **remembers** a logged-in user, how to **store passwords**, how to **log someone out** for real, and what **CORS** is actually protecting.
+
+It is not a complete security course. For a production system, also use a well-maintained auth library or provider, and follow the OWASP guidance for your stack.

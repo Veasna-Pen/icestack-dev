@@ -1,0 +1,160 @@
+---
+title: "Strong vs Eventual Consistency"
+question: "When must distributed systems guarantee linearizable Strong Consistency versus scalable Eventual Consistency?"
+summary: "Strong Consistency ensures every read receives the most recent write, essential for financial balances and inventory reservation at the cost of higher latency and lower availability. Eventual Consistency guarantees convergence over time (milliseconds to seconds), unlocking massive horizontal scale and continuous availability."
+tags: [distributed-systems, cap-theorem, database, consistency, architecture]
+related: [tradeoffs/sql-vs-nosql, problems/replication-lag, patterns/cqrs]
+order: 13
+updated: "2026-09-12"
+contributors: [veasna]
+---
+
+## Context
+
+In a single-node database, consistency is straightforward: transactions are serialized (ACID), and every reader sees committed writes immediately.
+
+In modern distributed systems (multi-region clusters, read replicas, NoSQL databases, microservices), data is replicated across multiple independent physical machines across the globe. Under Eric Brewer's **CAP Theorem**, when network delays or partitions occur between nodes, a system must choose between:
+1. **Strong Consistency (Linearizability):** Every read across every node is guaranteed to return the most recent write. If nodes cannot communicate, writes or reads are rejected to prevent reading stale data (CP system).
+2. **Eventual Consistency:** Nodes accept reads and writes independently. Updates propagate asynchronously across replicas. In the short term, nodes may return stale data; given enough time without new updates, all replicas converge to identical state (AP system).
+
+Choosing Strong Consistency everywhere severely bottlenecks throughput and increases latency across global networks. Conversely, choosing Eventual Consistency for financial transactions creates catastrophic accounting discrepancies.
+
+## Symptoms
+
+- **Eventual Consistency Pitfall:** A customer transfers money, refreshes their profile page, and sees their old balance, triggering panic and repeated duplicate transfer clicks.
+- **Strong Consistency Pitfall:** A cross-region database cluster experiences a transient transatlantic network blip; instead of serving read-only catalog pages, the entire global e-commerce website displays HTTP 500 error pages.
+- Distributed locks or multi-region two-phase commit (2PC) transactions introduce 300 ms of latency to every user interaction.
+
+<Callout type="warning" title="Consistency is a spectrum, not a binary choice">
+Most production architectures are hybrid: use Strong Consistency for the single critical write transaction (deducting stock), and Eventual Consistency for broad downstream views (search indexes, recommendation carousels, email receipts).
+</Callout>
+
+## Diagnose
+
+1. **Map business cost of staleness:** If a user reads data that is 500 milliseconds out of date, does the business lose money, or is it merely cosmetic?
+2. **Evaluate geographical distribution:** Are your users and database nodes distributed across multiple continents (where light traveling through fiber optics imposes a minimum 70–150 ms latency penalty per cross-region consensus round)?
+3. **Audit read-your-own-writes expectations:** Do users update a record and immediately get redirected to a view displaying that exact update?
+4. **Inspect partition handling:** When AWS availability zones experience network degradation, must your service stay 100% available for reads?
+
+## Options
+
+1. **Linearizable Strong Consistency (Spanner, CockroachDB, Postgres Master):** Raft/Paxos consensus or single primary node. Every read is guaranteed to reflect the absolute latest committed state.
+2. **Read-Your-Own-Writes (Causal Consistency):** A user is guaranteed to see their own edits immediately, while other users converge eventually.
+3. **Eventual Consistency (DynamoDB, Cassandra, Read Replicas):** Replicas synchronize asynchronously. Reads are served locally in < 2 ms from the nearest replica.
+4. **Monotonic Read Consistency:** Guarantees that once a reader sees a certain version of data, they will never see an older version on subsequent requests.
+
+## Trade-offs
+
+| Dimension | Strong Consistency (CP) | Eventual Consistency (AP) | Causal / Session Consistency |
+| :--- | :--- | :--- | :--- |
+| **Read Latency** | Higher (quorum or primary hit) | **Ultra-fast (< 2 ms local)** | Fast |
+| **Write Latency** | Higher (synchronous quorum) | **Fast (local commit)** | Moderate |
+| **Availability During Network Partition** | Rejects requests (safe) | **100% Available (serves stale)** | High |
+| **Horizontal Scale** | Limited by consensus coordinator | **Infinite (sharded replicas)** | High |
+| **User Experience (UX)** | No stale UI surprises | Requires optimistic UI | **Optimal (user sees own edits)** |
+| **System Complexity** | Simpler mental model | Complex (conflict resolution, CRDTs) | Moderate |
+
+## Decision
+
+- **Mandate Strong Consistency for:**
+  - Financial balances, bank transfers, payment authorization.
+  - Inventory reservation for low-stock items (preventing overselling).
+  - User authentication credentials, password resets, access revocation.
+  - Primary key uniqueness constraints and sequential counter allocation.
+- **Embrace Eventual Consistency for:**
+  - Social media feeds, likes, comments, and follower counts.
+  - Full-text search indexes (Elasticsearch/Typesense).
+  - Product recommendation carousels and user reviews.
+  - Analytical dashboards, logging, and historical reporting.
+- **Implement "Read-Your-Own-Writes" for hybrid UX:** When a user updates their profile, save the write timestamp in a cookie or session token. If the user requests their profile within 5 seconds, route the read to the primary database; for all other reads, route to the eventual read replica.
+
+## Implementation
+
+### 1. Hybrid Read-Your-Own-Writes Router in TypeScript:
+
+```typescript
+import { Request, Response, NextFunction } from 'express';
+import { primaryDb, replicaDb } from './database';
+
+export function getDatabaseForRequest(req: Request) {
+  const lastWriteTimestamp = req.cookies['last_write_at'];
+
+  if (lastWriteTimestamp) {
+    const elapsedSeconds = (Date.now() - parseInt(lastWriteTimestamp, 10)) / 1000;
+    // If user wrote to the system within the last 5 seconds, route to Primary to avoid replication lag
+    if (elapsedSeconds < 5) {
+      console.log(`[DB Router] Routing to PRIMARY (user wrote ${elapsedSeconds.toFixed(1)}s ago)`);
+      return primaryDb;
+    }
+  }
+
+  // Otherwise, route to fast read replica (Eventual Consistency)
+  return replicaDb;
+}
+
+export async function handleUpdateProfile(req: Request, res: Response) {
+  // 1. Write strictly to Primary DB
+  await primaryDb.query('UPDATE profiles SET bio = $1 WHERE user_id = $2', [req.body.bio, req.user.id]);
+
+  // 2. Set cookie indicating recent write
+  res.cookie('last_write_at', Date.now().toString(), { httpOnly: true, maxAge: 10000 });
+
+  return res.json({ success: true });
+}
+```
+
+### 2. DynamoDB Strong vs Eventual Consistency Toggle:
+
+```typescript
+import { DynamoDBClient, GetItemCommand } from '@aws-sdk/client-dynamodb';
+
+const client = new DynamoDBClient({});
+
+export async function fetchAccountBalance(accountId: string) {
+  // Strong Consistency: Guarantees latest balance at 2x read capacity cost
+  return await client.send(
+    new GetItemCommand({
+      TableName: 'Accounts',
+      Key: { id: { S: accountId } },
+      ConsistentRead: true, // Strong Consistency enabled
+    })
+  );
+}
+
+export async function fetchPublicReviews(productId: string) {
+  // Eventual Consistency: Half the cost, ultra-low latency, acceptable 200ms lag
+  return await client.send(
+    new GetItemCommand({
+      TableName: 'Reviews',
+      Key: { productId: { S: productId } },
+      ConsistentRead: false, // Eventual Consistency
+    })
+  );
+}
+```
+
+## Verification
+
+1. **Replication lag measurement:** Continuously write timestamp records to primary DB and measure time until visible on read replica (`lag_ms = replica.timestamp - primary.timestamp`).
+2. **Read-your-own-writes test:** Update a user profile via API and immediately issue a GET request. Verify that the response contains the updated data 100% of the time.
+3. **Partition resilience test:** Simulate a network partition on read replicas. Verify that write transactions on the primary database continue to succeed without deadlocks.
+
+## Why
+
+The speed of light in optical fiber is roughly 200,000 km/s. It is a fundamental law of physics that coordinating state across continents takes real time (tens to hundreds of milliseconds).
+
+- If you demand **Strong Consistency**, you must pay the latency tax of waiting for distant nodes to acknowledge the write before continuing.
+- If you accept **Eventual Consistency**, you decouple local execution from global coordination, enabling applications to deliver lightning-fast responses from edge nodes anywhere on Earth.
+
+Architecting high-scale systems requires distinguishing between operations that legally require immediate truth and operations where eventual convergence is completely acceptable.
+
+## When Not To Use
+
+- **Eventual consistency for airline seat booking:** If two users can both reserve seat 14B because the inventory was eventually consistent, your customer support team will spend hours resolving physical conflicts at the airport gate.
+- **Strong consistency for global video streaming view counts:** Halting video playback because a view count in Tokyo has not synced with a server in Frankfurt is absurd engineering.
+
+## Common Mistakes
+
+- **Assuming read replicas are strongly consistent:** Pointing user-facing profile reads directly to a standard MySQL/PostgreSQL read replica without session stickiness will cause users to see stale data right after saving.
+- **Blindly selecting DynamoDB default reads:** DynamoDB defaults to `ConsistentRead: false`. If developers forget to set `ConsistentRead: true` for balance checks, race conditions will occur.
+- **All-or-nothing thinking:** Demanding that the entire system be 100% strongly consistent or 100% eventually consistent. Pragmatic architectures apply strong consistency to writes and bounded eventual consistency to reads.

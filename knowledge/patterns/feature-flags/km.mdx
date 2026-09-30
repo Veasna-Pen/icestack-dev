@@ -1,0 +1,180 @@
+---
+title: "Feature Flags"
+question: "តើខ្ញុំអាចបំបែកការ Deploy កូដចេញពីការបើកដំណើរការមុខងារ (Release) ធ្វើតេស្តក្នុង Production និងបើកសាកល្បងជាភាគរយ (Canary Rollout) យ៉ាងដូចម្តេច?"
+summary: "ស្រោបមុខងារថ្មី ឬការកែប្រែស្ថាបត្យកម្មក្នុងលក្ខខណ្ឌ Conditional Toggles នៅពេល Runtime។ Deploy កូដដែលមិនទាន់ដំណើរការទៅកាន់ Production ដោយសុវត្ថិភាព ធ្វើតេស្តជាមួយបុគ្គលិកផ្ទៃក្នុង បើកឱ្យអ្នកប្រើប្រាស់តាមភាគរយ (Canary) និងបិទត្រឡប់ក្រោយភ្លាមៗក្នុងពេល ០ វិនាទីដោយមិនបាច់ Deploy កូដឡើងវិញ។"
+tags: [devops, feature-flags, canary, continuous-delivery, deployment]
+related: [patterns/circuit-breaker, patterns/strangler-fig, problems/slow-first-request]
+order: 17
+updated: "2026-09-12"
+contributors: [veasna]
+translation: draft
+---
+
+## Context
+
+នៅក្នុងដំណើរការអភិវឌ្ឍន៍ Software បែបប្រពៃណី ការបញ្ចេញមុខងារថ្មី (Release) តែងតែជាប់ជំពាក់យ៉ាងស្អិតរមួតជាមួយការ Deploy កូដទៅកាន់ Server។ ប្រសិនបើមុខងារ Checkout ថ្មីមានបញ្ហា Bug ដែលមិនបានរំពឹងទុក ការ Rollback តម្រូវឱ្យមានការ Compile កូដឡើងវិញ, រត់ CI/CD Pipeline, បង្កើត Docker Image, និងធ្វើ Rolling Deployment ដែលចំណាយពេលពី ១៥ ទៅ ៤៥ នាទីអំឡុងពេលប្រព័ន្ធកំពុងដាច់។
+
+លើសពីនេះទៅទៀត Git Feature Branches តែងតែបើកចោលរាប់សប្តាហ៍ដោយមិនហ៊ាន Merge ចូល `main` ព្រោះខ្លាចប៉ះពាល់ Production ដែលនាំឱ្យជួបបញ្ហា "Merge Hell" និង Conflict កូដយ៉ាងឈឺក្បាល។
+
+**Feature Flags (Feature Toggles)** បំបែកការ **Deploy** (ការរុញកូដទៅលើ Server) ចេញពីការ **Release** (ការបើកឱ្យអ្នកប្រើប្រាស់មើលឃើញ)។ តាមរយៈការស្រោបកូដថ្មីក្នុងលក្ខខណ្ឌ Runtime ដែលផ្ទៀងផ្ទាត់ជាមួយ User Context (User ID, Email, ភាគរយ Cohort) ក្រុមការងារអាច Merge កូដចូល `main` ជាច្រើនដងក្នុងមួយថ្ងៃ (Trunk-Based Development) ដោយមិនបាច់បារម្ភពីការលេចធ្លាយមុខងារដែលមិនទាន់រួចរាល់ឡើយ។
+
+## Symptoms
+
+- Git Feature Branches ទុកចោលរាប់សប្តាហ៍ ឬរាប់ខែមិនបាន Merge ដែលបង្កជា Merge Conflict ដ៏ធំធេងនៅពេលព្យាយាមបញ្ចូលគ្នា។
+- ការបញ្ចេញ Version ថ្មីទាមទារការធ្វើការងារនៅពាក់កណ្តាលអធ្រាត្រ ព្រោះការ Rollback ត្រូវ Deploy Container ចាស់ឡើងវិញ។
+- ក្រុមការងារមិនអាចធ្វើការសាកល្បងបែប Canary Rollout បាន (ឧ. បើកមុខងារទូទាត់ប្រាក់ថ្មីឱ្យតែ ៥% នៃអ្នកប្រើប្រាស់ដើម្បីតាមដាន Error)។
+- ការធ្វើតេស្ត Beta ទាមទារឱ្យមាន Staging Environment ធំដាច់ដោយឡែកដែលមិនដែលដូច Production ពិតប្រាកដឡើយ។
+
+<Callout type="warning" title="Feature Flags ចាស់ៗដែលមិនព្រមលុបក្លាយជាបំណុលបច្ចេកទេស (Technical Debt)">
+ប្រសិនបើ Flag មិនត្រូវបានលុបចោលក្រោយពេលបើកដល់ 100% ទេ Codebase របស់អ្នកនឹងពោរពេញទៅដោយលក្ខខណ្ឌ `if/else` ស្មុគស្មាញដែលពិបាកធ្វើតេស្ត និងបង្កការភ័ន្តច្រឡំដល់អ្នកសរសេរកូដជំនាន់ក្រោយ។
+</Callout>
+
+## Diagnose
+
+1. **គណនាអាយុកាលរបស់ Git Branch៖** តើរយៈពេលមធ្យមនៃ Pull Requests ដែលបើកចោលមានរយៈពេលប៉ុន្មាន? តើ Branch ទុកចោលលើសពី ៣ ថ្ងៃដែរឬទេ?
+2. **វាស់វែងរយៈពេល Rollback (MTTR)៖** ប្រសិនបើប្រទះឃើញ Bug ធ្ងន់ធ្ងរក្នុង Production ឥឡូវនេះ តើត្រូវចំណាយពេលប៉ុន្មាននាទីទើបអាច Revert ប្រព័ន្ធត្រឡប់មកវិញបាន?
+3. **ពិនិត្យមើលភាពខុសគ្នានៃ Staging និង Production៖** តើ Bug តែងតែលេចធ្លាយចូល Production ព្រោះតែ Staging គ្មានទិន្នន័យពិត និងទំហំផ្ទុកដូច Production មែនទេ?
+4. **វាយតម្លៃសមត្ថភាពកំណត់គោលដៅអ្នកប្រើប្រាស់ (User Targeting)៖** តើក្រុមការងារអាចបើកមុខងារថ្មីឱ្យតែបុគ្គលិកផ្ទៃក្នុង `@mycompany.com` ប្រើប្រាស់សាកល្បងមុនគេបានដែរឬទេ?
+
+## Options
+
+1. **Environment Variables / ConfigMaps៖** បង្កើត Flag ជា Boolean ក្នុង `.env` ឬ Kubernetes ConfigMap។ (ទាមទារការ Restart Pod ដើម្បីផ្លាស់ប្តូរ និងមិនអាចកំណត់តាម User ជាក់លាក់បានឡើយ)។
+2. **តារាង Feature Flag ក្នុង Database៖** រក្សាទុក Flag ក្នុង PostgreSQL ឬ Redis។ (អាចកែប្រែភ្លាមៗបាន ប៉ុន្តែការ Query DB លើរាល់ Request បន្ថែម Latency ដល់ប្រព័ន្ធ)។
+3. **In-Memory Flag Client ជាមួយ Background Polling/Streaming (LaunchDarkly, Unleash, Flipt)៖** គណនាលក្ខខណ្ឌ Flag ក្នុង Memory ម៉ាស៊ីនក្នុងពេល < 1 microsecond។ ការផ្លាស់ប្តូរត្រូវបាន Update ពីខាងក្រោយតាមរយៈ Server-Sent Events (SSE)។
+4. **Percentage-based Deterministic Hashing៖** ប្រើការ Hash User ID ជាមួយឈ្មោះ Flag (`crc32(userId + flagKey) % 100 < percentage`) ដើម្បីធានាថា User ម្នាក់ៗនៅតែទទួលបានលទ្ធផលដដែលជានិច្ចដោយមិនបាច់កត់ត្រា State ក្នុង Database។
+
+## Trade-offs
+
+| វិធីសាស្ត្រ | រយៈពេល Update | ការកំណត់គោលដៅ User | ល្បឿនដំណើរការ | បន្ទុកប្រតិបត្តិការ |
+| :--- | :--- | :--- | :--- | :--- |
+| **Environment Variables** | យឺត (ត្រូវ Restart App) | គ្មាន (បើកទាំងអស់ ឬបិទទាំងអស់) | ភ្លាមៗ (ក្នុង RAM) | ទាបបំផុត |
+| **តារាងក្នុង Database** | ភ្លាមៗ | គាំទ្រ | យឺត (Query DB រាល់ Request) | ទាប |
+| **In-Memory SDK (ទំនើប)** | ភ្លាមៗ (< ២ វិនាទី) | សម្បូរបែប (Cohorts, ភាគរយ) | លឿនបំផុត (< 1 µs) | មធ្យម |
+| **Client-Side Storage** | យឺត (ទាល់តែ Refresh) | កម្រិតម៉ាស៊ីនផ្ទាល់ | ភ្លាមៗ | ទាប |
+
+## Decision
+
+- **គណនាលក្ខខណ្ឌ Flag ក្នុង Local Memory ជានិច្ច៖** ហាម Query Database ឬហៅ HTTP Request ទៅក្រៅអំឡុងពេល User កំពុងរង់ចាំ Request ជាដាច់ខាត។ ត្រូវរក្សាទុកច្បាប់ Flag ក្នុង Memory ហើយធ្វើសមកាលកម្ម (Sync) ពីខាងក្រោយ។
+- **ប្រើ Deterministic Hashing សម្រាប់ការបើកសាកល្បងតាមភាគរយ (Percentage Rollout)៖** ប្រើរូបមន្ត Hash `userId + flagKey` សំណល់នឹង ១០០។ វិធីនេះធានាថា User ម្នាក់នឹងស្ថិតក្នុងក្រុម Canary ១០% ដដែលជានិច្ចទោះបីជាគេ Refresh ទំព័រ ឬប្តូរឧបករណ៍ប្រើប្រាស់ក៏ដោយ។
+- **អនុវត្តវដ្តជីវិត Flag ឱ្យបានតឹងរ៉ឹង (Flag Lifecycle)៖** ចាត់ទុក Feature Flag ជាជើងទម្របណ្តោះអាសន្នប៉ុណ្ណោះ។ ត្រូវកំណត់កាលវិភាគបង្កើត PR ដើម្បីលុប Flag និងកូដ `if/else` ចាស់ៗចោលក្នុងរយៈពេល ២ សប្តាហ៍ក្រោយពេលវាបានបើកដល់ 100% ពេញលេញ។
+- **ប្រើ Kill Switches សម្រាប់ Dependency ដែលប្រឈមហានិភ័យខ្ពស់៖** ស្រោបការតភ្ជាប់ថ្មីៗ (ដូចជា AI Recommendation Engine ឬ Third-party Fraud API) ក្នុង Kill Switch ដើម្បីអាចបិទវាភ្លាមៗក្នុងពេល ០ វិនាទីប្រសិនបើវាជួបបញ្ហា Latency ខ្ពស់។
+
+## Implementation
+
+### ការបង្កើត In-Memory Feature Flag Evaluator ក្នុង TypeScript៖
+
+```typescript
+import { createHash } from 'crypto';
+
+export interface UserContext {
+  id: string;
+  email?: string;
+  country?: string;
+}
+
+export interface FeatureFlagConfig {
+  enabled: boolean;
+  percentage?: number; // ០ ដល់ ១០០
+  allowedEmails?: string[];
+  allowedCountries?: string[];
+}
+
+export class FeatureFlagManager {
+  private flags = new Map<string, FeatureFlagConfig>();
+
+  // ធ្វើបច្ចុប្បន្នភាព Flags ក្នុង Background ដោយមិនបាច់ Restart App
+  updateFlags(newConfigs: Record<string, FeatureFlagConfig>) {
+    for (const [key, val] of Object.entries(newConfigs)) {
+      this.flags.set(key, val);
+    }
+  }
+
+  /**
+   * ផ្ទៀងផ្ទាត់ថាតើ Flag ដំណើរការសម្រាប់ User ដែរឬទេក្នុងពេល < 1 microsecond
+   */
+  isEnabled(flagKey: string, user?: UserContext): boolean {
+    const flag = this.flags.get(flagKey);
+    if (!flag || !flag.enabled) return false;
+
+    // ១. បើកសម្រាប់តែ Email ផ្ទៃក្នុង (ឧ. បុគ្គលិកសាកល្បងមុន)
+    if (user?.email && flag.allowedEmails) {
+      if (flag.allowedEmails.some((allowed) => user.email!.endsWith(allowed))) {
+        return true;
+      }
+    }
+
+    // ២. បើកសម្រាប់តែប្រទេសជាក់លាក់
+    if (user?.country && flag.allowedCountries) {
+      if (!flag.allowedCountries.includes(user.country)) {
+        return false;
+      }
+    }
+
+    // ៣. បើកតាមភាគរយដោយប្រើ Deterministic Hashing
+    if (flag.percentage !== undefined && user?.id) {
+      const hash = createHash('md5').update(`${flagKey}:${user.id}`).digest('hex');
+      const hashInt = parseInt(hash.substring(0, 8), 16);
+      const userBucket = hashInt % 100; // ០ ដល់ ៩៩
+      return userBucket < flag.percentage;
+    }
+
+    // បើគ្មានលក្ខខណ្ឌពិសេស យកតាមស្ថានភាពទូទៅ
+    return flag.enabled;
+  }
+}
+```
+
+### ការប្រើប្រាស់ក្នុង Express Route៖
+
+```typescript
+export const flagManager = new FeatureFlagManager();
+
+// កំណត់ Flag ដំបូង (ឬទាញយកពី Redis PubSub / SSE)
+flagManager.updateFlags({
+  'new-checkout-v2': {
+    enabled: true,
+    percentage: 10, // បើកសាកល្បង Canary ១០%
+    allowedEmails: ['@mycompany.com'], // តែងតែបើកសម្រាប់បុគ្គលិកក្រុមហ៊ុន
+  },
+});
+
+export async function handleCheckout(req: any, res: any) {
+  const user: UserContext = {
+    id: req.user.id,
+    email: req.user.email,
+    country: req.user.country,
+  };
+
+  if (flagManager.isEnabled('new-checkout-v2', user)) {
+    // ដំណើរការប្រព័ន្ធ Checkout ថ្មី
+    return await renderModernCheckout(req, res);
+  }
+
+  // ដំណើរការប្រព័ន្ធ Checkout ចាស់ដែលមានស្ថិរភាព
+  return await renderLegacyCheckout(req, res);
+}
+```
+
+## Verification
+
+1. **ការផ្ទៀងផ្ទាត់ Canary ប្រាកដនិយម៖** ធ្វើតេស្ត `userId` ដដែលចំនួន ១០០ ដង។ ធានាថា `isEnabled()` ប្រគល់លទ្ធផល Boolean ដូចគ្នា ១០០% គ្រប់ពេល។
+2. **ការធ្វើតេស្តបែងចែកភាគរយ៖** បង្កើត User ID ចំនួន ១០,០០០ ជាមួយ `percentage: 10`។ ផ្ទៀងផ្ទាត់ថាចំនួន User ដែលទទួលបាន `true` ស្ថិតនៅចន្លោះ ៩៥០ ទៅ ១,០៥០ នាក់ (ប្រហាក់ប្រហែល ១០%)។
+3. **ការផ្ទៀងផ្ទាត់ Whitelist ផ្ទៃក្នុង៖** ធានាថា User ដែលមានអ៊ីមែល `user@mycompany.com` ទទួលបាន `true` ជានិច្ច ទោះបីជា `percentage: 0` ក៏ដោយ។
+4. **ការវាស់ស្ទង់ Kill Switch ភ្លាមៗ៖** ប្តូរ Flag ទៅជា `enabled: false`។ ផ្ទៀងផ្ទាត់ថាសំណើបន្ទាប់បង្វែរទៅកាន់កូដចាស់ក្នុងពេល < 1 វិនាទីដោយមិនបាច់ Restart ឬ Deploy Server ឡើងវិញឡើយ។
+
+## Why
+
+មធ្យោបាយដែលមានសុវត្ថិភាពបំផុតក្នុងការបញ្ចេញ Software គឺការបញ្ចេញវាបន្តិចម្តងៗ និងញឹកញាប់។ ប៉ុន្តែការរុញការកែប្រែទៅកាន់អ្នកប្រើប្រាស់ទាំងអស់ព្រមគ្នា បង្កើតនូវហានិភ័យធ្ងន់ធ្ងរសម្រាប់អាជីវកម្ម។
+
+Feature Flags បំបែកការងារបច្ចេកទេសនៃការ Deploy ចេញពីការសម្រេចចិត្តអាជីវកម្មនៃការ Release។ ពួកគេលុបបំបាត់ការភ័យខ្លាចក្នុងការ Deploy ទៅកាន់ Production, បម្លែងដំណើរការ Release រាប់សប្តាហ៍ទៅជា Continuous Delivery, និងផ្តល់ឱ្យវិស្វករនូវប៊ូតុង Kill Switch ក្នុងពេល ០ វិនាទីនៅពេលមានអាសន្ន។
+
+## When Not To Use
+
+- **ការធ្វើ Migration រចនាសម្ព័ន្ធ Database ស្នូល៖** អ្នកមិនអាចប្រើ Feature Flag លើការលុបជួរឈរ SQL Non-null បានឡើយ។ ការផ្លាស់ប្តូរ Database ទាមទារការប្រើប្រាស់ Expand/Contract Pattern ជំនួសវិញ។
+- **ការកែប្រែពណ៌ប៊ូតុងតូចតាច៖** ការដាក់ Flag លើការប្តូរពណ៌ប៊ូតុងបន្តិចបន្តួច បង្កើតតែកូដស្មុគស្មាញឥតប្រយោជន៍។
+
+## Common Mistakes
+
+- **Flag ខ្មោច (Zombie Flags)៖** ទុកចោល Flag ក្នុង Codebase រាប់ខែក្រោយពេលវាបើកដល់ 100% រួចរាល់ ដែលបង្កើតជា Spaghetti Code និងផ្លូវកូដដែលគ្មានអ្នកមើលថែ។
+- **ហៅ Network Request ខាងក្រៅពេលកំពុងដំណើរការ API៖** ការផ្ញើសំណើ HTTP ទៅកាន់សេវាកម្ម Flag ខាងក្រៅរាល់ពេលមានសំណើចូល បន្ថែម Latency ៥០ ms និងបង្កើតជា Single Point of Failure ដ៏គ្រោះថ្នាក់។
+- **មិនបានធ្វើតេស្តទាំងពីរផ្លូវ៖** ភ្លេចធ្វើ Automated Test លើទាំងករណី `flag=true` និង `flag=false` មុនពេល Deploy ទៅកាន់ Production។

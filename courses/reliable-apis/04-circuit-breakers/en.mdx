@@ -1,0 +1,86 @@
+---
+title: "Stop calling a service that is down"
+summary: "Use a circuit breaker to fail fast while a dependency is broken, and let it recover without your traffic on top."
+minutes: 12
+related: [patterns/circuit-breaker, patterns/bulkhead, problems/rate-limit-cascade]
+updated: "2026-09-29"
+contributors: [Veasna-Pen]
+---
+
+## The problem
+
+The recommendations service is down for ten minutes. You have timeouts (1 second) and retries (3 attempts), so every product page now spends up to **3 seconds** failing to load recommendations, and the recommendations service is flooded with retries while it tries to restart.
+
+Timeouts and retries help with short blips. When a service is **clearly down**, calling it at all is the problem.
+
+## The idea
+
+A **circuit breaker** sits in front of a dependency and watches for failures. Like the breaker in your home's electrics, it **trips** when something is wrong and stops the flow.
+
+It has three states:
+
+| State | What happens | Moves on when |
+| --- | --- | --- |
+| **Closed** | Calls go through normally; failures are counted | Too many fail, e.g. 50% of the last 20 |
+| **Open** | Calls fail **at once**, without touching the service | A cool-down passes, e.g. 30 seconds |
+| **Half-open** | A few trial calls go through | They succeed: back to closed. They fail: open again |
+
+While the breaker is open, your app answers immediately, with a **fallback** such as a default, a cached value, or simply leaving that part of the page out. The failing service gets a quiet period to recover.
+
+## Example
+
+Using the `opossum` library in Node.js:
+
+```ts
+import CircuitBreaker from 'opossum';
+
+const breaker = new CircuitBreaker(fetchRecommendations, {
+  timeout: 1000, // a call slower than this counts as a failure
+  errorThresholdPercentage: 50, // trip when half of recent calls fail
+  resetTimeout: 30_000 // stay open for 30 s, then try again
+});
+
+breaker.fallback(() => []); // no recommendations, but the page still loads
+
+const items = await breaker.fire(productId);
+```
+
+When the service goes down, the breaker trips after a handful of failures. From then on, product pages load in their normal time with an empty recommendations block, instead of waiting 3 seconds each. Every 30 seconds one trial request checks whether the service is back.
+
+<Tip title="One breaker per dependency">
+Give each downstream service its own breaker. A problem with recommendations should never block calls to payments.
+</Tip>
+
+## Try it
+
+1. Pick a non-essential dependency in your project, such as recommendations, analytics or avatars.
+2. Decide the fallback: what the user sees when it is unavailable.
+3. Wrap the call in a circuit breaker with a timeout, a failure threshold and a reset time.
+4. Stop the dependency (or point it at a URL that fails) and watch the breaker open: responses should become fast again. Start it and watch the breaker close.
+
+## Check yourself
+
+**1. What is the main difference between a retry and a circuit breaker?**
+
+<Answer>
+A retry tries again and hopes the failure was brief. A circuit breaker decides the failure is not brief and stops calling for a while. They work well together: retries for blips, the breaker for outages.
+</Answer>
+
+**2. Why does the breaker move to half-open instead of straight back to closed?**
+
+<Answer>
+To test recovery gently. A few trial calls show whether the service is healthy again without sending it all of your traffic at once, which could knock it straight back down.
+</Answer>
+
+**3. Payments are down. Is "fail fast with a fallback" a good idea here?**
+
+<Answer>
+Failing fast, yes: it is better than making users wait. But the fallback cannot pretend the payment worked. Show a clear "try again in a few minutes" message, or queue the order to charge later if the business allows it.
+</Answer>
+
+## Key takeaways
+
+- A **circuit breaker** stops calls to a dependency that is clearly failing.
+- **Closed → open → half-open**: count failures, fail fast, then test recovery gently.
+- Pair it with a **fallback** so users get a fast, partial answer.
+- Use **one breaker per dependency**, and combine it with timeouts and limited retries.

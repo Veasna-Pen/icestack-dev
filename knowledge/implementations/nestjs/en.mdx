@@ -1,0 +1,167 @@
+---
+title: "NestJS"
+question: "How do I configure timeout interceptors, Prisma idempotency, and Throttler rate limiting in NestJS?"
+summary: "Retries with RxJS, idempotency in a Prisma transaction, response caching, throttling and BullMQ processors, using the building blocks NestJS already ships."
+tags: [nestjs, typescript, nodejs, prisma, implementation]
+related: [patterns/retry, patterns/idempotency, patterns/caching, patterns/rate-limiting, implementations/nodejs]
+order: 2
+updated: "2026-09-11"
+---
+
+Production patterns for NestJS 11 and TypeScript. Employs official framework modules: RxJS timeout and retry interceptors, Prisma transactional idempotency, @nestjs/cache-manager, route throttling, and BullMQ worker queues.
+
+## Timeouts and retries
+
+`HttpService` returns Observables, so timeouts and retries are RxJS operators. The `delay` callback decides what to retry: throwing from it gives up immediately.
+
+```ts
+import { Injectable } from '@nestjs/common';
+import { HttpService } from '@nestjs/axios';
+import { firstValueFrom, retry, timeout, timer } from 'rxjs';
+
+const TRANSIENT = new Set([408, 429, 500, 502, 503, 504]);
+const isTransient = (err: any) =>
+  err?.name === 'TimeoutError' || err?.code === 'ECONNRESET' || TRANSIENT.has(err?.response?.status);
+
+@Injectable()
+export class RatesClient {
+  constructor(private readonly http: HttpService) {}
+
+  async latest() {
+    const response = await firstValueFrom(
+      this.http.get('https://api.example.com/rates').pipe(
+        timeout(2000),
+        retry({
+          count: 2,
+          delay: (error, retryCount) => {
+            if (!isTransient(error)) throw error;              // don't retry 4xx
+            return timer(Math.random() * 100 * 2 ** retryCount); // full jitter
+          }
+        })
+      )
+    );
+    return response.data;
+  }
+}
+```
+
+## Idempotency keys
+
+Claim the key and create the order in one Prisma transaction. The unique constraint on the key means a concurrent duplicate fails with `P2002`, and the handler returns the stored response instead. See [Idempotency](../../patterns/idempotency).
+
+```ts
+import { BadRequestException, Body, ConflictException, Controller, Headers, Injectable, Post } from '@nestjs/common';
+import { Prisma } from '@prisma/client';
+
+@Injectable()
+export class OrdersService {
+  constructor(private readonly prisma: PrismaService) {}
+
+  async create(key: string, dto: CreateOrderDto) {
+    try {
+      return await this.prisma.$transaction(async tx => {
+        await tx.idempotencyKey.create({ data: { key } }); // a concurrent duplicate fails here
+        const order = await tx.order.create({ data: dto });
+        await tx.idempotencyKey.update({ where: { key }, data: { response: order } });
+        return order;
+      });
+    } catch (err) {
+      if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
+        const saved = await this.prisma.idempotencyKey.findUnique({ where: { key } });
+        if (saved?.response) return saved.response;
+        throw new ConflictException('The original request is still in progress');
+      }
+      throw err;
+    }
+  }
+}
+
+@Controller('orders')
+export class OrdersController {
+  constructor(private readonly orders: OrdersService) {}
+
+  @Post()
+  create(@Headers('idempotency-key') key: string | undefined, @Body() dto: CreateOrderDto) {
+    if (!key) throw new BadRequestException('Idempotency-Key header is required');
+    return this.orders.create(key, dto);
+  }
+}
+```
+
+## Caching
+
+`CacheInterceptor` caches GET responses by URL. Back it with Redis in production so every instance shares one cache. With `cache-manager` 5 and later, TTLs are in **milliseconds**.
+
+```ts
+@Module({
+  imports: [CacheModule.register({ ttl: 60_000 })] // plug in a Redis store for multiple instances
+})
+export class ProductsModule {}
+
+@Controller('products')
+@UseInterceptors(CacheInterceptor)
+export class ProductsController {
+  constructor(private readonly products: ProductsService) {}
+
+  @Get(':id')
+  @CacheTTL(60_000)
+  findOne(@Param('id') id: string) {
+    return this.products.findOne(id);
+  }
+}
+```
+
+Never put `CacheInterceptor` on a route whose response depends on the user unless the cache key includes the user; the default key is the URL, so one user's data would be served to the next. [Caching](../../patterns/caching) covers invalidation and stampedes.
+
+## Rate limiting
+
+`@nestjs/throttler` applies a default limit globally and lets sensitive routes tighten it:
+
+```ts
+@Module({
+  imports: [ThrottlerModule.forRoot([{ ttl: 60_000, limit: 100 }])],
+  providers: [{ provide: APP_GUARD, useClass: ThrottlerGuard }]
+})
+export class AppModule {}
+
+@Controller('auth')
+export class AuthController {
+  @Throttle({ default: { limit: 5, ttl: 60_000 } })
+  @Post('login')
+  login(@Body() dto: LoginDto) {
+    // ...
+  }
+}
+```
+
+The default storage is in memory, which is per instance. Behind a load balancer, use a Redis-backed throttler storage so the limit is shared, and make sure the app trusts the proxy so client addresses are correct. See [Rate limiting](../../patterns/rate-limiting).
+
+## Background jobs
+
+`@nestjs/bullmq` wraps BullMQ in providers. Queue the job once the order has committed, and keep the processor idempotent:
+
+```ts
+@Injectable()
+export class CheckoutService {
+  constructor(@InjectQueue('emails') private readonly emails: Queue) {}
+
+  async afterOrderCommitted(orderId: string) {
+    await this.emails.add('receipt', { orderId }, {
+      jobId: `receipt:${orderId}`,                 // the same order can't be queued twice
+      attempts: 5,
+      backoff: { type: 'exponential', delay: 1000 }
+    });
+  }
+}
+
+@Processor('emails')
+export class EmailsProcessor extends WorkerHost {
+  constructor(private readonly mailer: MailerService) {
+    super();
+  }
+
+  async process(job: Job<{ orderId: string }>) {
+    await this.mailer.sendReceiptOnce(job.data.orderId); // skips orders already marked as sent
+  }
+}
+```

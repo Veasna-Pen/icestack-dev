@@ -1,0 +1,184 @@
+---
+title: "ហេតុអ្វីបានជា database របស់ខ្ញុំជួបប្រទះ deadlock?"
+summary: "Deadlock កើតឡើងនៅពេលដែល transaction ច្រើនដំណើរការព្រមគ្នា ហើយ lock rows ដដែលៗតាមលំដាប់លំដោយខុសគ្នា។ ចូរកំណត់លំដាប់នៃការ lock ឱ្យមានសណ្តាប់ធ្នាប់ (deterministic order) ក្នុងកូដរបស់អ្នក និងធ្វើការ retry រាល់ serialization errors។"
+tags: [database, postgres, deadlocks, concurrency, transactions]
+related: [problems/database-is-slow, problems/running-out-of-connections, patterns/retry]
+order: 6
+updated: "2026-09-12"
+contributors: [veasna]
+translation: draft
+---
+
+## Context
+
+ប្រព័ន្ធ Payment និង Order Processing API មួយដំណើរការលើ PostgreSQL 16។ អតិថិជនផ្ទេរប្រាក់រវាងកាបូបឌីជីថល (wallets) ឬទិញទំនិញអំឡុងពេល flash sale ដែលមានអ្នកប្រើប្រាស់ច្រើនក្នុងពេលតែមួយ។ នៅពេលមាន traffic ខ្ពស់ transaction រាប់សិបដំណើរការព្រមគ្នា ដើម្បីកែប្រែសមតុល្យគណនី និងទំហំស្តុកទំនិញ។
+
+កូដនេះត្រូវបានសាកល្បងដោយជោគជ័យជាមួយ unit tests និង load test ធម្មតា។ ប៉ុន្តែនៅក្នុង production នៅពេលអ្នកប្រើប្រាស់ពីរនាក់ផ្ទេរប្រាក់ទៅវិញទៅមកក្នុងមិល្លីវិនាទីតែមួយ transaction ចាប់ផ្តើមបរាជ័យដោយសារកំហុស deadlock។
+
+## Symptoms
+
+- Database logs បង្ហាញ៖
+  ```text
+  ERROR: deadlock detected
+  DETAIL: Process 18421 waits for ShareLock on transaction 91823; blocked by process 18429.
+  Process 18429 waits for ShareLock on transaction 91821; blocked by process 18421.
+  HINT: See server log for query details.
+  CONTEXT: while updating tuple (14, 2) in relation "wallets"
+  ```
+- កម្មវិធីបង្ហាញ error 500 ទៅកាន់អ្នកប្រើប្រាស់៖ `Transaction was deadlocked on lock resources with another process and has been chosen as the deadlock victim.`
+- អត្រា deadlock កើនឡើងយ៉ាងខ្លាំងពេល traffic ឡើងខ្ពស់ ទោះបីជា CPU និង memory របស់ database នៅសល់ច្រើន (ក្រោម 50%) ក៏ដោយ។
+
+<Callout type="warning" title="Deadlock គឺជា bug របស់ application មិនមែនជាការខូចខាតរបស់ database ទេ">
+Postgres មិនបានខូចទេនៅពេលវាបង្ហាញ error deadlock; ប្រព័ន្ធ deadlock detector របស់វាបានជួយសង្គ្រោះ database មិនឱ្យជាប់គាំង (freeze) រហូតនោះទេ។ Deadlock កើតឡើងដោយសារ transaction ច្រើនព្យាយាមទាញយក lock តាមលំដាប់ច្រាសទិសគ្នា។
+</Callout>
+
+## Diagnose
+
+**1. ពិនិត្យមើលអត្រា deadlock ក្នុង database៖**
+
+```sql
+SELECT
+  datname,
+  deadlocks,
+  conflicts
+FROM pg_stat_database
+WHERE datname = current_database();
+```
+
+**2. អាន deadlock graph ពី server log របស់ PostgreSQL៖**
+
+នៅពេលកំណត់ `log_lock_waits = on` និងពេល `deadlock_timeout` (លំនាំដើម 1 វិនាទី) ផុតកំណត់ PostgreSQL នឹងកត់ត្រាព័ត៌មានលម្អិត៖
+
+```text
+Process 18421: UPDATE wallets SET balance = balance - 50 WHERE id = 'user_A';
+-- Query បន្ទាប់ដែល 18421 ព្យាយាមដំណើរការ៖
+UPDATE wallets SET balance = balance + 50 WHERE id = 'user_B';
+
+Process 18429: UPDATE wallets SET balance = balance - 30 WHERE id = 'user_B';
+-- Query បន្ទាប់ដែល 18429 ព្យាយាមដំណើរការ៖
+UPDATE wallets SET balance = balance + 30 WHERE id = 'user_A';
+```
+
+ការពឹងផ្អែកវិលជុំ (Circular dependency) គឺច្បាស់ណាស់៖
+- Transaction 1 កំពុង lock លើ `user_A` ហើយកំពុងរង់ចាំ lock លើ `user_B`។
+- Transaction 2 កំពុង lock លើ `user_B` ហើយកំពុងរង់ចាំ lock លើ `user_A`។
+- គ្មាន transaction ណាអាចបន្តដំណើរការបានឡើយ។ ក្រោយ ១ វិនាទី Postgres សម្រេចចិត្ត abort transaction ណាមួយចោលដើម្បីឱ្យមួយទៀតដើរទៅមុខ។
+
+## Options
+
+1. **Random exponential retries នៅខាង client។** ចាប់ error code `40P01` (deadlock detected) រួច retry transaction ឡើងវិញក្រោយរង់ចាំបន្តិច។
+2. **Deterministic lock ordering។** តម្រៀប (sort) ID របស់ទិន្នន័យដែលត្រូវ lock តាមលំដាប់ពីតូចទៅធំជាមុនសិន មុននឹងចាប់ផ្តើម lock។
+3. **Pessimistic row locking (`SELECT FOR UPDATE`)។** Lock ទិន្នន័យជាមុនតាមលំដាប់តម្រៀបរួចរាល់ មុននឹងចាប់ផ្តើមគណនា business logic។
+4. **Optimistic concurrency control។** ប្រើប្រាស់ `version` ឬ `updated_at` column (`UPDATE ... WHERE id = $1 AND version = $2`) ជំនួសឱ្យការ lock ជួរទិន្នន័យទុកយូរ។
+5. **Serialize transactions តាមរយៈ Queue។** បញ្ជូនរាល់ request លើ entity តែមួយ តាមរយៈ single-partition message queue (ឧទាហរណ៍ Kafka ឬ BullMQ)។
+
+## Trade-offs
+
+| Option | កម្លាំងអនុវត្ត | ផលប៉ះពាល់លើ Throughput | ការធានាលើការការពារ Deadlock |
+| :--- | :--- | :--- | :--- |
+| **Client Retry** | ទាប | ទាប | មិនអាចការពារ deadlock ទេ គ្រាន់តែបិទបាំង error ជាមួយ latency បន្ថែម។ |
+| **Deterministic Ordering** | មធ្យម | គ្មាន overhead | **ធានា 100% តាមទ្រឹស្តីគណិតវិទ្យា** ក្នុងការលុបបំបាត់ deadlock ពីការ lock ច្រាសគ្នា។ |
+| **Optimistic Concurrency** | មធ្យម | ខ្ពស់ពេល contention ទាប | លុបបំបាត់ការ lock ទាំងស្រុង; fail fast ពេលមាន conflict។ មិនសូវល្អពេលទិន្នន័យដដែលៗត្រូវគេ update ច្រើនព្រមគ្នា។ |
+| **Partitioned Queue** | ខ្ពស់ (ត្រូវបន្ថែម infra) | កំណត់តាម entity | លុបបំបាត់ concurrency ទាំងស្រុង; បន្ថែម async latency។ |
+
+## Decision
+
+1. **តម្រៀបជាមុន មុននឹង lock (Sort before locking)៖** នៅពេលណាដែល transaction មួយត្រូវកែប្រែលើសពីមួយ row ក្នុង table តែមួយ (ដូចជាការ checkout ទំនិញច្រើនមុខ ឬការផ្ទេរប្រាក់រវាងគណនីពីរ) **ត្រូវតែ sort IDs ពីតូចទៅធំជានិច្ច** មុនពេលបញ្ជូន `UPDATE` ឬ `SELECT FOR UPDATE`។
+2. **រួមបញ្ចូលជាមួយ Client Retry៖** ទោះបីជាមានការ sort lock ក៏ដោយ foreign key checks ឬ index updates អាចនឹងបណ្តាលឱ្យមាន serialization failure ម្តងម្កាល (`40001` ឬ `40P01`)។ ត្រូវបង្កើត automated retry wrapper ចំនួន 3 ដងជាមួយ exponential backoff។
+
+## Implementation
+
+### 1. អនុវត្ត deterministic lock ordering ក្នុងកូដ
+
+នៅពេលផ្ទេរប្រាក់រវាងគណនីពីរ សូម sort account IDs ឱ្យបានត្រឹមត្រូវ ដើម្បីឱ្យគ្រប់ transaction ទាំងអស់ lock តាមលំដាប់ដូចគ្នាជានិច្ច៖
+
+```typescript
+async function transferFunds(fromId: string, toId: string, amount: number) {
+  // ត្រូវ lock ID ដែលតូចជាងមុនជានិច្ច មិនថាអ្នកផ្ញើ ឬអ្នកទទួលឡើយ
+  const [firstId, secondId] = [fromId, toId].sort();
+
+  return await withTransactionRetry(async (client) => {
+    await client.query('BEGIN');
+
+    // 1. Lock rows ទាំងពីរតាមលំដាប់ ascending order
+    await client.query(
+      `SELECT id, balance FROM wallets WHERE id IN ($1, $2) ORDER BY id FOR UPDATE`,
+      [firstId, secondId]
+    );
+
+    // 2. ផ្ទៀងផ្ទាត់ និងកែប្រែទិន្នន័យ
+    await client.query(
+      `UPDATE wallets SET balance = balance - $1 WHERE id = $2`,
+      [amount, fromId]
+    );
+    await client.query(
+      `UPDATE wallets SET balance = balance + $1 WHERE id = $2`,
+      [amount, toId]
+    );
+
+    await client.query('COMMIT');
+  });
+}
+```
+
+### 2. Transaction retry helper ដោយស្វ័យប្រវត្តិ
+
+ចាប់ deadlock error code `40P01` និង serialization failure `40001`៖
+
+```typescript
+import { PoolClient } from 'pg';
+
+export async function withTransactionRetry<T>(
+  operation: (client: PoolClient) => Promise<T>,
+  maxRetries = 3
+): Promise<T> {
+  const client = await pool.connect();
+  try {
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        return await operation(client);
+      } catch (err: any) {
+        await client.query('ROLLBACK').catch(() => {});
+        const isDeadlock = err?.code === '40P01' || err?.code === '40001';
+        if (!isDeadlock || attempt === maxRetries) {
+          throw err;
+        }
+        // Jittered backoff មុនពេល retry
+        const delay = Math.random() * (100 * 2 ** (attempt - 1));
+        await new Promise((r) => setTimeout(r, delay));
+      }
+    }
+    throw new Error('Transaction retry exhausted');
+  } finally {
+    client.release();
+  }
+}
+```
+
+## Verification
+
+1. **តាមដាន Deadlock metric៖** ពិនិត្យមើល `pg_stat_database.deadlocks`។ អត្រា deadlock ត្រូវតែធ្លាក់មកសូន្យបន្ទាប់ពីអនុវត្តការ sort IDs។
+2. **Concurrency stress test៖** ដំណើរការ test ផ្ទេរប្រាក់ឆ្លាស់គ្នា 100 requests ព្រមគ្នារវាង user A និង user B៖
+   - បើគ្មានការ sort lock៖ ~40% នៃ transactions នឹង abort ដោយសារ deadlock។
+   - បើមានការ sort lock៖ 100% ដំណើរការជោគជ័យដោយគ្មាន deadlock សូម្បីតែមួយ។
+
+## Why
+
+Deadlock ត្រូវការលក្ខខណ្ឌចំនួន ៤ ព្រមគ្នា (ហៅថា Coffman conditions) ដើម្បីកើតឡើង៖
+1. Mutual Exclusion (ការផ្តាច់មុខលើ row lock)
+2. Hold and Wait (កាន់កាប់ row A ខណៈរង់ចាំទាមទារ row B)
+3. No Preemption (Postgres មិនអាចដកហូត lock ពី transaction ដែលកំពុងដំណើរការបានទេ)
+4. **Circular Wait (ការពឹងផ្អែកវិលជុំ)**
+
+នៅពេលដែលយើងកំណត់លំដាប់តម្រៀបនៃការទាញយក resource ជាសកល (ឧទាហរណ៍ lock $X$ មុន $Y$ ប្រសិនបើ $X < Y$) នោះលក្ខខណ្ឌ Circular Wait នឹងក្លាយជា **រឿងមិនអាចកើតឡើងបានជាដាច់ខាតតាមទ្រឹស្តីគណិតវិទ្យា**។
+
+## When Not To Use
+
+- **Single-row updates៖** ប្រសិនបើ transaction កែប្រែទិន្នន័យតែមួយ row ក្នុងពេលតែមួយ នោះ order-induced deadlock មិនអាចកើតឡើងបានឡើយ។
+- **Bulk data imports៖** សម្រាប់ការបញ្ចូលទិន្នន័យរាប់លាន rows ការ sort ក្នុង memory អាចយឺត; គួរប្រើ staging table ជាមួយ `INSERT ... ON CONFLICT` វិញ។
+
+## Common Mistakes
+
+- **ពឹងផ្អែកតែលើការ Retry តែមួយមុខ។** ការ retry ដោយមិនបានកែប្រែ lock order ធ្វើឱ្យខាតបង់ CPU របស់ database និងបង្កើន latency យ៉ាងខ្លាំង។
+- **ការ lock បង្កប់ក្នុង Foreign Keys។** ការ insert ចូល child table នឹង lock row មេក្នុង parent table ជាមួយ `FOR KEY SHARE`។ ប្រសិនបើ row មេត្រូវបាន update ក្នុងពេលតែមួយ នោះ deadlock អាចកើតឡើងដោយមិនដឹងខ្លួន។
+- **មិនបាន Index លើ Foreign Key columns។** បើគ្មាន index លើ foreign key ទេ ការ update ឬ delete លើ table មេអាចនឹង lock table កូនទាំងមូល។

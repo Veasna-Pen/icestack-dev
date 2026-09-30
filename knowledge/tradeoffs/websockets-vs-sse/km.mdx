@@ -1,0 +1,157 @@
+---
+title: "WebSockets vs SSE"
+question: "តើខ្ញុំគួរប្រើ WebSockets, Server-Sent Events (SSE), ឬ Polling សម្រាប់ការធ្វើបច្ចុប្បន្នភាពទិន្នន័យផ្ទាល់ (real-time updates)?"
+summary: "ប្រើ Server-Sent Events (SSE) សម្រាប់ការបញ្ជូនទិន្នន័យមួយទិសពី server ទៅកាន់ client (ការ stream ចម្លើយ AI, ការជូនដំណឹង, ព័ត៌មានផ្សាយផ្ទាល់); ប្រើ WebSockets សម្រាប់ការប្រាស្រ័យទាក់ទងពីរទិសដែលមានល្បឿនលឿនញឹកញាប់ (chat, ហ្គេម, whiteboard សហការគ្នា); ប្រើ Polling សម្រាប់តែការពិនិត្យស្ថានភាពយូរៗម្តងប៉ុណ្ណោះ។"
+tags: [realtime, websockets, sse, polling, networking, architecture]
+related: [tradeoffs/rest-vs-grpc, tradeoffs/sync-vs-async, patterns/circuit-breaker]
+order: 5
+updated: "2026-09-12"
+contributors: [veasna]
+translation: draft
+---
+
+## Context
+
+ក្រុមការងារមួយត្រូវការបញ្ជូនព័ត៌មានថ្មីៗទៅកាន់ web និង mobile clients ផ្ទាល់៖ ការតាមដានស្ថានភាពនៃការបញ្ជាទិញ, ដំណើរការការងារ background, ក្រាហ្វិក dashboard ផ្សាយផ្ទាល់, ការកែសម្រួលឯកសារព្រមគ្នា (multi-user collaboration), ឬការ stream ចម្លើយពី Generative AI។
+
+អ្នកអភិវឌ្ឍន៍ជាច្រើនតែងតែជ្រើសរើស **WebSockets** ជាជម្រើសដំបូងតាមទម្លាប់សម្រាប់រាល់តម្រូវការ real-time ទាំងអស់។ មិនយូរប៉ុន្មាន ពួកគេក៏បានដឹងថា WebSockets ទាមទារការកំណត់ heartbeat ping ដោយដៃ, ភាពស្មុគស្មាញនៃ sticky sessions លើ load balancers, ការសរសេរ logic reconnection និង buffering ដោយខ្លួនឯង ហើយតែងតែត្រូវរារាំងដោយ enterprise firewalls ទៀតផង។ ខណៈពេលដែល **Server-Sent Events (SSE)** ឬ HTTP polling អាចដោះស្រាយបញ្ហានេះបានយ៉ាងងាយស្រួលជាមួយការចំណាយតិចជាងឆ្ងាយ។
+
+## Symptoms
+
+- **ការបង្កើតប្រព័ន្ធស្មុគស្មាញជ្រុល (Over-engineered)៖** បង្កើត cluster សម្រាប់ WebSocket server ពេញលេញជាមួយ Redis pub/sub backplane គ្រាន់តែដើម្បីផ្ញើសារជូនដំណឹងមួយម៉ោងម្តង។
+- **Firewall និង Proxy កាត់ផ្តាច់ Connection៖** Corporate firewalls ឬបណ្តាញទូរស័ព្ទកាត់ផ្តាច់ TCP WebSocket connection ចោលក្រោយពេលស្ងាត់គ្មានទិន្នន័យ ៦០ វិនាទី។
+- **ការបាត់បង់ Context ពេល Reconnect៖** នៅពេល client ភ្ជាប់ឡើងវិញក្រោយបាត់បង់បណ្តាញ កម្មវិធីត្រូវទាញយក state ទាំងមូលឡើងវិញពីដំបូង ដោយសារ WebSockets គ្មានមុខងារតាមដាន event ID ពីកំណើតឡើយ។
+- **បញ្ហា Sticky Session លើ Load Balancer៖** រាល់ពេល deploy កូដថ្មី ឬ scale server នោះ WebSocket connections រាប់ពាន់ត្រូវបានកាត់ផ្តាច់ព្រមគ្នា ដែលធ្វើឱ្យ client ទាំងអស់សម្រុក reconnect ក្នុងពេលតែមួយ។
+
+<Callout type="warning" title="WebSockets មិនមែនជាការជំនួស HTTP ទាំងស្រុងនោះទេ">
+WebSocket ធ្វើការ upgrade ចេញពី standard HTTP ទៅជា raw bidirectional TCP stream។ អ្នកនឹងបាត់បង់ HTTP status codes, standard authentication headers លើ frames, request-response pairing, HTTP caching និង standard HTTP monitoring metrics។
+</Callout>
+
+## Diagnose
+
+ដើម្បីជ្រើសរើស protocol ឱ្យបានត្រឹមត្រូវ សូមវាយតម្លៃលើលក្ខណៈនៃការហូរទិន្នន័យរបស់អ្នក៖
+
+1. **ទិសដៅនៃការហូរទិន្នន័យ៖** តើទិន្នន័យហូរតែពី server ទៅ client មួយទិស (ដូចជា AI token streaming, order status, price ticker) ឬ client ត្រូវផ្ញើសារតូចៗរាប់រយត្រឡប់មកវិញក្នុងមួយនាទី (ដូចជា mouse cursor, gamepad controls)?
+2. **ភាពញឹកញាប់នៃការ Update៖** តើសារមកដល់រៀងរាល់ប៉ុន្មានវិនាទី/នាទីម្តង ឬលើសពី ៣០ ដងក្នុងមួយវិនាទី?
+3. **ទម្រង់នៃ Payload៖** តើទិន្នន័យជាអត្ថបទ Text/JSON ឬជា Raw Binary Buffers?
+4. **បរិស្ថាន Network៖** តើ clients ភ្ជាប់មកពីបណ្តាញក្រុមហ៊ុនដែលមាន strict corporate proxy ឬពីទូរស័ព្ទចល័តទូទៅ?
+
+## Options
+
+1. **Short Polling៖** Client បញ្ជូន `GET` request ធម្មតារៀងរាល់ $N$ វិនាទីម្តង (ឧ. `setInterval(fetch, 5000)`)។
+2. **Long Polling៖** Client បញ្ជូន HTTP request មួយ; server រក្សាវាទុកចំហរហូតទាល់តែមានទិន្នន័យថ្មី ឬផុត timeout ទើបឆ្លើយតប រួច client ធ្វើការភ្ជាប់ម្តងទៀតភ្លាមៗ។
+3. **Server-Sent Events (SSE)៖** ប្រើប្រាស់ persistent HTTP connection (`Content-Type: text/event-stream`) ដើម្បី stream ទិន្នន័យពី server ទៅ client ជាមួយ browser auto-reconnect និង event ID ពីកំណើត។
+4. **WebSockets៖** Full-duplex bidirectional TCP connection ដែលបង្កើតឡើងតាមរយៈ HTTP Upgrade handshake។
+
+## Trade-offs
+
+| លក្ខណៈ | Short Polling | Long Polling | Server-Sent Events (SSE) | WebSockets |
+| :--- | :--- | :--- | :--- | :--- |
+| **ទិសដៅ** | Client $\to$ Server | Client $\to$ Server | **Server $\to$ Client តែមួយទិស** | **ពីទិសទាំងសងខាង (Full Duplex)** |
+| **Protocol** | Standard HTTP | Standard HTTP | **Standard HTTP / HTTP/2** | TCP (Upgraded ពី HTTP) |
+| **ការភ្ជាប់ឡើងវិញ (Reconnection)** | គ្មាន (ជា request ថ្មី) | សរសេរ logic ក្នុង JS | **Browser ភ្ជាប់ស្វ័យប្រវត្តិតាមកំណើត** | ត្រូវសរសេរ logic គ្រប់គ្រងដោយដៃ |
+| **Message IDs & Resumption** | បញ្ជូន query params | សរសេរ logic ដោយដៃ | **ភ្ជាប់មកជាមួយស្រាប់ (`Last-Event-ID`)** | ត្រូវបង្កើត protocol ផ្ទាល់ខ្លួន |
+| **ភាពត្រូវគ្នាជាមួយ Firewall/Proxy** | ទូទៅទាំងអស់ | ទូទៅទាំងអស់ | **ខ្ពស់ (ជា Standard HTTP ធម្មតា)** | មធ្យម (តែងតែត្រូវ firewall បិទ) |
+| **ទិន្នន័យ Binary** | គាំទ្រ | គាំទ្រ | មិនគាំទ្រ (តែ Text/UTF-8 ប៉ុណ្ណោះ) | **គាំទ្រ Binary ពីកំណើត** |
+| **ការស៊ីធនធាន Server** | ស៊ីច្រើនលើ request overhead | មធ្យម | **ទាបបំផុត (ជាពិសេសលើ HTTP/2)** | មធ្យម (long-lived socket) |
+
+## Decision
+
+- **ជ្រើសរើស Server-Sent Events (SSE) នៅពេល៖**
+  - ទិន្នន័យហូរតែពី **server ទៅកាន់ client** ប៉ុណ្ណោះ (LLM AI token streaming, ការតាមដានការដឹកជញ្ជូន, live logs, ព័ត៌មានថ្មីៗ, ទីផ្សារភាគហ៊ុន)។
+  - អ្នកមិនចង់ប្រើ external library បន្ថែមលើ client (Browser មាន `EventSource` API មកជាមួយស្រាប់ ដែលដោះស្រាយ reconnection និង message ID ដោយស្វ័យប្រវត្តិ)។
+  - អ្នកដំណើរការក្រោយ HTTP/2 reverse proxies (Cloudflare, AWS ALB, Nginx)។
+- **ជ្រើសរើស WebSockets នៅពេល៖**
+  - អ្នកត្រូវការ **ការប្រាស្រ័យទាក់ទងពីទិសទាំងសងខាងក្នុងល្បឿនលឿនបំផុត** ជាមួយ latency ក្រោម 50 ms (ហ្គេមអនឡាញ, collaborative whiteboard ដូចជា Figma, live chat latency ទាប)។
+  - អ្នកត្រូវបញ្ជូនទិន្នន័យជា raw binary frames (audio/video streaming chunks)។
+- **ជ្រើសរើស Short Polling នៅពេល៖**
+  - ស្ថានភាពប្រែប្រួលយូរៗម្តងប៉ុណ្ណោះ (ដូចជាការពិនិត្យមើល software update ឬស្ថានភាព export ឯកសារធំៗ)។
+
+## Implementation
+
+### Server-Sent Events (SSE) ក្នុង Node.js / Express៖
+
+```typescript
+import express from 'express';
+
+const app = express();
+
+app.get('/api/orders/:id/stream', (req, res) => {
+  // 1. កំណត់ headers ចាំបាច់សម្រាប់ SSE
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive',
+  });
+
+  // ពិនិត្យមើលថាតើ client បញ្ជូន event ID ចុងក្រោយមកដែរឬទេពេលភ្ជាប់ឡើងវិញ
+  const lastEventId = req.headers['last-event-id'];
+  if (lastEventId) {
+    console.log(`Client បានភ្ជាប់ឡើងវិញ ដោយចាប់ផ្តើមពី event ${lastEventId}`);
+  }
+
+  // 2. បញ្ជូន stream events ទៅកាន់ client
+  let eventCounter = 1;
+  const interval = setInterval(() => {
+    const payload = JSON.stringify({ status: 'preparing', progress: eventCounter * 20 });
+    
+    // ទម្រង់ SSE protocol៖ id, event name, data រួចចុះបន្ទាត់ពីរដង
+    res.write(`id: ${eventCounter}\n`);
+    res.write(`event: order-update\n`);
+    res.write(`data: ${payload}\n\n`);
+
+    eventCounter++;
+    if (eventCounter > 5) {
+      clearInterval(interval);
+      res.end();
+    }
+  }, 2000);
+
+  // 3. សម្អាតចោលនៅពេល client ផ្តាច់ connection
+  req.on('close', () => {
+    clearInterval(interval);
+  });
+});
+```
+
+### Browser Client ប្រើប្រាស់ SSE ជាមួយ `EventSource` ពីកំណើត៖
+
+```javascript
+// Native browser API - មិនបាច់ដំឡើង library បន្ថែមឡើយ!
+const eventSource = new EventSource('/api/orders/123/stream');
+
+eventSource.addEventListener('order-update', (event) => {
+  const data = JSON.parse(event.data);
+  console.log('ស្ថានភាព Order៖', data.status, 'វឌ្ឍនភាព៖', data.progress);
+});
+
+eventSource.onerror = (err) => {
+  // Browser នឹង retry ស្វ័យប្រវត្តិតាម backoff
+  // ហើយនឹងបញ្ជូន header "Last-Event-ID" ដោយស្វ័យប្រវត្តិពេល reconnect!
+  console.warn('ដាច់ការតភ្ជាប់, browser កំពុងភ្ជាប់ឡើងវិញដោយស្វ័យប្រវត្តិ...', err);
+};
+```
+
+## Verification
+
+1. **ភាពធន់ពេល Reconnection៖** ក្នុង DevTools របស់ Browser សូមបិទ "Offline" ក្នុង Network tab រយៈពេល ៥ វិនាទី រួចបើក "Online" វិញ។
+   - ចំពោះ **WebSockets** កូដ JavaScript ត្រូវគ្រប់គ្រង reconnection និង recovery state ដោយខ្លួនឯង។
+   - ចំពោះ **SSE** មុខងារ `EventSource` របស់ Browser នឹង reconnect ដោយស្វ័យប្រវត្តិ និងបញ្ជូន `Last-Event-ID` ទៅ server ដើម្បីបន្តទិន្នន័យដោយមិនបាត់បង់។
+2. **HTTP/2 Multiplexing៖** ពិនិត្យមើល network requests។ នៅក្រោម HTTP/2 connections របស់ SSE ច្រើនអាចចែករំលែក TCP connection តែមួយបាន ដោយមិនចាំបាច់បង្កើត socket ថ្មីៗបន្ថែមឡើយ។
+
+## Why
+
+WebSockets ទាមទារការ upgrade protocol ទៅកាន់ raw duplex socket។ ដំណើរការនេះបានកាត់ផ្តាច់នូវអត្ថប្រយោជន៍ជាច្រើនរបស់ HTTP ដូចជា៖ ការបង្ហាប់ទិន្នន័យ (compression), HTTP/2 multiplexing, caching proxies និង edge CDN termination។
+
+Server-Sent Events ដំណើរការលើ HTTP ធម្មតា។ នៅពេលប្រើលើ HTTP/2 streams របស់ SSE ជាច្រើនអាចបញ្ជូនឆ្លងកាត់ single TCP connection តែមួយបាន ព្រមជាមួយ normal API calls ដទៃទៀត ដែលជួយកាត់បន្ថយការស៊ីថ្មលើទូរស័ព្ទ និងកាត់បន្ថយការប្រើប្រាស់ធនធានលើ server យ៉ាងច្រើន។
+
+## When Not To Use
+
+- **ការផ្ញើទិន្នន័យពីទិសទាំងសងខាងលើ connection តែមួយ៖** SSE មិនអាចផ្ញើទិន្នន័យពី client ទៅ server បានទេ។ ប្រសិនបើ client ត្រូវផ្ញើសារញឹកញាប់ ការប្រើ `POST` requests ដាច់ដោយឡែកអាចមាន overhead ច្រើន; ក្នុងករណីនេះគួរប្រើ WebSockets វិញ។
+- **ដែនកំណត់ Connection លើ HTTP/1.1 ចាស់ៗ៖** លើ browser ដែលប្រើ HTTP/1.1 ចាស់ មានកម្រិតកំណត់ 6 connections ក្នុង domain មួយ។ បើបើក 6 tabs ជាមួយ SSE នោះ tab ទី 7 នឹងត្រូវជាប់គាំង។ ត្រូវប្រាកដថាប្រើ SSE លើ HTTP/2 ជានិច្ច។
+
+## Common Mistakes
+
+- **ប្រើ WebSockets សម្រាប់ការជូនដំណឹងមួយទិស។** បង្កើត stateful socket server និង Redis pub/sub ដោយមិនចាំបាច់ ខណៈដែល SSE ត្រូវការកូដតែ ២០ ជួរ។
+- **ភ្លេចដាក់ Header `Cache-Control: no-cache` លើ SSE។** បើគ្មាន header នេះទេ proxy ឬ Nginx នឹងទប់ស្កាត់ (buffer) ទិន្នន័យរហូតទាល់តែពេញ buffer (ជាទូទៅ 4 KB) ទើបព្រមបញ្ជូនទៅ client។
+- **ខកខានផ្ញើ Heartbeat Comments។** ក្នុង SSE proxies អាចនឹងកាត់ផ្តាច់ connection ក្រោយស្ងាត់ ៦០ វិនាទី។ ត្រូវផ្ញើសារ comment ធម្មតាដូចជា `: ping\n\n` រៀងរាល់ ១៥–៣០ វិនាទីម្តងដើម្បីរក្សា connection ឱ្យនៅរស់។

@@ -1,0 +1,248 @@
+---
+title: "Why am I running out of database connections?"
+summary: "Usually because each container has an oversized connection pool, or transactions are holding connections idle. Right-size client pools and set timeouts before you raise max_connections or deploy PgBouncer."
+tags: [database, postgres, connections, pgbouncer, performance]
+related: [problems/database-is-slow, patterns/caching, tradeoffs/monolith-vs-microservices]
+order: 5
+updated: "2026-09-12"
+contributors: [veasna]
+---
+
+## Context
+
+An e-commerce API running in a containerized cluster (20 Kubernetes pods or ECS tasks) talking to a single PostgreSQL 16 primary on AWS RDS (`db.m6g.xlarge`, 4 vCPU, 16 GB RAM). The application is written in Node.js using the standard `pg` pool (or Knex / Prisma).
+
+Postgres defaults `max_connections` to roughly 100 on standard setups (or around 200 on cloud RDS instances of this size), reserving 3 slots for superusers.
+
+When the service first launched with 3 pods, each pod configured its pool with `max: 20` "to make sure requests never queue." At 3 pods, peak connection count was 60—well under the limit. Last week, marketing ran a flash sale. The horizontal pod autoscaler (HPA) scaled the service up from 3 pods to 20 pods.
+
+Math that seemed harmless at launch became fatal:
+
+```text
+20 pods × 20 connections = 400 connections attempted
+PostgreSQL max_connections = 100
+```
+
+## Symptoms
+
+- Postgres error logs fill with:
+  ```text
+  FATAL: remaining connection slots are reserved for non-replication superuser connections
+  FATAL: sorry, too many clients already
+  ```
+- Application logs flood with connection acquisition timeouts:
+  ```text
+  TimeoutError: ResourceRequest timed out after 30000ms
+  Error: Connection terminated unexpectedly
+  ```
+- API p99 latency explodes from 45 ms to over 30 seconds as HTTP handlers block waiting for free database connections.
+- Kubernetes liveness probes fail because health check endpoints can't acquire a connection. Pods restart, creating a **thundering herd**: 20 restarting pods flood Postgres with hundreds of fresh TLS handshakes and authentication handshakes at the exact moment the database is choking.
+- First intuition from the team: *"Traffic spiked, so we need to set max_connections = 500 or upgrade the database instance."*
+
+<Callout type="warning" title="More connections make Postgres slower, not faster">
+Postgres uses a process-based architecture (one OS process per connection), not lightweight threads. 400 active connections will thrash CPU cache with context switching and consume hundreds of megabytes of memory before running a single query.
+</Callout>
+
+## Diagnose
+
+Before changing configurations, verify where your connections are being held.
+
+**1. Inspect connection state distribution in Postgres.** Run this from `psql`:
+
+```sql
+SELECT
+  state,
+  count(*) AS total,
+  round(100.0 * count(*) / sum(count(*)) OVER (), 1) AS pct
+FROM pg_stat_activity
+WHERE backend_type = 'client backend'
+GROUP BY state
+ORDER BY total DESC;
+```
+
+In almost every connection exhaustion incident, the output looks like this:
+
+```text
+         state          | total |  pct  
+------------------------+-------+-------
+ idle                   |    76 |  78.4
+ idle in transaction    |    16 |  16.5
+ active                 |     5 |   5.1
+```
+
+Notice that only **5 connections are actually executing queries**. The rest are either sitting idle in client pools or stuck `idle in transaction`.
+
+**2. Find transactions stuck `idle in transaction`.** This state means an application opened a transaction (`BEGIN`), ran a query, and is now waiting for something else (like an external HTTP call or slow application loop) before calling `COMMIT`:
+
+```sql
+SELECT
+  pid,
+  usename,
+  application_name,
+  client_addr,
+  now() - xact_start AS xact_duration,
+  now() - state_change AS idle_duration,
+  left(query, 80) AS last_query
+FROM pg_stat_activity
+WHERE state = 'idle in transaction'
+  AND (now() - xact_start) > interval '5 seconds'
+ORDER BY xact_duration DESC;
+```
+
+If you see rows with `xact_duration` in seconds or minutes, application code is holding a database connection hostage while doing non-database work.
+
+**3. Calculate your cluster's connection ceiling.** Calculate the maximum connections your infrastructure can attempt:
+
+```text
+Max Possible Connections = (Pod Replicas × pool.max) + Background Workers + Migration Jobs
+```
+
+If this number exceeds `max_connections - superuser_reserved_connections`, connection exhaustion during an autoscaling event is guaranteed.
+
+## Options
+
+1. **Bump `max_connections` in PostgreSQL.** Change `max_connections` from 100 to 500 in `postgresql.conf` or the cloud parameter group.
+2. **Right-size client-side connection pools.** Shrink each pod's `pool.max` to what its concurrent worker threads actually need.
+3. **Configure defensive timeouts.** Terminate abandoned transactions and long-running queries automatically on the database server.
+4. **Deploy PgBouncer in transaction pooling mode.** Place a dedicated connection pooler between application pods and PostgreSQL.
+5. **Use AWS RDS Proxy.** Managed connection pooling service provided by AWS.
+
+## Trade-offs
+
+| Option | Implementation Cost | Time to Ship | Reversibility | Failure Modes & Trade-offs |
+| :--- | :--- | :--- | :--- | :--- |
+| **Bump `max_connections`** | Zero code change | 5 minutes | Yes | High RAM consumption (~5–10 MB per connection), severe CPU context switching thrash, degraded query throughput. |
+| **Right-size client pools** | Config change | 1 hour | Yes | Requests queue in client memory if undersized, but protects the database and improves throughput. |
+| **Defensive timeouts** | Parameter change | 30 minutes | Yes | Aborts slow/stuck queries with errors rather than hanging connections forever. |
+| **PgBouncer (Transaction mode)** | New service / sidecar | 1–2 days | Moderate | Multiplexes 1,000+ client connections into 20–30 Postgres backends. Incompatible with session state, temporary tables, and prepared statements without config. |
+| **AWS RDS Proxy** | Cloud config ($$) | 2 hours | Yes | Fully managed; adds ~15% to your RDS bill, adds 2–5 ms latency per query, AWS-only. |
+
+## Decision
+
+Use a **two-tier strategy**:
+
+1. **Tier 1 (Immediate, zero new infrastructure):**
+   - Right-size client pools. For Node.js (single-threaded event loop), set `pool.max = 3` to `5` per container. For 20 pods, 20 × 3 = 60 connections, well under your 100 connection limit.
+   - Configure `idle_in_transaction_session_timeout = '10s'` and `statement_timeout = '30s'` on Postgres.
+   - Enforce client acquisition timeouts (`connectionTimeoutMillis: 5000`) so requests fail fast rather than hanging indefinitely.
+
+2. **Tier 2 (When scaling beyond ~30 pods or using serverless / Lambdas):**
+   - Place **PgBouncer in transaction mode** in front of Postgres.
+   - PgBouncer holds the 1,000+ client connections open, but only connects to Postgres when a transaction is actively executing.
+
+## Implementation
+
+### 1. Right-size the client pool (Node.js `pg`)
+
+Never leave pool settings at library defaults. Configure connection limits and timeouts explicitly:
+
+```typescript
+import { Pool } from 'pg';
+
+export const pool = new Pool({
+  host: process.env.DB_HOST,
+  database: process.env.DB_NAME,
+  user: process.env.DB_USER,
+  password: process.env.DB_PASSWORD,
+  // Single-threaded Node.js containers rarely need more than 3-5 concurrent DB connections
+  max: parseInt(process.env.DB_POOL_MAX || '4', 10),
+  // Drop idle connections after 30 seconds
+  idleTimeoutMillis: 30000,
+  // Fail fast if pool cannot provide a connection within 3 seconds
+  connectionTimeoutMillis: 3000,
+});
+
+pool.on('error', (err) => {
+  console.error('Unexpected error on idle database client', err);
+});
+```
+
+<Callout type="info" title="Using Prisma?">
+Prisma defaults its connection pool to `num_physical_cpus * 2 + 1`. In containers with fractional CPUs, set `connection_limit` explicitly in your connection string: `postgresql://USER:PASS@HOST/DB?connection_limit=4`.
+</Callout>
+
+### 2. Kill stuck transactions automatically (Postgres server)
+
+Add these guards to `postgresql.conf` (or AWS RDS Parameter Group):
+
+```ini
+# Kill any transaction that has been idle in transaction for more than 10 seconds
+idle_in_transaction_session_timeout = 10000
+
+# Stop runaway queries from holding resources longer than 30 seconds
+statement_timeout = 30000
+```
+
+### 3. PgBouncer configuration for high-scale horizontal deployments
+
+When running dozens of pods or serverless functions, deploy PgBouncer with `pool_mode = transaction`:
+
+```ini
+[databases]
+app_db = host=postgres-primary.internal port=5432 dbname=production
+
+[pgbouncer]
+listen_addr = 0.0.0.0
+listen_port = 6432
+auth_type = scram-sha-256
+auth_file = /etc/pgbouncer/userlist.txt
+
+# Transaction pooling returns the server connection to the pool immediately after COMMIT/ROLLBACK
+pool_mode = transaction
+
+# Maximum client connections accepted from pods
+max_client_conn = 1000
+
+# Maximum actual connections maintained to the Postgres primary
+default_pool_size = 25
+min_pool_size = 10
+reserve_pool_size = 5
+```
+
+## Verification
+
+1. **Verify connection state under load:** Run the `pg_stat_activity` query during peak traffic. Total client connections should remain stable (e.g., 25–40) instead of matching the pod count times 20.
+2. **Simulate pod autoscaling:** Scale your deployment from 3 pods to 30 pods in staging:
+   ```bash
+   kubectl scale deployment api --replicas=30
+   ```
+   Postgres connection count should remain well below `max_connections`, and zero `FATAL: sorry, too many clients already` errors should appear in database logs.
+3. **Check query throughput:** Measure transactions per second (TPS). With smaller pools and without context switching contention, Postgres CPU usage will decrease and query p95 will improve.
+
+## Why
+
+PostgreSQL was designed in the 1980s around Unix processes. Every client connection creates a dedicated backend process via `fork()`. Each process requires its own private memory stack, tracks transaction snapshots, and competes for CPU scheduler time.
+
+According to the queuing theory formula used by connection pools (such as HikariCP):
+
+connections = (core_count * 2) + effective_spindle_count
+
+A 4 vCPU database server with SSD storage can only execute queries on **4 cores simultaneously**. Having 400 connections open does not mean 400 queries run at once; it means 396 queries wait while the OS kernel spends precious CPU cycles context switching between 400 processes.
+
+Queuing requests in client memory or inside PgBouncer is orders of magnitude faster and cheaper than letting clients flood Postgres backends.
+
+## When Not To Use
+
+Transaction-mode connection pooling (PgBouncer) is not compatible with features that depend on session lifetime:
+
+- **Session-level `SET` commands** (e.g., `SET timezone = 'UTC'`) because the next query in the transaction pool may be routed to a different Postgres backend.
+- **`LISTEN` and `NOTIFY`** in Postgres (these require a continuous, long-lived session connection).
+- **Temporary tables** (`CREATE TEMP TABLE`), which disappear when the transaction ends and the server connection is reallocated.
+- **Advisory locks held across transactions** (`pg_advisory_lock`).
+
+If your application requires these features, either use PgBouncer in `session` mode, or maintain two separate connection pools: a transaction pool for standard CRUD endpoints (98% of traffic) and a direct session connection pool for specialized jobs.
+
+## Common Mistakes
+
+- **Treating database connections like HTTP sockets.** An HTTP connection to Nginx is virtually free; a PostgreSQL connection costs 5–10 MB of memory and an OS process.
+- **Performing HTTP or external API calls inside a database transaction.**
+  ```javascript
+  // ANTI-PATTERN: Connection held idle while waiting for Stripe network response
+  await db.query('BEGIN');
+  await db.query('UPDATE orders SET status = "processing" WHERE id = $1', [id]);
+  await paymentGateway.charge(amount); // Can take 2-5 seconds!
+  await db.query('COMMIT');
+  ```
+  Always complete external network calls *before* opening a transaction or *after* committing it.
+- **Increasing `max_connections` to 1,000 without calculating memory.** Each connection can allocate up to `work_mem` for sorting and hashing. 1,000 connections with `work_mem = 64MB` can easily trigger the OS Out-Of-Memory (OOM) killer and crash the database.
+- **Omitting `connectionTimeoutMillis` in application code.** When a pool exhausts, requests block indefinitely by default in many drivers, eventually exhausting Node.js memory and causing cascading service failures.

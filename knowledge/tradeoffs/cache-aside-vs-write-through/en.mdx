@@ -1,0 +1,164 @@
+---
+title: "Cache-Aside vs Write-Through"
+question: "How should applications synchronize caching: lazy cache-aside or eager write-through?"
+summary: "Cache-Aside (lazy loading) populates the cache only on read misses, ideal for read-heavy workloads with unpredictable access patterns. Write-Through and Write-Behind write to the cache synchronously or asynchronously on every update, guaranteeing cache freshness at the cost of higher write latency or data loss risk."
+tags: [caching, performance, redis, architecture, database]
+related: [patterns/caching, problems/cache-stampede, problems/database-is-slow]
+order: 12
+updated: "2026-09-12"
+contributors: [veasna]
+---
+
+## Context
+
+Caching is the most effective tool for reducing database CPU load and delivering sub-millisecond API response times. However, maintaining consistency between the cache (e.g. Redis) and the persistent database (e.g. PostgreSQL) is notoriously difficult.
+
+Developers must choose how the cache is populated and updated:
+1. **Cache-Aside (Lazy Loading):** The application orchestrates everything. On a read, the app checks the cache. On a hit, it returns the data. On a miss, it fetches from the database, writes the result to the cache with a TTL, and returns it. On a write, the app updates the database and invalidates (deletes) the cache key.
+2. **Write-Through:** The application treats the cache as the primary data store. When data is written, the cache provider synchronously updates both the cache and the underlying database in a single operation.
+3. **Write-Behind (Write-Back):** The application writes only to the cache and acknowledges immediately. The cache asynchronously batches and flushes writes to the database in the background.
+
+## Symptoms
+
+- **Cache-Aside Failure Mode:** Cache misses during traffic spikes create thundering herds (cache stampedes) that crush the database; stale data is served because a write path forgot to delete the cached key.
+- **Write-Through Failure Mode:** Write latency doubles because every insert or update must succeed in both Redis and PostgreSQL before returning to the user; cache memory fills up with millions of records that are never read.
+- **Write-Behind Failure Mode:** Redis crashes or runs out of memory before flushing dirty writes to disk, resulting in permanent, unrecoverable data loss.
+
+<Callout type="warning" title="Always invalidate (delete) keys on write, never update them in place">
+In Cache-Aside, attempting to update a cached key during a write (`SET key new_val`) causes race conditions with concurrent reads. Always delete the key (`DEL key`) so subsequent reads repopulate it cleanly from the database.
+</Callout>
+
+## Diagnose
+
+1. **Calculate cache hit ratio:** Run `INFO stats` in Redis. Is your `keyspace_hits / (keyspace_hits + keyspace_misses)` ratio above 90%?
+2. **Measure write-to-read ratio:** Does your system perform 100 reads per write (ideal for Cache-Aside) or 10 writes per read (poor fit for Write-Through)?
+3. **Audit data loss tolerance:** Can your business tolerate losing the last 5 seconds of writes if a cache server crashes? (If no, Write-Behind is immediately disqualified).
+4. **Inspect cache memory pressure:** Is Redis evicting active keys because unread records are pre-warmed into memory and never accessed?
+
+## Options
+
+1. **Cache-Aside with TTL & Invalidation (Default):** Reads lazily populate cache; writes update DB and `DEL` cache key. (Resilient, resource-efficient, handles cache failures gracefully).
+2. **Write-Through:** Synchronous write to cache and DB. (Guarantees zero stale reads, but increases write latency).
+3. **Write-Behind / Write-Back:** Asynchronous batch flushing to DB. (Ultra-fast writes, but risks data loss on crash).
+4. **Refresh-Ahead:** The cache automatically re-fetches hot keys from the database before their TTL expires based on access frequency.
+
+## Trade-offs
+
+| Strategy | Read Latency | Write Latency | Data Consistency | Crash Durability | Cache Memory Efficiency |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **Cache-Aside** | Fast (< 1 ms on hit) | Normal (DB write only) | Eventual (until TTL or DEL) | **100% Durable (DB is truth)** | **Optimal (stores only read data)** |
+| **Write-Through** | **Fastest (always warm)** | Slower (dual writes) | **Immediate** | **100% Durable** | Lower (caches cold data too) |
+| **Write-Behind** | Fastest | **Ultra-fast (< 1 ms)** | Eventual (DB lags) | **Risky (data lost on crash)** | Lower |
+
+## Decision
+
+- **Default to Cache-Aside for 95% of web applications:**
+  - Best fit for read-heavy workloads (product catalogs, user profiles, article content).
+  - Only requested data occupies expensive Redis RAM.
+  - If Redis crashes, the application continues functioning directly against the database (degraded performance, but zero downtime).
+- **Use Write-Through for strictly consistent read-after-write domains:**
+  - When users expect to read their own write immediately and stale cache reads cannot be tolerated (e.g. account settings or user balances).
+- **Use Write-Behind only for high-frequency ephemeral counters:**
+  - Page view tracking, video watch-time heartbeats, IoT telemetry where losing 5 seconds of counter increments during a crash is an acceptable trade-off for handling 100,000 writes/sec.
+- **Always set a TTL on Cache-Aside keys:** Even if you explicitly delete keys on write, always attach a safety TTL (e.g. 1 hour or 24 hours) to prevent orphaned zombie keys if an invalidation event drops.
+
+## Implementation
+
+### 1. Production Cache-Aside Pattern in TypeScript:
+
+```typescript
+import { Redis } from 'ioredis';
+
+const redis = new Redis(process.env.REDIS_URL!);
+
+export class UserService {
+  constructor(private readonly db: any) {}
+
+  // READ: Lazy load with cache-aside
+  async getUser(userId: string) {
+    const cacheKey = `users:${userId}`;
+
+    // 1. Try cache hit
+    const cached = await redis.get(cacheKey);
+    if (cached) {
+      return JSON.parse(cached);
+    }
+
+    // 2. Cache miss: Fetch from source of truth
+    const result = await this.db.query('SELECT id, name, email FROM users WHERE id = $1', [userId]);
+    const user = result.rows[0];
+
+    if (user) {
+      // 3. Populate cache with safety TTL (1 hour)
+      await redis.set(cacheKey, JSON.stringify(user), 'EX', 3600);
+    }
+
+    return user;
+  }
+
+  // WRITE: Update DB first, then invalidate cache key
+  async updateUser(userId: string, data: { name: string; email: string }) {
+    const cacheKey = `users:${userId}`;
+
+    // 1. Update source of truth
+    await this.db.query('UPDATE users SET name = $1, email = $2 WHERE id = $3', [data.name, data.email, userId]);
+
+    // 2. Invalidate cache! Do NOT use SET; always DEL to avoid race conditions
+    await redis.del(cacheKey);
+  }
+}
+```
+
+### 2. High-Throughput Write-Behind Counter Flusher:
+
+```typescript
+// Fast in-memory increment (< 0.5 ms)
+export async function trackPageView(articleId: string) {
+  await redis.hincrby('buffer:article_views', articleId, 1);
+}
+
+// Background worker flushes accumulated batch counts to Postgres every 10 seconds
+export async function flushViewsToDatabase(db: any) {
+  const views = await redis.hgetall('buffer:article_views');
+  if (!views || Object.keys(views).length === 0) return;
+
+  // Atomically swap/delete key
+  await redis.del('buffer:article_views');
+
+  // Batch insert into database in a single SQL query
+  const entries = Object.entries(views);
+  for (const [articleId, count] of entries) {
+    await db.query(
+      'UPDATE articles SET view_count = view_count + $1 WHERE id = $2',
+      [parseInt(count, 10), articleId]
+    );
+  }
+  console.log(`[Write-Behind] Flushed ${entries.length} article view counts to PostgreSQL`);
+}
+```
+
+## Verification
+
+1. **Cache hit ratio measurement:** Run a 5-minute load test. Query `redis-cli info stats` and verify that `keyspace_hits / (keyspace_hits + keyspace_misses)` stabilizes above 95%.
+2. **Staleness elimination test:** Read user #5 (populating cache). Update user #5's name via API. Immediately read user #5 again. Verify that the response reflects the updated name in < 5 ms.
+3. **Cache outage survival test:** Stop the Redis container during a load test. Verify that the application continues serving requests directly from PostgreSQL without crashing.
+
+## Why
+
+Memory (RAM) is orders of magnitude faster than disk, but costs 10x more per gigabyte. 
+- **Cache-Aside** is the most resource-efficient strategy because it only stores data that clients actually ask for. Unread records never pollute memory.
+- **Write-Through** trades write latency for guaranteed cache warmth.
+- **Write-Behind** trades data durability for peak write throughput.
+
+Understanding these trade-offs ensures that you do not over-engineer caching or risk catastrophic data loss.
+
+## When Not To Use
+
+- **Write-Behind for critical financial data:** Never use Write-Behind for bank balances, payments, or ledger transactions where losing unwritten memory is fatal.
+- **Caching on low-traffic endpoints:** If an endpoint is called once every 10 minutes, caching adds operational complexity for zero tangible performance gain.
+
+## Common Mistakes
+
+- **Updating instead of deleting on write:** Doing `redis.set(key, newVal)` inside write handlers causes stale data races when concurrent writes collide. Always `redis.del(key)`.
+- **Omitting TTLs on Cache-Aside:** Relying solely on explicit cache deletion means any unhandled bug in a write path leaves stale data in the cache forever.
+- **Cache stampedes on expiration:** If a hot key expires during peak traffic, 500 requests will concurrently hit the database to recompute it. Use mutex locks or probabilistic early expiration (XFetch).

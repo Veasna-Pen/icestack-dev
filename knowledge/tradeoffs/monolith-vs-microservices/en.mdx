@@ -1,0 +1,128 @@
+---
+title: "Monolith vs microservices"
+question: "When does a monolith become a problem?"
+summary: "When teams can't change or release their part without coordinating with everyone else, or when one part's load or failures keep hurting the rest. Size alone is not the signal. Fix the boundaries first, and split only when the organization, not the code, is the bottleneck."
+tags: [monolith, microservices, architecture, teams, deployment]
+related: [problems/when-to-use-microservices, tradeoffs/sync-vs-async, tradeoffs/sql-vs-nosql]
+order: 1
+updated: "2026-09-11"
+---
+
+## Context
+
+Almost every successful product starts as a monolith: one codebase, one deployable, one database. The useful question isn't whether monoliths are good. It's when a particular monolith has stopped serving the team, and whether splitting it would help or just move the pain somewhere else.
+
+This page compares the two shapes directly. For the narrower question of whether to adopt microservices now, see [When should I use microservices?](../../problems/when-to-use-microservices).
+
+## Symptoms
+
+Signs that a monolith is becoming a problem, roughly in the order they appear:
+
+- **Coordination cost:** releases need a meeting, and one team's unfinished work blocks another team's deploy.
+- **Change amplification:** a small feature touches many unrelated modules.
+- **Blast radius:** a bug or a memory leak in one feature takes all of them down.
+- **Resource conflict:** a batch job or a heavy endpoint starves latency-sensitive requests.
+- **Build and test times** that grow faster than the codebase does.
+
+Things that are *not* a problem on their own: the number of lines of code, the age of the framework, or the fact that it's "a monolith".
+
+## Diagnose
+
+Measure instead of arguing:
+
+1. **Lead time for changes:** time from merge to production, per team. Lead time rising while team size stays flat is a real signal.
+2. **Deploy coupling:** how often a deploy is blocked or rolled back because of another team's change.
+3. **Change coupling:** which parts of the code change together in git history. Files that always change together belong in one module; modules that always change together belong in one service.
+4. **Incident blast radius:** how many of last quarter's incidents started in one area and hurt unrelated ones.
+5. **Resource profile per area:** CPU, memory and latency per group of endpoints. Is one area's profile genuinely different?
+
+A first look at where change concentrates:
+
+```bash
+# Which folders change most often? (last six months)
+git log --since="6 months ago" --name-only --pretty=format: \
+  | grep '^src/' | cut -d/ -f1-3 | sort | uniq -c | sort -rn | head -20
+```
+
+Tools such as `code-maat` go further and compute change coupling between files and folders from the same history.
+
+## Options
+
+1. **Keep the monolith as it is**, and fix the pipeline and the tests.
+2. **A modular monolith:** enforced internal boundaries, still one deployable.
+3. **A monolith plus a few services**, extracted with the strangler fig pattern where there is a concrete need.
+4. **Microservices:** many independently deployable services, each owning its data.
+
+## Trade-offs
+
+| Dimension | Monolith | Modular monolith | Microservices |
+| :--- | :--- | :--- | :--- |
+| Time to the first feature | Fastest | Fast | Slow: the platform comes first |
+| Refactoring across domains | Easy: one IDE, one PR | Easy, within the rules | Hard: APIs, versions, data migrations |
+| Team autonomy | Low | Medium | High |
+| Release independence | None | None | Per service |
+| Failure isolation | None | Little | Per service, if designed for it |
+| Scaling | The whole app | The whole app | Per service |
+| Consistency | ACID transactions | ACID transactions | Eventual, with sagas and outboxes |
+| Debugging | Stack traces | Stack traces | Distributed tracing required |
+| Operating cost | Low | Low | High, and it grows with the number of services |
+| Typical team size | Up to about 15 engineers | About 10 to 50 | Many teams plus a platform team |
+
+The costs of microservices are paid up front and continuously: the platform, tracing, handling network failures. The benefits arrive only once many teams need autonomy. A monolith's costs grow slowly, with the number of teams sharing it.
+
+## Decision
+
+- **Under roughly 15 engineers, or before product-market fit:** a monolith with sensible modules.
+- **As the number of teams grows:** a modular monolith with enforced boundaries. It keeps transactions and simple debugging, and makes a later extraction cheap.
+- **When measurements show one module needs its own releases, scaling or isolation:** extract that one module as a service, with the strangler fig pattern.
+- **Microservices across the board** only with several teams, a platform able to run them, and boundaries that have proved stable.
+
+A monolith "becomes a problem" at the point where the cost of coordinating teams inside it exceeds the cost of operating them separately. Both can be measured.
+
+## Implementation
+
+The strangler fig pattern extracts one capability without a rewrite. Route the new service's paths at the proxy, and move traffic across gradually:
+
+```nginx
+# Every request still goes to the monolith, except the capability being extracted.
+upstream monolith      { server monolith:8080; }
+upstream notifications { server notifications:8080; }
+
+server {
+  location /api/notifications/ { proxy_pass http://notifications; }
+  location /                   { proxy_pass http://monolith; }
+}
+```
+
+Then, in order:
+
+1. Build the new service behind the same API contract, while writes still go through the monolith.
+2. Copy or share the data it needs, then make the service the owner of those tables. The monolith calls the service's API instead of the tables.
+3. Move read traffic, then write traffic, behind a flag you can turn back.
+4. Delete the old code path from the monolith. The extraction isn't finished until this step is.
+
+## Verification
+
+- **The metric that motivated the split improved:** lead time for the team that owns the service, incident blast radius, or resource isolation.
+- **Nothing got worse for users:** end-to-end latency and error rates for flows that now cross the network.
+- **The boundary is real:** the service deploys on its own, and the monolith no longer touches the tables that moved.
+
+## Why
+
+Architecture follows communication. A monolith is efficient while the people changing it can coordinate cheaply, and becomes a problem when they can't. Microservices swap coordination between people for coordination between machines, which is expensive to build and run but scales with the number of teams. The right moment to split is when that swap becomes worth its price, and that is something you can measure rather than guess.
+
+## When Not To Use
+
+This comparison is the wrong lens when:
+
+- **The real issue is code quality** inside modules. Neither shape fixes that.
+- **Deploys are slow because the pipeline is slow.** Fix the pipeline.
+- **There is one team.** Team autonomy, the main benefit of microservices, doesn't apply.
+
+## Common Mistakes
+
+- **Splitting by size** ("the monolith is too big") rather than by coupling and ownership.
+- **Big-bang rewrites** into microservices, which stop feature work for months and usually miss behavior the old system had.
+- **Extracting services but keeping one shared database**, which keeps all the coupling and adds a network.
+- **Never deleting the old path** after an extraction, so two implementations have to be maintained.
+- **Ignoring the platform cost:** CI/CD, observability and on-call for every new service.

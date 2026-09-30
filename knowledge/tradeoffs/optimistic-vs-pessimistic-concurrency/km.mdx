@@ -1,0 +1,153 @@
+---
+title: "Optimistic vs Pessimistic Locking"
+question: "តើនៅពេលណាដែលខ្ញុំគួរប្រើប្រាស់ SELECT FOR UPDATE (Pessimistic Locking) ហើយនៅពេលណាដែលខ្ញុំគួរប្រើប្រាស់ Version-based Optimistic Checks?"
+summary: "Pessimistic Locking (SELECT FOR UPDATE) ទប់ស្កាត់ការប៉ះទង្គិចដោយការចាក់សោជួរទិន្នន័យជាមុន ដែលល្អឥតខ្ចោះសម្រាប់ប្រតិបត្តិការហិរញ្ញវត្ថុ និងស្តុកទំនិញដែលមានការប្រជែងខ្លាំង។ រីឯ Optimistic Concurrency Control (OCC) ផ្ទៀងផ្ទាត់ Version នៅពេល Commit ដែលស័ក្តិសមបំផុតសម្រាប់ដំណើរការកែសម្រួលទិន្នន័យរបស់មនុស្ស និងប្រព័ន្ធ Web ដែលកម្រជួបបញ្ហាប៉ះទង្គិច។"
+tags: [database, concurrency, transactions, locking, postgresql]
+related: [patterns/optimistic-locking, problems/database-deadlocks, patterns/distributed-lock]
+order: 9
+updated: "2026-09-12"
+contributors: [veasna]
+translation: draft
+---
+
+## Context
+
+នៅពេលណាដែលមាន Database Transactions ពីរឬច្រើនព្យាយាមអាន និងកែប្រែជួរទិន្នន័យដដែលក្នុងពេលតែមួយ ប្រព័ន្ធគ្រប់គ្រង Concurrency គឺជារឿងចាំបាច់ដើម្បីការពារកុំឱ្យទិន្នន័យខូចខាត ឬជួបបញ្ហា Lost Update Problem។
+
+វិស្វករត្រូវប្រឈមមុខនឹងការសម្រេចចិត្តរវាងទស្សនវិជ្ជាពីរ៖
+1. **Pessimistic Concurrency Control (PCC)៖** គិតទុកជាមុនថាការប៉ះទង្គិចនឹងកើតឡើងជាមិនខាន។ ដូច្នេះ ត្រូវចាក់សោជួរទិន្នន័យ (Row-level Lock) ភ្លាមៗនៅពេលចាប់ផ្តើមអាន (`SELECT ... FOR UPDATE`)។ បិទមិនឱ្យ Transaction ផ្សេងទៀតចូលបានឡើយ រហូតទាល់តែ Transaction បច្ចុប្បន្ន Commit ឬ Rollback ចប់សព្វគ្រប់។
+2. **Optimistic Concurrency Control (OCC)៖** គិតទុកជាមុនថាការប៉ះទង្គិចកម្រនឹងកើតឡើងណាស់។ អនុញ្ញាតឱ្យគ្រប់ Transaction ទាំងអស់អានទិន្នន័យដោយសេរីដោយគ្មាន Lock ឡើយ។ នៅពេលសរសេរកត់ត្រា ត្រូវផ្ទៀងផ្ទាត់ថា Version របស់ Record នោះមិនទាន់ផ្លាស់ប្តូរ (`UPDATE ... WHERE id = ? AND version = ?`)។ បើមានការប៉ះទង្គិច ត្រូវបញ្ឈប់ Transaction ហើយ Retry ម្តងទៀត។
+
+ការជ្រើសរើសខុស នឹងនាំទៅរកបញ្ហា Lock Contention ធ្ងន់ធ្ងរ និង Deadlocks (ករណីប្រើ Pessimistic ខុសកន្លែង) ឬនាំទៅរកព្យុះ Retry ដែលស៊ី CPU អស់ (ករណីប្រើ Optimistic ខុសកន្លែង)។
+
+## Symptoms
+
+- **រោគសញ្ញាបរាជ័យនៃ Pessimistic៖** Throughput របស់ API ដាំក្បាលចុះក្រោមពេលមានបន្ទុកខ្ពស់; Database Connection Pool អស់ពីស្តុកដោយសារតែ Transaction ស្ថិតក្នុងស្ថានភាព `idle in transaction` ឬ `waiting on lock`; ជួបបញ្ហា `ERROR: deadlock detected (SQLSTATE 40P01)` ជាញឹកញាប់។
+- **រោគសញ្ញាបរាជ័យនៃ Optimistic៖** អំឡុងពេល Flash Sale ឬការបើកលក់សំបុត្រប្រគំតន្ត្រី ៩៥% នៃប្រតិបត្តិការរបស់អ្នកប្រើប្រាស់បរាជ័យជាមួយ `409 Conflict`; កូដ Retry Loop ជន់ជោរ CPU របស់ Server និង Database ដោយស្ទើរតែគ្មានការបញ្ជាទិញណាមួយបានសម្រេចឡើយ។
+
+<Callout type="warning" title="កម្រិតនៃការប្រជែងទិន្នន័យ (Contention Level) កំណត់យុទ្ធសាស្ត្រ Concurrency ត្រឹមត្រូវ">
+Optimistic Concurrency ល្អបំផុតនៅពេលដែលឱកាសនៃការប៉ះទង្គិចទាបជាង ២%។ រីឯ Pessimistic Locking ល្អបំផុតនៅពេលដែលឱកាសនៃការប៉ះទង្គិចខ្ពស់ជាង ២០% ក្នុង Transaction ខ្លីៗក្រោម 5 ms។
+</Callout>
+
+## Diagnose
+
+1. **គណនាអត្រាប៉ះទង្គិច (Collision Rate)៖** តើមានប៉ុន្មានភាគរយនៃការសរសេរដែលតម្រង់ទៅរក Primary Key ដដែលក្នុងរង្វង់ ១ វិនាទី?
+2. **វាស់ស្ទង់អាយុកាលរបស់ Transaction៖** តើ Transaction បើកចំហររយៈពេលប៉ុន្មានមិល្លីវិនាទី? តើវាមានជាប់ពាក់ព័ន្ធនឹងការហៅ HTTP API ខាងក្រៅ, ការ Upload ឯកសារ, ឬរង់ចាំមនុស្សចុច Confirm ដែរឬទេ?
+3. **ពិនិត្យមើល Lock Waiting Metrics៖** ពិនិត្យ `pg_stat_activity` ក្នុង PostgreSQL រកមើល `wait_event_type = 'Lock'`។ តើ Query ចំណាយពេលរង់ចាំ Lock ច្រើនជាងពេលដំណើរការកូដមែនទេ?
+4. **វាយតម្លៃការខាតបង់ពេល Retry៖** ប្រសិនបើ Transaction ត្រូវ Abort ដោយសារតែ Conflict តើការអាននិងដំណើរការឡើងវិញពីដំបូងខាតបង់ធនធានកម្រិតណា?
+
+## Options
+
+1. **Optimistic Concurrency Control (OCC) ជាមួយ Version៖** បន្ថែមជួរឈរ `version INT`។ បង្កើនលេខរៀងពេល Update។ បោះបង់ និងប្រគល់ HTTP 409 បើ Version មិនត្រូវគ្នា។
+2. **Optimistic Atomic Compare-and-Swap (CAS)៖** ប្រើលក្ខខណ្ឌ SQL ផ្ទាល់ដោយមិនចាំបាច់មាន Version ពេញលេញ៖ `UPDATE inventory SET stock = stock - 1 WHERE id = $1 AND stock >= 1`។
+3. **Pessimistic Exclusive Locking (`SELECT ... FOR UPDATE`)៖** ចាក់សោជួរទិន្នន័យរហូតដល់ចប់ Transaction។
+4. **Pessimistic Non-Blocking (`SELECT ... FOR UPDATE SKIP LOCKED`)៖** ព្យាយាមចាក់សោ; បើមានគេចាក់សោរួចហើយ រំលងទៅយកជួរបន្ទាប់ដែលទំនេរ (ល្អឥតខ្ចោះសម្រាប់ Job Worker Queue)។
+
+## Trade-offs
+
+| លក្ខណៈវិនិច្ឆ័យ | Optimistic Concurrency (OCC) | Pessimistic Locking (PCC) |
+| :--- | :--- | :--- |
+| **សមត្ថភាពអានស្របគ្នា** | **គ្មានដែនកំណត់ (គ្មាន Lock)** | ត្រូវរង់ចាំការ Update បញ្ចប់ |
+| **ល្បឿនពេលមានការប្រជែងទាប** | **Throughput អតិបរមា** | មានការខាតបង់ Lock បន្តិចបន្តួច |
+| **ល្បឿនពេលមានការប្រជែងខ្ពស់** | ធ្លាក់ចុះខ្លាំង (ព្យុះ Retry ស៊ី CPU) | **មានស្ថិរភាព (តម្រង់ជួរតាមលំដាប់)** |
+| **ហានិភ័យនៃ Deadlock** | **សូន្យ** | ខ្ពស់ (បើរៀបលំដាប់ Lock មិនត្រូវ) |
+| **ភាពឆបគ្នាជាមួយពេលគិតរបស់មនុស្ស** | **ឆបគ្នា ១០០% (Stateless)** | **មហន្តរាយ (បើក DB Transaction ចោល)** |
+| **រយៈពេលនៃ Transaction** | អាចឆ្លងកាត់ការហៅ HTTP បាន | **ត្រូវតែខ្លីបំផុត (< 5 ms)** |
+
+## Decision
+
+- **ជ្រើសរើស Optimistic Concurrency Control សម្រាប់៖**
+  - ដំណើរការដែលមានមនុស្សចូលរួម៖ Web forms, ការកែសម្រួលឯកសារ, ការ Update Profile, ប្រព័ន្ធ CRM ដែលមនុស្សបើកទំព័រចោល គិតរាប់នាទី រួចទើបចុច Save។
+  - ប្រព័ន្ធ Distributed Systems ដែលមានការប្រជែងទាប ដោយការកែជួរទិន្នន័យដូចគ្នាកើតឡើងក្រោម ១% នៃទិន្នន័យសរុប។
+  - Entity ដែលផ្តោតលើការអានជាចម្បង ដែលការ Lock នឹងរារាំង Query អានរាប់លានដោយឥតប្រយោជន៍។
+- **ជ្រើសរើស Pessimistic Locking (`SELECT FOR UPDATE`) សម្រាប់៖**
+  - ប្រតិបត្តិការហិរញ្ញវត្ថុរវាងម៉ាស៊ីន និងការផ្ទេរលុយដែលមានការប្រជែងខ្ពស់ ដែលមានសំណើ ៥០ មកកាត់ប្រាក់ពីកុងតែមួយក្នុងពេល ១០០ ms។
+  - ទំនិញក្នុងស្តុកដែលមានចំនួនកំណត់ខ្លាំង (ដូចជា កៅអីយន្តហោះ ២ ចុងក្រោយ) ដែលការ Retry បែប Optimistic នឹងធ្វើឱ្យខ្ជះខ្ជាយធនធានម៉ាស៊ីនយ៉ាងធ្ងន់ធ្ងរ។
+  - Background Job Workers (ប្រើ `SELECT ... FOR UPDATE SKIP LOCKED` ដើម្បីចែករំលែកការងារគ្នារវាង Workers ដោយមិនបាច់ប៉ះទង្គិចគ្នា)។
+- **ច្បាប់មាសនៃ Pessimistic Locking៖** ហាមកាន់កាប់ Pessimistic Lock ឆ្លងកាត់ Network Call, Third-party API, ឬការរង់ចាំមនុស្សជាដាច់ខាត។ ត្រូវរក្សាទុក Pessimistic Transaction ឱ្យខ្លីក្រោម 5 មិល្លីវិនាទីជានិច្ច។
+
+## Implementation
+
+### 1. Pessimistic Locking: ការផ្ទេរប្រាក់ក្នុងគណនី (រៀបលំដាប់ ID ដើម្បីការពារ Deadlock)
+
+```typescript
+export async function transferFundsPessimistic(
+  client: any,
+  senderId: string,
+  recipientId: string,
+  amountCents: number
+) {
+  try {
+    await client.query('BEGIN');
+
+    // ការពារ Deadlock ដោយការចាក់សោជួរទិន្នន័យតាមលំដាប់ ID កើនឡើងជានិច្ច
+    const [firstId, secondId] = [senderId, recipientId].sort();
+
+    await client.query('SELECT id, balance_cents FROM accounts WHERE id = $1 FOR UPDATE', [firstId]);
+    await client.query('SELECT id, balance_cents FROM accounts WHERE id = $1 FOR UPDATE', [secondId]);
+
+    // ពិនិត្យសមតុល្យ និងផ្ទេរប្រាក់ជាលក្ខណៈ Atomic
+    const senderRes = await client.query('SELECT balance_cents FROM accounts WHERE id = $1', [senderId]);
+    if (senderRes.rows[0].balance_cents < amountCents) {
+      throw new Error('សមតុល្យទឹកប្រាក់មិនគ្រប់គ្រាន់ឡើយ');
+    }
+
+    await client.query('UPDATE accounts SET balance_cents = balance_cents - $1 WHERE id = $2', [amountCents, senderId]);
+    await client.query('UPDATE accounts SET balance_cents = balance_cents + $1 WHERE id = $2', [amountCents, recipientId]);
+
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  }
+}
+```
+
+### 2. Optimistic Concurrency: ការកែសម្រួលឯកសារជាមួយ Version Check
+
+```typescript
+export async function updateDocumentOptimistic(
+  db: any,
+  docId: string,
+  newContent: string,
+  expectedVersion: number
+) {
+  // Query តែមួយគត់ - មិនចាំបាច់បើក Transaction ចោលឡើយ!
+  const result = await db.query(
+    `UPDATE documents 
+     SET content = $1, version = version + 1, updated_at = NOW() 
+     WHERE id = $2 AND version = $3 
+     RETURNING version`,
+    [newContent, docId, expectedVersion]
+  );
+
+  if (result.rowCount === 0) {
+    throw new Error('Conflict: ឯកសារនេះត្រូវបានកែប្រែដោយអ្នកផ្សេងរួចហើយ។ សូមទាញយកទិន្នន័យថ្មីឡើងវិញ។');
+  }
+
+  return { newVersion: result.rows[0].version };
+}
+```
+
+## Verification
+
+1. **ការធ្វើតេស្តបន្ទុកពេលមានការប្រជែងខ្ពស់ (High Contention Stress Test)៖** សាកល្បង 500 requests ស្របគ្នាព្យាយាមកាត់បន្ថយលេខរាប់ពី 500 មក 0។ Pessimistic Locking ត្រូវតែដំណើរការសំណើទាំង 500 ដោយជោគជ័យតាមលំដាប់ ខណៈដែល Optimistic Locking នឹងបរាជ័យដោយសារអស់កូតា Retry និងស៊ី CPU ពេញ។
+2. **Throughput នៃការអានពេលគ្មានការប្រជែង៖** នៅកម្រិត 10,000 req/sec លើ ១,០០០ ជួរផ្សេងគ្នា ផ្ទៀងផ្ទាត់ថា Optimistic Concurrency សម្រេចបាន Throughput ខ្ពស់ជាង Pessimistic ២ ទៅ ៣ ដង ព្រោះគ្មានការខាតបង់លើការដណ្តើម Lock។
+3. **ការតាមដាន Deadlock៖** ធានាថាមិនមាន Error `deadlock detected` កើតឡើងក្នុង PostgreSQL Log ឡើយនៅពេលរត់ Pessimistic Transactions ស្របគ្នា។
+
+## Why
+
+ការសម្រេចចិត្តរវាង Optimistic និង Pessimistic Concurrency គឺជាជម្រើសរវាង **ការបង្កើន Throughput** និង **ការដោះស្រាយការកកស្ទះ (Contention)**៖
+- នៅពេលការប៉ះទង្គិចគ្នាកម្រកើតមាន ការចាក់សោជួរទុកជាមុនគឺជាការខ្ជះខ្ជាយធនធាន។ Optimistic Concurrency អនុញ្ញាតឱ្យការអានដំណើរការគ្មានដែនកំណត់ និងលុបបំបាត់ការខាតបង់លើ Lock Coordination។
+- នៅពេលការប៉ះទង្គិចកើតឡើងជាប្រាកដ ការបណ្តោយឱ្យកូដដំណើរការទៅមុខរួចទើបឱ្យវា Fail នៅជំហានចុងក្រោយ បង្កើតនូវការខាតបង់ការគណនា និងព្យុះ Retry ដ៏ធ្ងន់ធ្ងរ។ Pessimistic Locking ជួយតម្រង់ជួរអ្នកហៅចូលឱ្យចូលតាមលំដាប់នៅមាត់ទ្វារ Database Engine។
+
+## When Not To Use
+
+- **Pessimistic Locking ឆ្លងកាត់ការហៅ HTTP៖** ការបើក `BEGIN ... SELECT FOR UPDATE`, ហៅទៅ Stripe តាម HTTPS, រួចទើប Commit នឹងធ្វើឱ្យអស់ Database Connection Pool ក្នុងរយៈពេលតែប៉ុន្មានវិនាទី។
+- **Optimistic Concurrency សម្រាប់ការដេញថ្លៃល្បឿនលឿន (Auctions)៖** អំឡុងពេល ១០ វិនាទីចុងក្រោយនៃការដេញថ្លៃដែលមាន ១០០ សំណើក្នុងមួយវិនាទីលើទំនិញតែមួយ ការប្រើ Optimistic នឹងបណ្តាលឱ្យមានការបរាជ័យរហូតដល់ ៩៩%។
+
+## Common Mistakes
+
+- **ចាក់សោដោយគ្មានលំដាប់ច្បាស់លាស់ក្នុង Pessimistic៖** ចាក់សោគណនី A រួច B ក្នុង Thread មួយ ហើយចាក់សោគណនី B រួច A ក្នុង Thread មួយទៀត បង្កជា Deadlock ភ្លាមៗ។ ត្រូវ Sort ID ជានិច្ចមុននឹង Lock។
+- **គ្មានដែនកំណត់ Retry ក្នុង Optimistic៖** ការបណ្តោយឱ្យកូដ Retry គ្មានដែនកំណត់ អាចបង្កជា Livelock Loop ដែលទាញទម្លាក់ Server ទាំងមូល។
+- **ភ្លេចឆែក Affected Row Count ក្នុង Optimistic Query៖** ការភ្លេចឆែក `result.rowCount === 0` ធ្វើឱ្យកូដយល់ច្រឡំថាការ Update បានសម្រេច ទោះបីជាការពិតគ្មានជួរណាត្រូវបានកែប្រែក៏ដោយ។

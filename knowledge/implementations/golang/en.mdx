@@ -1,0 +1,229 @@
+---
+title: "Go"
+question: "How do I configure context timeouts, database/sql connection pools, and rate limiters in Go?"
+summary: "Timeouts with context, retry with jitter, database/sql connection pooling, idempotency keys, and token-bucket rate limiting in idiomatic Go."
+tags: [golang, go, backend, implementation]
+related: [patterns/retry, patterns/idempotency, patterns/rate-limiting, patterns/circuit-breaker]
+order: 5
+updated: "2026-09-12"
+contributors: [veasna]
+---
+
+Idiomatic resilience patterns using Go 1.22+ and the standard library. Covers context cancellation, exponential retry with jitter, database/sql connection lifecycle tuning, atomic SQL idempotency, and token-bucket rate limiting.
+
+## Timeouts first
+
+In Go, timeouts and cancellations are carried explicitly by `context.Context`. Every network request must inherit a deadline:
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"time"
+)
+
+func fetchRates(ctx context.Context) (*http.Response, error) {
+	// Enforce a hard 2-second deadline
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.example.com/rates", nil)
+	if err != nil {
+		return nil, err
+	}
+
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		// Detect if failure was caused by timeout
+		if ctx.Err() == context.DeadlineExceeded {
+			return nil, fmt.Errorf("rates API timed out: %w", err)
+		}
+		return nil, err
+	}
+	return res, nil
+}
+```
+
+## Retry with backoff
+
+Retry only transient errors with exponential backoff, full jitter, and context cancellation awareness:
+
+```go
+package main
+
+import (
+	"context"
+	"errors"
+	"math/rand/v2"
+	"net/http"
+	"time"
+)
+
+func isTransient(err error, statusCode int) bool {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	return statusCode == http.StatusTooManyRequests ||
+		statusCode == http.StatusBadGateway ||
+		statusCode == http.StatusServiceUnavailable ||
+		statusCode == http.StatusGatewayTimeout
+}
+
+func WithRetry[T any](ctx context.Context, maxAttempts int, baseDelay time.Duration, fn func() (T, int, error)) (T, error) {
+	var zero T
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		val, status, err := fn()
+		if err == nil && status < 400 {
+			return val, nil
+		}
+
+		if attempt == maxAttempts || !isTransient(err, status) {
+			if err != nil {
+				return zero, err
+			}
+			return zero, errors.New("non-retryable status code")
+		}
+
+		// Exponential backoff with full jitter
+		maxSleep := float64(baseDelay) * float64(1<<(attempt-1))
+		sleepDuration := time.Duration(rand.Float64() * maxSleep)
+
+		select {
+		case <-ctx.Done():
+			return zero, ctx.Err()
+		case <-time.After(sleepDuration):
+		}
+	}
+	return zero, errors.New("retries exhausted")
+}
+```
+
+## Database connection pool
+
+In Go, `sql.Open` does not create a single connection—it initializes an internal thread-safe connection pool. Never leave pool settings at their unbounded defaults:
+
+```go
+package main
+
+import (
+	"database/sql"
+	"time"
+
+	_ "github.com/jackc/pgx/v5/stdlib"
+)
+
+func InitDB(dsn string) (*sql.DB, error) {
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		return nil, err
+	}
+
+	// Sizing formula: 2 * CPU_CORES + SPINDLES
+	// In containers with 2 vCPUs, 4-10 connections is plenty
+	db.SetMaxOpenConns(10)
+
+	// Keep idle connections ready to eliminate connection handshake overhead
+	db.SetMaxIdleConns(5)
+
+	// Recycle connections every 15 minutes to prevent stale TCP sockets behind AWS NLB/ALB
+	db.SetConnMaxLifetime(15 * time.Minute)
+
+	// Terminate connections idle for more than 5 minutes
+	db.SetConnMaxIdleTime(5 * time.Minute)
+
+	return db, nil
+}
+```
+
+## Rate limiting with token bucket
+
+Use Go’s standard `golang.org/x/time/rate` package for high-performance in-memory rate limiting:
+
+```go
+package main
+
+import (
+	"net/http"
+
+	"golang.org/x/time/rate"
+)
+
+// Allow 100 requests per second with a burst capacity of 20
+var limiter = rate.NewLimiter(100, 20)
+
+func RateLimitMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !limiter.Allow() {
+			http.Error(w, `{"error":"Too Many Requests"}`, http.StatusTooManyRequests)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+```
+
+## Idempotency with SQL transactions
+
+Record the idempotency key in the exact same transaction as the business operation:
+
+```go
+package main
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"fmt"
+)
+
+func CreateOrder(ctx context.Context, db *sql.DB, idempotencyKey string, customerID string, amount int) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	// 1. Try to claim the idempotency key in the transaction
+	var existingResponse []byte
+	err = tx.QueryRowContext(ctx, `
+		INSERT INTO idempotency_keys (key, status, created_at)
+		VALUES ($1, 'processing', NOW())
+		ON CONFLICT (key) DO UPDATE SET key = EXCLUDED.key
+		RETURNING response;
+	`, idempotencyKey).Scan(&existingResponse)
+
+	if err != nil && err != sql.ErrNoRows {
+		return fmt.Errorf("idempotency check failed: %w", err)
+	}
+
+	// Key was already processed
+	if len(existingResponse) > 0 {
+		return nil // Return cached result
+	}
+
+	// 2. Perform business logic
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO orders (customer_id, amount_cents, status)
+		VALUES ($1, $2, 'completed')
+	`, customerID, amount)
+	if err != nil {
+		return fmt.Errorf("order insert failed: %w", err)
+	}
+
+	// 3. Save stored response and commit
+	resPayload, _ := json.Marshal(map[string]string{"status": "completed"})
+	_, err = tx.ExecContext(ctx, `
+		UPDATE idempotency_keys
+		SET status = 'completed', response = $1
+		WHERE key = $2
+	`, resPayload, idempotencyKey)
+	if err != nil {
+		return err
+	}
+
+	return tx.Commit()
+}
+```

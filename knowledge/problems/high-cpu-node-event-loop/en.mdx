@@ -1,0 +1,156 @@
+---
+title: "Why is my Node.js CPU at 100%?"
+question: "Why is my Node.js CPU at 100% while traffic is low?"
+summary: "Node.js runs JavaScript on a single thread. Synchronous operations—like parsing huge JSON payloads, crypto hashing, or catastrophic regex backtracking—block the event loop for all users. Offload to worker threads or streaming parsers."
+tags: [nodejs, performance, eventloop, cpu, profiling]
+related: [problems/database-is-slow, problems/memory-leak-in-production]
+order: 11
+updated: "2026-09-12"
+contributors: [veasna]
+---
+
+## Context
+
+A production Node.js API service deployed in containers. The service usually handles 1,000 requests per second with 15% CPU usage.
+
+Suddenly, with only 50 requests per second active, container CPU jumps to **100%** on a single core and stays pegged there. Health checks fail, P99 latency shoots up from 20 ms to 30,000 ms, and unrelated lightweight requests (like `/healthz`) time out.
+
+## Symptoms
+
+- Container CPU sits at 100% (or exactly 1 full core on multi-core systems, e.g. 25% on a 4-core machine).
+- Event Loop Delay monitoring metrics (from `perf_hooks` or Datadog) spike from 2 ms to several seconds.
+- Simple requests that perform no database queries freeze and wait behind one heavy request.
+- Restarting the container fixes the issue briefly until the same user action is triggered again.
+
+<Callout type="warning" title="Node.js is asynchronous for I/O, but single-threaded for execution">
+Asynchronous functions (`async/await`) only yield to other requests when waiting on network or disk I/O. Any synchronous JavaScript execution runs on the single main thread. If a function loops for 5 seconds, all other users are frozen for 5 seconds.
+</Callout>
+
+## Diagnose
+
+1. **Monitor Event Loop Delay:**
+   ```typescript
+   import { monitorEventLoopDelay } from 'perf_hooks';
+   const histogram = monitorEventLoopDelay({ resolution: 20 });
+   histogram.enable();
+
+   setInterval(() => {
+     const p99 = histogram.percentile(99) / 1e6; // Convert nanoseconds to ms
+     if (p99 > 50) {
+       console.warn(`WARNING: Event loop blocked! P99 delay: ${p99.toFixed(2)} ms`);
+     }
+     histogram.reset();
+   }, 5000);
+   ```
+2. **Profile CPU hotspots:** Generate a flamegraph using Node.js built-in profiler:
+   ```bash
+   node --prof app.js
+   # Process logs with:
+   node --prof-process isolate-*.log > processed.txt
+   ```
+3. **Common culprits:**
+   - **Catastrophic ReDoS (Regular Expression Denial of Service):** A nested quantifier (e.g. `/(a+)+$/`) matching malicious input.
+   - **Huge JSON operations:** Running `JSON.parse()` or `JSON.stringify()` on a 50 MB JSON file blocks the thread for 500–1,500 ms.
+   - **Synchronous Crypto:** Using `bcrypt.hashSync()` instead of the asynchronous `bcrypt.hash()`, or synchronous compression (`zlib.gzipSync`).
+   - **Accidental infinite loops:** A `while` loop with an exit condition that never triggers.
+
+## Options
+
+1. **Scale horizontally.** Add more pods behind the load balancer. (Ineffective: any blocked pod will still freeze requests routed to it).
+2. **Offload CPU work to Worker Threads (`worker_threads`).** Run heavy CPU operations on background worker threads without blocking the event loop.
+3. **Chunk long operations with `setImmediate`.** Break large arrays into small slices, yielding back to the event loop between chunks.
+4. **Use Streaming JSON Parsers.** Parse large payloads chunk-by-chunk instead of buffering the whole string in memory.
+5. **Sanitize Regular Expressions.** Replace exponential regexes with linear state machines or safe regex engines (`re2`).
+
+## Trade-offs
+
+| Strategy | Event Loop Protection | Latency Impact | Implementation Effort |
+| :--- | :--- | :--- | :--- |
+| **Worker Threads** | **100% unblocked** | Zero main-thread delay | Medium (message passing overhead) |
+| **Chunking (`setImmediate`)** | Moderate | Increases overall job time | Low |
+| **Async Crypto / Zlib** | **100% unblocked** | Offloaded to libuv threadpool | Minimal (change to async API) |
+| **Safe Regex (`re2`)** | Immune to ReDoS | Slightly slower on simple regex | Low |
+
+## Decision
+
+- **For cryptography and hashing:** Never use `*Sync` methods in web request handlers. Always use asynchronous APIs (e.g. `await bcrypt.hash(...)` or Node.js native `crypto.subtle`).
+- **For heavy calculations (image processing, PDF generation, large calculations):** Delegate to **Worker Threads** via a reusable worker pool (such as `piscina`).
+- **For regular expressions:** Test all user-facing regexes against ReDoS vulnerabilities and enforce maximum input length checks before evaluating.
+
+## Implementation
+
+### 1. Offloading heavy CPU tasks using Worker Threads (`piscina`)
+
+```typescript
+// worker.js - Runs in a dedicated background thread
+export default function heavyCalculation(data: number[]) {
+  // Heavy CPU work here without blocking the Express event loop
+  let sum = 0;
+  for (let i = 0; i < 50_000_000; i++) {
+    sum += Math.sqrt(i);
+  }
+  return sum;
+}
+```
+
+```typescript
+// server.ts - Main HTTP server thread
+import express from 'express';
+import Piscina from 'piscina';
+import path from 'path';
+
+const app = express();
+const pool = new Piscina({
+  filename: path.resolve(__dirname, 'worker.js'),
+  maxThreads: 4,
+});
+
+app.get('/compute', async (req, res) => {
+  // Dispatches to background thread pool; HTTP server remains 100% responsive!
+  const result = await pool.run([1, 2, 3]);
+  res.json({ result });
+});
+
+app.get('/healthz', (req, res) => {
+  // Still answers in < 1 ms even when /compute is churning
+  res.send('OK');
+});
+```
+
+### 2. Guarding against ReDoS
+
+```typescript
+// VULNERABLE: Catastrophic backtracking on input: "aaaaaaaaaaaaaaaaaaaaaaaaaaaa!"
+// const regex = /([a-zA-Z0-9]+)+$/;
+
+// SECURE: Enforce maximum length limit and avoid nested quantifiers
+app.post('/validate', (req, res) => {
+  const input = req.body.text;
+  if (input.length > 500) {
+    return res.status(400).send('Input too long');
+  }
+  // Safe linear regex
+  const isMatch = /^[a-zA-Z0-9]+$/.test(input);
+  res.json({ valid: isMatch });
+});
+```
+
+## Verification
+
+1. **Measure event loop delay under stress:** While running a heavy computation request, hit `/healthz` continuously. Health check latency should remain **< 5 ms** without deviation.
+2. **CPU core distribution:** On a 4-core machine, check `top` or `htop`. CPU load should be distributed across worker threads instead of pinning a single core at 100% while others sit idle.
+
+## Why
+
+The Node.js event loop handles I/O by registering file descriptor callbacks with the OS kernel (via `epoll`, `kqueue`, or `IOCP`). When data arrives, the kernel wakes up the thread.
+
+However, executing JavaScript instructions requires the CPU. Because V8 executes JavaScript sequentially on one call stack, CPU-heavy synchronous code starves the event loop from picking up newly arrived network events, effectively rendering the server deaf and mute to all clients.
+
+## When Not To Use
+
+- **Do not use Worker Threads for I/O operations:** Worker threads have thread spawning and memory serialization costs. For database queries, HTTP fetches, and file I/O, Node.js's standard async event loop is significantly faster than worker threads.
+
+## Common Mistakes
+
+- **Spawning a new Worker on every request.** Creating a thread costs 20–50 ms and tens of megabytes of RAM. Always use a warm, pre-allocated worker pool (like `piscina`).
+- **Synchronous file reads in request handlers.** Calling `fs.readFileSync()` inside an API handler halts all requests until the disk read completes.

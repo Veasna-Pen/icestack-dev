@@ -1,0 +1,89 @@
+---
+title: "Cache-aside: check the cache, then the database"
+summary: "Add the most common caching pattern to a read endpoint, with a time-to-live so old copies clean themselves up."
+minutes: 12
+related: [patterns/caching, tradeoffs/cache-aside-vs-write-through]
+updated: "2026-09-29"
+contributors: [Veasna-Pen]
+---
+
+## The problem
+
+You decided product details are worth caching: read 3,000 times a minute, changed about once a day. Now you need to add the cache without changing how the rest of the app works, and without the cache growing forever.
+
+## The idea
+
+**Cache-aside** (also called lazy loading) is the pattern most teams start with. Your code talks to the cache and the database itself:
+
+1. **Look in the cache** for the key, for example `product:42`.
+2. **Hit**: the value is there. Return it.
+3. **Miss**: it is not there. Read from the database, **store a copy** in the cache, then return it.
+
+Every copy gets a **TTL** (time to live): the cache deletes it automatically after that many seconds. The TTL is your promise about freshness: "this answer is never more than 60 seconds old."
+
+Two small rules keep it safe:
+
+- **The database stays the source of truth.** If the cache is empty or down, the app still works, only slower.
+- **Keys are predictable.** Use one clear format, such as `product:<id>`, so you can find and delete a key later.
+
+## Example
+
+A cache-aside read in Node.js with Redis:
+
+```ts
+const TTL_SECONDS = 60;
+
+async function getProduct(id: string) {
+  const key = `product:${id}`;
+
+  const cached = await redis.get(key);
+  if (cached) return JSON.parse(cached); // hit
+
+  const product = await db.product.findUnique({ where: { id } }); // miss
+  if (product) {
+    await redis.set(key, JSON.stringify(product), 'EX', TTL_SECONDS);
+  }
+  return product;
+}
+```
+
+The first request for product 42 misses and takes about 180 ms. Every request in the next 60 seconds hits and takes about 2 ms. After 60 seconds the key expires, one request reloads it, and the cycle repeats.
+
+<Warning title="Don't let the cache break the page">
+If Redis is down, `redis.get` throws. Wrap cache calls so an error is treated as a miss: log it, read from the database, and carry on.
+</Warning>
+
+## Try it
+
+1. Start Redis locally: `docker run -p 6379:6379 redis:7`.
+2. Add the pattern above to one read endpoint in your project.
+3. Call it twice and compare the times. The second call should be much faster.
+4. Run `redis-cli TTL product:42` (with your key) and watch the seconds count down.
+5. Stop Redis and call the endpoint again. It should still answer, just slower.
+
+## Check yourself
+
+**1. What happens on the very first request after you deploy the cache?**
+
+<Answer>
+It is a miss: the cache is empty, so the request reads from the database and stores a copy. Only the following requests are fast. This is normal and is why a new cache is described as "cold".
+</Answer>
+
+**2. Why set a TTL even if you plan to delete keys when data changes?**
+
+<Answer>
+It is a safety net. If a delete is ever missed, because of a bug or a failed network call, the wrong value still disappears within the TTL instead of staying forever. It also stops keys nobody reads any more from filling memory.
+</Answer>
+
+**3. Your cache is down. What should the user see?**
+
+<Answer>
+The normal page, loaded from the database. With cache-aside the database is the source of truth, so a cache failure should cost speed, not correctness.
+</Answer>
+
+## Key takeaways
+
+- **Cache-aside**: look in the cache, on a miss read the database and store a copy.
+- Always set a **TTL**; it is your maximum staleness and your safety net.
+- The **database stays the source of truth**, so treat cache errors as misses.
+- Use clear, predictable keys like `product:42`.

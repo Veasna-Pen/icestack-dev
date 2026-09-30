@@ -1,0 +1,230 @@
+---
+title: "Go"
+question: "តើត្រូវកំណត់ Context Timeouts, database/sql Connection Pools, និង Rate Limiters ក្នុង Go ដោយរបៀបណា?"
+summary: "Timeouts ជាមួយ context, retry ជាមួយ jitter, database/sql connection pooling, idempotency keys, និង token-bucket rate limiting ក្នុងកូដ Go ស្តង់ដារ។"
+tags: [golang, go, backend, implementation]
+related: [patterns/retry, patterns/idempotency, patterns/rate-limiting, patterns/circuit-breaker]
+order: 5
+updated: "2026-09-12"
+contributors: [veasna]
+translation: draft
+---
+
+ការអនុវត្ត Patterns ប្រកបដោយភាពធន់ដោយប្រើប្រាស់ Go 1.22+ Standard Library។ ផ្តោតលើ Context Cancellation, Retry ជាមួយ Jitter, ការកំណត់អាយុកាល database/sql Connection Pool, Atomic SQL Idempotency, និង Token-Bucket Rate Limiting។
+
+## Timeouts first
+
+នៅក្នុង Go timeouts និង cancellations ត្រូវបានគ្រប់គ្រងយ៉ាងច្បាស់លាស់តាមរយៈ `context.Context`។ រាល់ network request ចេញទៅក្រៅទាំងអស់ត្រូវតែមាន deadline កំណត់ជានិច្ច៖
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"time"
+)
+
+func fetchRates(ctx context.Context) (*http.Response, error) {
+	// កំណត់ deadline ២ វិនាទីដាច់ខាត
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.example.com/rates", nil)
+	if err != nil {
+		return nil, err
+	}
+
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		// ពិនិត្យមើលថាតើការបរាជ័យបណ្តាលមកពី timeout ឬទេ
+		if ctx.Err() == context.DeadlineExceeded {
+			return nil, fmt.Errorf("rates API timed out: %w", err)
+		}
+		return nil, err
+	}
+	return res, nil
+}
+```
+
+## Retry with backoff
+
+Retry តែលើ transient errors ប៉ុណ្ណោះ ជាមួយ exponential backoff, full jitter និងការពិនិត្យ context cancellation៖
+
+```go
+package main
+
+import (
+	"context"
+	"errors"
+	"math/rand/v2"
+	"net/http"
+	"time"
+)
+
+func isTransient(err error, statusCode int) bool {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	return statusCode == http.StatusTooManyRequests ||
+		statusCode == http.StatusBadGateway ||
+		statusCode == http.StatusServiceUnavailable ||
+		statusCode == http.StatusGatewayTimeout
+}
+
+func WithRetry[T any](ctx context.Context, maxAttempts int, baseDelay time.Duration, fn func() (T, int, error)) (T, error) {
+	var zero T
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		val, status, err := fn()
+		if err == nil && status < 400 {
+			return val, nil
+		}
+
+		if attempt == maxAttempts || !isTransient(err, status) {
+			if err != nil {
+				return zero, err
+			}
+			return zero, errors.New("non-retryable status code")
+		}
+
+		// Exponential backoff ជាមួយ full jitter
+		maxSleep := float64(baseDelay) * float64(1<<(attempt-1))
+		sleepDuration := time.Duration(rand.Float64() * maxSleep)
+
+		select {
+		case <-ctx.Done():
+			return zero, ctx.Err()
+		case <-time.After(sleepDuration):
+		}
+	}
+	return zero, errors.New("retries exhausted")
+}
+```
+
+## Database connection pool
+
+នៅក្នុង Go មុខងារ `sql.Open` មិនបានបង្កើត connection តែមួយនោះទេ—វាគឺជាការបង្កើត thread-safe connection pool ខាងក្នុងមួយ។ កុំទុកការកំណត់ pool ឱ្យនៅ unbounded តាម default ឱ្យសោះ៖
+
+```go
+package main
+
+import (
+	"database/sql"
+	"time"
+
+	_ "github.com/jackc/pgx/v5/stdlib"
+)
+
+func InitDB(dsn string) (*sql.DB, error) {
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		return nil, err
+	}
+
+	// រូបមន្តកំណត់ទំហំ៖ 2 * CPU_CORES + SPINDLES
+	// ក្នុង container ដែលមាន 2 vCPUs ចន្លោះ 4-10 connections គឺគ្រប់គ្រាន់ណាស់ហើយ
+	db.SetMaxOpenConns(10)
+
+	// រក្សាទុក idle connections ទុកជាមុនដើម្បីកាត់បន្ថយ handshake overhead
+	db.SetMaxIdleConns(5)
+
+	// បង្វិល connection ថ្មីរៀងរាល់ 15 នាទីដើម្បីការពារ stale TCP socket ក្រោយ AWS NLB/ALB
+	db.SetConnMaxLifetime(15 * time.Minute)
+
+	// បិទ connection ណាដែលនៅទំនេរលើសពី 5 នាទី
+	db.SetConnMaxIdleTime(5 * time.Minute)
+
+	return db, nil
+}
+```
+
+## Rate limiting with token bucket
+
+ប្រើប្រាស់ package ស្តង់ដារ `golang.org/x/time/rate` សម្រាប់ in-memory rate limiting ដែលមានល្បឿនលឿនខ្ពស់៖
+
+```go
+package main
+
+import (
+	"net/http"
+
+	"golang.org/x/time/rate"
+)
+
+// អនុញ្ញាត 100 requests ក្នុងមួយវិនាទី ជាមួយ burst capacity ចំនួន 20
+var limiter = rate.NewLimiter(100, 20)
+
+func RateLimitMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !limiter.Allow() {
+			http.Error(w, `{"error":"Too Many Requests"}`, http.StatusTooManyRequests)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+```
+
+## Idempotency with SQL transactions
+
+កត់ត្រា idempotency key នៅក្នុង database transaction តែមួយជាមួយ business logic៖
+
+```go
+package main
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"fmt"
+)
+
+func CreateOrder(ctx context.Context, db *sql.DB, idempotencyKey string, customerID string, amount int) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	// 1. សាកល្បងកក់ idempotency key ក្នុង transaction
+	var existingResponse []byte
+	err = tx.QueryRowContext(ctx, `
+		INSERT INTO idempotency_keys (key, status, created_at)
+		VALUES ($1, 'processing', NOW())
+		ON CONFLICT (key) DO UPDATE SET key = EXCLUDED.key
+		RETURNING response;
+	`, idempotencyKey).Scan(&existingResponse)
+
+	if err != nil && err != sql.ErrNoRows {
+		return fmt.Errorf("idempotency check failed: %w", err)
+	}
+
+	// ប្រសិនបើ key នេះត្រូវបានដំណើរការរួចរាល់ហើយ
+	if len(existingResponse) > 0 {
+		return nil // ផ្តល់លទ្ធផលពី cache
+	}
+
+	// 2. ដំណើរការ business logic
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO orders (customer_id, amount_cents, status)
+		VALUES ($1, $2, 'completed')
+	`, customerID, amount)
+	if err != nil {
+		return fmt.Errorf("order insert failed: %w", err)
+	}
+
+	// 3. រក្សាទុក response និង commit transaction
+	resPayload, _ := json.Marshal(map[string]string{"status": "completed"})
+	_, err = tx.ExecContext(ctx, `
+		UPDATE idempotency_keys
+		SET status = 'completed', response = $1
+		WHERE key = $2
+	`, resPayload, idempotencyKey)
+	if err != nil {
+		return err
+	}
+
+	return tx.Commit()
+}
+```

@@ -1,0 +1,153 @@
+---
+title: "តើខ្ញុំដោះស្រាយ 429 rate limits ដោយរបៀបណា?"
+question: "ហេតុអ្វីបានជា Requests របស់យើងត្រូវទទួលរង 429 Rate-Limited ពី Upstream APIs?"
+summary: "នៅពេល downstream APIs ឆ្លើយតប HTTP 429 Too Many Requests ការ retry ដោយមិនបានគិតគូរនឹងបង្កើន traffic ក្លាយជាព្យុះ retry storm ដោយខ្លួនឯង។ អនុវត្ត client-side token bucket rate limiter និងគោរពតាម header Retry-After ជានិច្ច។"
+tags: [rate-limiting, api, http, resilience, retry]
+related: [patterns/rate-limiting, patterns/retry, patterns/circuit-breaker]
+order: 15
+updated: "2026-09-12"
+contributors: [veasna]
+translation: draft
+---
+
+## Context
+
+កម្មវិធី backend របស់អ្នកភ្ជាប់ទៅកាន់ third-party APIs សំខាន់ៗ៖ SendGrid សម្រាប់ផ្ញើ transactional emails, OpenAI សម្រាប់ការបង្កើតអត្ថបទ, ឬ Banking API សម្រាប់ការផ្ទៀងផ្ទាត់អត្តសញ្ញាណ។
+
+Provider កំណត់កម្រិត quota ច្បាស់លាស់ ដូចជា 100 requests ក្នុងមួយវិនាទី។ អំឡុងពេលសម្ពោធផលិតផលថ្មី ឬពេលផ្ញើ marketing notification សេវាកម្មរបស់អ្នកបានព្យាយាមបញ្ជូន 250 requests ក្នុងមួយវិនាទី។ Provider ចាប់ផ្តើមច្រានចោល request លើសកម្រិតទាំងនោះជាមួយកំហុស `HTTP 429 Too Many Requests`។
+
+HTTP client របស់អ្នកមាន auto-retry loop។ ជំនួសឱ្យការពន្យារពេល រាល់ request ដែលបរាជ័យបានធ្វើការ retry ឡើងវិញភ្លាមៗ។ Traffic ទៅកាន់ provider បានកើនឡើងទ្វេដងពី 250 ទៅ 500 requests ក្នុងមួយវិនាទី។ ទីបំផុត Firewall របស់ provider បាន block IP address របស់អ្នកទាំងស្រុងដោយចាត់ទុកថាជា "ការប្រើប្រាស់ API បែបបំពាន (Abusive)"។
+
+## Symptoms
+
+- Upstream API calls បង្ហាញកំហុស `HTTP 429 Too Many Requests`។
+- អត្រាកំហុសក្នុង application ស្ទុះឡើងដល់ 90%+ ដោយសារតែ retry storms ធ្វើឱ្យអស់ outbound sockets។
+- Provider ឆ្លើយតបសារដូចជា `Quota exceeded. Please retry after 42 seconds.` ឬបិទ API Key របស់ក្រុមហ៊ុនអ្នកជាបណ្តោះអាសន្ន។
+- Request របស់អ្នកប្រើប្រាស់ចុងក្រោយត្រូវគាំង និងជួប 504 Gateway Timeout ដោយសារ worker threads ត្រូវកកស្ទះក្នុងការរង់ចាំ retry loops។
+
+<Callout type="warning" title="ការ Retry លើ HTTP 429 ដោយគ្មាន Backoff នឹងបម្លែងបញ្ហាតូចតាចឱ្យទៅជាមហន្តរាយ">
+ស្ថានភាព 429 មិនមែនជាបញ្ហារអាក់រអួលបណ្តាញបណ្តោះអាសន្នទេ; វាគឺជាការបញ្ជាយ៉ាងម៉ឺងម៉ាត់ពី server ឱ្យ **ឈប់បញ្ជូន traffic មកទៀត**។ ការ retry ភ្លាមៗធានាថា request បន្ទាប់នឹងត្រូវបរាជ័យដដែល ហើយថែមទាំងពន្យារពេលនៃការជាប់ពិន័យ rate-limit ឱ្យកាន់តែយូរទៀតផង។
+</Callout>
+
+## Diagnose
+
+1. **ពិនិត្យ Response Headers ពី Provider៖** ស្វែងរក rate limit headers ស្តង់ដារ៖
+   ```text
+   HTTP/1.1 429 Too Many Requests
+   Retry-After: 30
+   X-RateLimit-Limit: 100
+   X-RateLimit-Remaining: 0
+   X-RateLimit-Reset: 1718920120
+   ```
+2. **គណនា Throughput សរុបរបស់ Client ទាំងអស់៖** ប្រសិនបើអ្នកដំណើរការ 20 Kubernetes pods ហើយ pod នីមួយៗអនុញ្ញាតឱ្យបញ្ជូន 10 requests ក្នុងមួយវិនាទី នោះ cluster របស់អ្នកបញ្ជូន 20 × 10 = 200 req/sec ដែលលើស quota 100 req/sec របស់ provider យ៉ាងងាយ។
+3. **ពិនិត្យមើល Logic នៃការ Retry៖** តើ HTTP client របស់អ្នកចាត់ទុកកំហុស 429 ដូចគ្នានឹងកំហុសបណ្តាញ 503 ហើយធ្វើការ retry ក្រោយ 100 ms ដែរឬទេ?
+
+## Options
+
+1. **Retry បែបងងឹតងងល់ (Blind Retry)។** បន្ត retry ជាមួយ backoff ធម្មតា។ (នៅតែបង្កើត traffic គំហុក និងមិនអើពើនឹងការបញ្ជារបស់ provider)។
+2. **គោរពតាម Header `Retry-After`។** អានតម្លៃក្នុង header `Retry-After` របស់ provider ហើយផ្អាកការ retry រហូតដល់ផុតរយៈពេលដែលគេកំណត់។
+3. **ការទប់ស្កាត់ជាមុននៅខាង Client (Token Bucket)។** កម្រិតចំនួន request មុនពេលវាចាកចេញពី server របស់អ្នក ដោយតម្រង់ជួរ calls ដើម្បីកុំឱ្យលើស quota របស់ provider។
+4. **Distributed Redis Rate Limiter។** សម្របសម្រួល rate limits ឆ្លងកាត់ pods ទាំង ២០ ដោយប្រើ Redis token bucket រួមគ្នា។
+
+## Trade-offs
+
+| យុទ្ធសាស្ត្រ | កំហុស 429 ចេញក្រៅ | ហានិភ័យនៃការត្រូវ Provider Ban | កម្លាំងអនុវត្ត |
+| :--- | :--- | :--- | :--- |
+| **Retry ធម្មតា** | ធ្ងន់ធ្ងរ | **ខ្ពស់បំផុត** | គ្មាន |
+| **គោរព `Retry-After`** | ម្តងម្កាល | ទាប | ទាប (កូដត្រឹម ១០ ជួរ) |
+| **Client Queue Limiter** | **គ្មាន 429 ឡើយ** | **គ្មាន** | មធ្យម |
+| **Distributed Redis Limiter** | **គ្មាន 429 ឡើយ** | **គ្មាន** | មធ្យម ទៅ ខ្ពស់ (ពឹងលើ Redis) |
+
+## Decision
+
+1. **ទប់ស្កាត់ជាមុននៅខាង Client៖** កុំបញ្ជូន request ទៅ provider ប្រសិនបើអ្នកដឹងថាវាលើស quota។ ត្រូវតម្រង់ជួរ outgoing requests ក្នុង token bucket rate limiter (ដូចជា BullMQ ឬ local token bucket) ដោយកំណត់ត្រឹម ៩០% នៃ quota របស់ provider (ទុក buffer សុវត្ថិភាព ១០%)។
+2. **គោរពតាម `Retry-After` យ៉ាងម៉ឺងម៉ាត់៖** ប្រសិនបើទទួលបានកំហុស 429 ត្រូវអាន header `Retry-After`។ ផ្អាករាល់ traffic ចេញក្រៅទាំងអស់ក្នុងរយៈពេលនោះ ជំនួសឱ្យការ spam retries ឥតឈប់ឈរ។
+
+## Implementation
+
+### 1. HTTP Client ដែលគោរព `Retry-After` និង 429 Backoff (TypeScript)៖
+
+```typescript
+export async function fetchWithRateLimitHandling(
+  url: string,
+  options: RequestInit,
+  maxRetries = 3
+): Promise<Response> {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    const res = await fetch(url, options);
+
+    if (res.status !== 429) {
+      return res; // ជោគជ័យ ឬជា status ធម្មតាផ្សេងទៀត
+    }
+
+    if (attempt === maxRetries) {
+      throw new Error(`Upstream rate limit លើសកម្រិតកំណត់ក្រោយព្យាយាម ${maxRetries} ដង`);
+    }
+
+    // 1. ពិនិត្យមើល Header "Retry-After" (អាចជាលេខវិនាទី ឬជា HTTP Date)
+    const retryAfterHeader = res.headers.get('Retry-After');
+    let waitMs = 1000 * Math.pow(2, attempt); // Exponential backoff លំនាំដើម
+
+    if (retryAfterHeader) {
+      const parsedSeconds = parseInt(retryAfterHeader, 10);
+      if (!isNaN(parsedSeconds)) {
+        waitMs = parsedSeconds * 1000;
+      } else {
+        const retryDate = new Date(retryAfterHeader).getTime();
+        if (!isNaN(retryDate)) {
+          waitMs = Math.max(0, retryDate - Date.now());
+        }
+      }
+    }
+
+    // បន្ថែម jitter ដើម្បីកុំឱ្យ requests ទាំងអស់ retry ព្រមគ្នាក្នុងវិនាទីតែមួយ
+    waitMs += Math.random() * 500;
+    console.warn(`[HTTP 429] ជាប់ Rate limited លើ ${url}។ រង់ចាំ ${waitMs.toFixed(0)} ms`);
+    await new Promise((r) => setTimeout(r, waitMs));
+  }
+
+  throw new Error('Retries ត្រូវបានអស់');
+}
+```
+
+### 2. ការកម្រិត Rate Limit ចេញក្រៅជាមុន (Token Bucket)៖
+
+```typescript
+import { RateLimiterMemory } from 'rate-limiter-flexible';
+
+// កម្រិតការហៅចេញក្រៅត្រឹម 90 requests ក្នុងមួយវិនាទី (Quota របស់ provider គឺ 100/sec)
+const outboundLimiter = new RateLimiterMemory({
+  points: 90,
+  duration: 1, // ក្នុងមួយវិនាទី
+});
+
+export async function sendEmail(emailPayload: any) {
+  // ទាញយក token មួយសិនមុននឹងបញ្ជូន; វានឹងរង់ចាំបើ token អស់
+  await outboundLimiter.consume('sendgrid-api', 1);
+  return await fetchWithRateLimitHandling('https://api.sendgrid.com/v3/mail/send', {
+    method: 'POST',
+    body: JSON.stringify(emailPayload),
+  });
+}
+```
+
+## Verification
+
+1. **Burst Load Test៖** បញ្ជូន 1,000 email requests ព្រមគ្នាក្នុងពេលតែមួយទៅកាន់សេវាកម្ម។
+2. **គ្មាន Error 429 កើតឡើង៖** ពិនិត្យ outbound network logs។ រាល់ requests ទាំងអស់ត្រូវបានរៀបចំសម្រួលឱ្យហូរចេញក្នុងកម្រិតថេរ 90 req/sec ដោយ **គ្មានកំហុស HTTP 429 សូម្បីតែមួយ**។
+3. **សាកល្បង Response 429 សិប្បនិម្មិត៖** ក្នុង staging បង្កើត response 429 ក្លែងក្លាយជាមួយ `Retry-After: 5`។ ផ្ទៀងផ្ទាត់ថាកម្មវិធីផ្អាកការបញ្ជូនពិតប្រាកដរយៈពេល ៥ វិនាទីមុនពេលសាកល្បងម្តងទៀត។
+
+## Why
+
+Rate limits ត្រូវបានបង្កើតឡើងដើម្បីការពារហេដ្ឋារចនាសម្ព័ន្ធ multitenant ពីអ្នកប្រើប្រាស់ដែលស៊ីធនធានច្រើនជ្រុល។ នៅពេល API provider ឆ្លើយតប HTTP 429 ពួកគេកំពុងផ្តល់សញ្ញាថា queue របស់ពួកគេពេញហើយ។
+
+ការ retry ភ្លាមៗដោយគ្មានការពន្យារពេល បង្កើតជា **Positive Feedback Loop (រង្វិលកំហុសវិជ្ជមាន)**៖ request ដែលបរាជ័យត្រូវបានរុញចូល queue ម្តងទៀត បង្កើនការកកស្ទះកាន់តែខ្លាំង បង្កឱ្យមានការបរាជ័យកាន់តែច្រើន ហើយបង្កឱ្យមានការ retry កាន់តែខ្លាំងឡើង។ ការកម្រិតអត្រាចេញជាមុន បម្លែងរលកយក្សឱ្យទៅជាខ្សែទឹកហូររលូន។
+
+## When Not To Use
+
+- **សកម្មភាពបន្ទាន់របស់អ្នកប្រើប្រាស់ដែលមិនអាចរង់ចាំបាន៖** បើអតិថិជនកំពុងរង់ចាំការកាត់លុយពីកាតលើ browser ហើយ provider ជាប់ rate limit ចូរកុំទប់ browser របស់គាត់ ៦០ វិនាទី។ ត្រូវ fail fast ជាមួយសារបញ្ជាក់ច្បាស់លាស់៖ «ប្រព័ន្ធទូទាត់កំពុងរវល់។ សូមព្យាយាមម្តងទៀតនៅបន្តិចក្រោយ។»
+
+## Common Mistakes
+
+- **ស្មានថា Rate Limit គិតលើ Server នីមួយៗ។** Quota ត្រូវបានកំណត់លើ API Key ឬ IP address របស់អ្នក។ ប្រសិនបើអ្នក scale ពី ២ ទៅ ២០ servers នោះ traffic ចេញក្រៅសរុបកើនឡើង ១០ ដង។
+- **មិនបានពិនិត្យខ្នាតនៃ `Retry-After`។** Provider មួយចំនួនបញ្ជូន `Retry-After` ជាលេខវិនាទី (`Retry-After: 120`) ខណៈ provider ខ្លះបញ្ជូនជាកាលបរិច្ឆេទ HTTP timestamp (`Retry-After: Wed, 21 Oct 2026 07:28:00 GMT`)។ កូដត្រូវតែគាំទ្រទម្រង់ទាំងពីរ។

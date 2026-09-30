@@ -1,0 +1,160 @@
+---
+title: "Dead Letter Queue"
+question: "តើខ្ញុំអាចដោះស្រាយសារខូច (Poison-Pill Messages) យ៉ាងដូចម្តេចដើម្បីកុំឱ្យស្ទះ Queue ទាំងមូល ឬបាត់បង់ទិន្នន័យ?"
+summary: "ញែកសារដែលបរាជ័យក្នុងការដំណើរការម្តងហើយម្តងទៀត ទៅដាក់ក្នុង Dead Letter Queue ដោយឡែកមួយ បន្ទាប់ពី Retry លើសកម្រិតកំណត់។ វិធីនេះជួយកុំឱ្យសារពុលបិទស្ទះប្រព័ន្ធ និងរក្សាទិន្នន័យទុកដើម្បី Debug និង Replay នៅពេលក្រោយ។"
+tags: [messaging, reliability, dlq, rabbitmq, kafka, sqs]
+related: [patterns/retry, patterns/idempotency, problems/unbounded-queue-backpressure]
+order: 9
+updated: "2026-09-12"
+contributors: [veasna]
+translation: draft
+---
+
+## Context
+
+នៅក្នុងស្ថាបត្យកម្ម Message-Driven បែប Asynchronous (RabbitMQ, AWS SQS, Apache Kafka, Redis Streams) Worker ដំណើរការទាញយកសារចេញពី Queue ដើម្បីធ្វើការងារនៅខាងក្រោយ (Background jobs) ដូចជា៖ ការបង្កើតឯកសារ PDF, ការកាត់ប្រាក់លើកាតធនាគារ, ឬការបញ្ជូន Webhook ទៅប្រព័ន្ធខាងក្រៅ។
+
+ជាយថាហេតុ តែងតែមានសារមួយចំនួនដែលមិនអាចដំណើរការបាន។ សារនោះអាចមានទម្រង់ JSON ខុសទម្រង់, យោងទៅកាន់ User ID ដែលត្រូវបានលុបចោលបាត់, ឬបង្កឱ្យមាន Runtime Exception ដែលមិនបានរំពឹងទុក។ ប្រសិនបើគ្មានយុទ្ធសាស្ត្រ Dead Letter Queue ទេ Worker នឹងច្រានសារនោះត្រឡប់ទៅ Queue វិញ រួចទាញយកវាមកអានភ្លាមៗ គាំងម្តងទៀត ហើយវិលវល់ក្នុង Loop ឥតឈប់ឈរ។ សារពុល (Poison Pill) នេះនឹងដណ្តើម CPU, បង្កើត Error logs រាប់លានជួរពេញ Hard disk, និងធ្វើឱ្យ Worker ទាំងអស់គាំងដំណើរការ។
+
+## Symptoms
+
+- Worker ទទួលសារគាំងម្តងហើយម្តងទៀតជាមួយ Stack Trace ដដែលរៀងរាល់ពីរបីមិល្លីវិនាទី។
+- ចំនួនសារកកស្ទះក្នុង Queue (Backlog) កើនឡើងយ៉ាងលឿន បើទោះបីជា Traffic ពី Producer មានសភាពធម្មតាក៏ដោយ ព្រោះតែ Worker ជាប់គាំងនឹងសារពុលតែមួយ។
+- CPU របស់ Worker ឡើងដល់ 100% ដោយសារតែការប្រឹងប្រែងដំណើរការសារខូចដដែលរាប់ពាន់ដងក្នុងមួយនាទី។
+- Hard disk ពេញដោយសារតែ Error logs ស្ទួនៗរាប់លានជួរ។
+- ប្រព័ន្ធខាងក្រៅអាចរងការហៅទូរស័ព្ទ ឬកាត់ប្រាក់ស្ទួន ប្រសិនបើបញ្ហាកើតឡើងនៅជំហានចុងក្រោយនៃ Transaction។
+
+<Callout type="warning" title="សារពុល (Poison Pill) អាចធ្វើឱ្យគាំង Pipeline ទាំងមូល">
+សារដែលខូចតែមួយគត់ដែលត្រូវបានច្រានត្រឡប់ទៅក្បាល Queue វិញ អាចធ្វើឱ្យ Worker Instance ទាំង ១០ គាំងធ្លាក់ក្នុង Loop ឥតកំណត់ ដែលរារាំងមិនឱ្យសារត្រឹមត្រូវរបស់អ្នកប្រើប្រាស់ដទៃដំណើរការបានឡើយ។
+</Callout>
+
+## Diagnose
+
+1. **ពិនិត្យមើលចំនួន Redelivery Count៖** តើសារដែលបរាជ័យនោះបង្ហាញ `delivery_count` ឬ `redelivery_count` លើសពី ១០ ដងដែរឬទេ?
+2. **ពិនិត្យមើលសារនៅក្បាល Queue៖** អានសារដែលនៅកំពូលគេក្នុង Queue ដោយមិនទាន់ Ack វា។ តើ Payload ខូចទម្រង់ ឬខ្វះទិន្នន័យចាំបាច់ដែរឬទេ?
+3. **ពិនិត្យ Error Handling ក្នុង Worker៖** តើកូដ Consumer របស់អ្នក `catch` error ហើយបញ្ជូន `nack(requeue=true)` ត្រឡប់ទៅវិញដោយងងឹតងងល់មែនទេ?
+4. **ពិនិត្យមើលការផ្ទុះឡើងនៃ Error Log៖** តើប្រព័ន្ធ Log (Datadog, Loki) កំពុងជន់ជោរដោយសារតែ Error ដដែលៗដែលកើតឡើងរាប់ពាន់ដងក្នុងមួយវិនាទីមែនទេ?
+
+## Options
+
+1. **លុបចោលពេលបរាជ័យ (Drop / Ack)៖** ទទួលស្គាល់សារ (Ack) ហើយលុបវាចោលភ្លាមៗ។ (លឿន តែបាត់បង់ទិន្នន័យអាជីវកម្មដោយស្ងាត់ៗ)។
+2. **Retry រហូតដោយពន្យារពេល (Infinite Retry)៖** ដាក់សារចូលជួរវិញជាមួយ Exponential Backoff។ (នៅតែទប់ស្ទះ Queue ដដែលសម្រាប់បញ្ហា Schema bug ដែលគ្មានថ្ងៃដោះស្រាយបានដោយស្វ័យប្រវត្តិ)។
+3. **Dead Letter Queue (DLQ)៖** បន្ទាប់ពីការប្រឹងប្រែងបរាជ័យចំនួន $N$ ដង (ឧ. ៣ ឬ ៥ ដង) បញ្ជូនសារនោះដោយស្វ័យប្រវត្តិចូលទៅកាន់ Queue ដាច់ដោយឡែកមួយ (`orders.dlq`) ដោយរក្សាទុកទាំង Headers, Error Stack Trace, និង Timestamp ទាំងអស់។
+4. **Database Parking Lot Table៖** បញ្ចូល Payload ដែលខូចនោះទៅក្នុងតារាង Database `failed_messages` ដើម្បីឱ្យ Admin ពិនិត្យនិងកែសម្រួលនៅពេលក្រោយ។
+
+## Trade-offs
+
+| យុទ្ធសាស្ត្រ | ភាពគង់វង្សនៃទិន្នន័យ | Throughput របស់ Queue | បន្ទុកថែទាំប្រព័ន្ធ | សមត្ថភាព Debug រកឫសគល់ |
+| :--- | :--- | :--- | :--- | :--- |
+| **លុបចោលភ្លាម (Drop)** | សូន្យ (បាត់បង់ដោយស្ងាត់ៗ) | ខ្ពស់ (មិនដែលស្ទះ) | ទាប | មិនអាចទៅរួច |
+| **Retry រហូតគ្មានដែនកំណត់** | ខ្ពស់ | ជិតសូន្យ (Queue ស្ទះ) | ខ្ពស់ (Alert រោទ៍រហូត) | ពិបាកខ្លាំង |
+| **Dead Letter Queue (DLQ)** | អតិបរមា (រក្សាទុក 100%) | អតិបរមា (ជួរហូរធម្មតា) | មធ្យម (ត្រូវការ Replay DLQ) | ល្អឥតខ្ចោះ (ទិន្នន័យនៅពេញលេញ) |
+| **Database DLQ Table** | អតិបរមា | ខ្ពស់ | ទាប (ប្រើ SQL ស្រួល) | ល្អឥតខ្ចោះ |
+
+## Decision
+
+- **កំណត់ DLQ ជាមួយកម្រិត Retry កំណត់ជានិច្ច៖** កំណត់ `maxReceiveCount: 3` (ឬ ៥)។ ប្រសិនបើសារមួយបរាជ័យ ៣ ដង ត្រូវបង្វែរវាចូលទៅក្នុង DLQ ភ្លាម។
+- **ភ្ជាប់មូលហេតុនៃការបរាជ័យទៅក្នុង Metadata៖** នៅពេលបញ្ជូនទៅ DLQ ត្រូវបន្ថែមព័ត៌មានអំពីមូលហេតុបរាជ័យ, Stack trace, Timestamp, និងឈ្មោះ Queue ដើមទៅក្នុង Message Headers។
+- **បង្កើត Alert លើចំនួនសារក្នុង DLQ៖** សារណាដែលធ្លាក់ចូលក្នុង DLQ បង្ហាញពីបញ្ហា Bug កូដ ឬការប្រែប្រួលទម្រង់ទិន្នន័យ។ ត្រូវផ្ញើ Alert ទៅកាន់ Slack ឬ PagerDuty ភ្លាមនៅពេល `DLQ.depth > 0`។
+- **បង្កើតឧបករណ៍ Replay៖** បង្កើត Script ឬ Admin API ដើម្បីរុញសារដែលកែសម្រួលរួចពី DLQ ត្រឡប់ចូល Main Queue វិញ ក្រោយពេលដែលកូដ Bug ត្រូវបាន Deploy ដោះស្រាយរួចរាល់។
+
+## Implementation
+
+### 1. ការបង្កើត Dead Letter Exchange ក្នុង RabbitMQ (amqplib)៖
+
+```typescript
+import amqp from 'amqplib';
+
+export async function setupQueues(channel: amqp.Channel) {
+  // ១. បង្កើត Dead Letter Exchange និង DLQ
+  await channel.assertExchange('dlx', 'direct', { durable: true });
+  await channel.assertQueue('orders.dlq', { durable: true });
+  await channel.bindQueue('orders.dlq', 'dlx', 'orders');
+
+  // ២. បង្កើត Queue ចម្បងភ្ជាប់ជាមួយ DLX
+  await channel.assertQueue('orders.main', {
+    durable: true,
+    arguments: {
+      'x-dead-letter-exchange': 'dlx',
+      'x-dead-letter-routing-key': 'orders',
+      'x-message-ttl': 86400000, // ២៤ ម៉ោង
+    },
+  });
+}
+```
+
+### 2. Consumer ដែលរាប់ចំនួនដងបរាជ័យ និងបញ្ជូនទៅ DLQ៖
+
+```typescript
+export async function consumeOrders(channel: amqp.Channel) {
+  await channel.prefetch(10);
+
+  channel.consume('orders.main', async (msg) => {
+    if (!msg) return;
+
+    try {
+      const order = JSON.parse(msg.content.toString());
+      await processOrder(order);
+      channel.ack(msg);
+    } catch (err) {
+      const deathCount = msg.properties.headers?.['x-death']?.[0]?.count || 0;
+      console.error(`[Consumer] បរាជ័យក្នុងដំណើរការសារ (លើកទី៖ ${deathCount + 1}):`, (err as Error).message);
+
+      if (deathCount >= 3) {
+        // លើសកម្រិត retry: reject ដោយមិនដាក់ចូលជួរវិញ ដែលនឹងរុញសារទៅកាន់ DLX
+        console.error(`[Consumer] បង្វែរសារពុល (Poison Pill) ចូលទៅកាន់ DLQ`);
+        channel.nack(msg, false, false); // requeue = false -> ចូល DLQ
+      } else {
+        // បរាជ័យបណ្តោះអាសន្ន: reject រួចដាក់ចូលជួរវិញ
+        channel.nack(msg, false, true); // requeue = true
+      }
+    }
+  });
+}
+```
+
+### 3. Script សម្រាប់ Replay សារពី DLQ ត្រឡប់ចូលជួរដើមវិញ៖
+
+```typescript
+// Script សម្រាប់ទាញសារពី DLQ រុញចូល Main Queue វិញ ក្រោយពេល Deploy កូដកែ Bug រួច
+export async function redriveDlq(channel: amqp.Channel, count = 100) {
+  let redriven = 0;
+  for (let i = 0; i < count; i++) {
+    const msg = await channel.get('orders.dlq', { noAck: false });
+    if (!msg) break;
+
+    // បញ្ជូនសារចូល Main Queue វិញ
+    channel.sendToQueue('orders.main', msg.content, {
+      persistent: true,
+      headers: { ...msg.properties.headers, redrivenFromDlq: true },
+    });
+    channel.ack(msg);
+    redriven++;
+  }
+  console.log(`បានបញ្ជូនសារចំនួន ${redriven} ពី orders.dlq ត្រឡប់ចូល orders.main ដោយជោគជ័យ`);
+}
+```
+
+## Verification
+
+1. **ការចាក់បញ្ចូលសារពុល (Poison Pill Injection)៖** បញ្ជូន JSON ដែលខូចទម្រង់ (`"{invalid-json"`) ចូលទៅក្នុង `orders.main`។
+2. **ផ្ទៀងផ្ទាត់ថាមិនមានការស្ទះជួរ៖** បញ្ជូនសារ Order ត្រឹមត្រូវចំនួន ៥០ ភ្លាមៗពីក្រោយសារដែលខូចនោះ។
+3. **ផ្ទៀងផ្ទាត់ការញែក DLQ៖** ពិនិត្យឱ្យប្រាកដថា ក្រោយពេលបរាជ័យ ៣ ដង សារដែលខូចត្រូវបានបង្វែរចូលទៅក្នុង `orders.dlq` ខណៈដែលសារត្រឹមត្រូវទាំង ៥០ ទៀតត្រូវបានដំណើរការដោយជោគជ័យភ្លាមៗដោយគ្មានការរង់ចាំ។
+4. **ការរោទ៍ Alert៖** ផ្ទៀងផ្ទាត់ថា Monitoring ប្រព័ន្ធបញ្ចេញ Alert នៅពេលចំនួនសារក្នុង `orders.dlq` កើនឡើងពី ០ ទៅ ១។
+
+## Why
+
+ក្នុងប្រព័ន្ធ Distributed Systems ការរំពឹងថាគ្រប់ Input ទាំងអស់សុទ្ធតែត្រឹមត្រូវ ហើយគ្រប់ប្រព័ន្ធខាងក្រៅសុទ្ធតែដំណើរការល្អ គឺជាការយល់ច្រឡំដ៏គ្រោះថ្នាក់។ ការផ្លាស់ប្តូរ Schema, Input ដែលខូចពី User, និងបញ្ហា Race Condition នឹងបង្កើតសារដែលមិនអាចដំណើរការបានជាមិនខាន។
+
+បើគ្មាន DLQ ប្រព័ន្ធត្រូវបង្ខំចិត្តជ្រើសរើសជម្រើសដ៏អាក្រក់ពីរ៖ ទីមួយ លុបសារចោលដែលនាំឱ្យបាត់បង់ទិន្នន័យអតិថិជន ឬទីពីរ ទុកឱ្យសារនោះគាំង Loop ដែលធ្វើឱ្យស្ទះប្រព័ន្ធសម្រាប់មនុស្សគ្រប់គ្នា។ DLQ ផ្តល់នូវដំណោះស្រាយដ៏ល្អប្រសើរបំផុត៖ គ្មានការបាត់បង់ទិន្នន័យ និងគ្មានការកកស្ទះប្រព័ន្ធ។
+
+## When Not To Use
+
+- **Metrics និង Telemetry ដែលមាន Throughput ខ្ពស់៖** សម្រាប់ Log ទូទៅ ឬ Sensor ping ដែលការបាត់បង់សារខ្លះមិនប៉ះពាល់ដល់អាជីវកម្ម ការប្រើប្រាស់ DLQ បង្កើតតែបន្ទុក Disk និងការថែទាំបន្ថែមប៉ុណ្ណោះ។
+- **ប្រព័ន្ធដែលទាមទារលំដាប់លំដោយ FIFO ដាច់ខាត៖** ក្នុងគណនេយ្យហិរញ្ញវត្ថុដែលប្រតិបត្តិការទី ២ អាស្រ័យលើប្រតិបត្តិការទី ១ ដាច់ខាត ការរំលងសារទី ១ ទៅកាន់ DLQ នឹងធ្វើឱ្យតួលេខលែងត្រូវគ្នា។ ក្នុងករណីនេះ Partition ទាំងមូលត្រូវតែផ្អាករង់ចាំការដោះស្រាយ។
+
+## Common Mistakes
+
+- **DLQ ដែលគ្មានអ្នកមើល (Write-Only Storage)៖** បញ្ជូនសារចូល DLQ តែគ្មាន Alert ឬ Dashboard ពិនិត្យ ដែលធ្វើឱ្យបញ្ហាកប់ទុកចោលរហូតដល់សារផុតកំណត់លុបចោល។
+- **គ្មានដែនកំណត់ទំហំ ឬអាយុកាលសារ (TTL)៖** ភ្លេចកំណត់ TTL ឬកម្រិតទំហំលើ DLQ ដែលអាចធ្វើឱ្យអស់ទំហំ Hard disk របស់ Message Broker ពេលមាន Outage ធំ។
+- **Replay ដោយមិនបានកែ Bug ជាមុន៖** រុញសារពី DLQ ចូល Main Queue វិញទាំងដែលមិនទាន់បាន Deploy កូដកែ Bug ដែលបណ្តាលឱ្យសារទាំងនោះធ្លាក់ចូល DLQ សាជាថ្មីម្តងទៀត។

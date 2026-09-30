@@ -1,0 +1,16 @@
+{
+  "askAi": "Ask AI",
+  "open": "Open AI Assistant",
+  "title": "Thinking partner",
+  "context": "Context:",
+  "thinking": "Thinking...",
+  "placeholder": "Describe your problem or constraints...",
+  "send": "Send",
+  "greetingTopic": "Let's think through “{{title}}”. Tell me about your situation (scale, stack, and what you've measured) and I'll help you weigh the options before any code gets written.",
+  "greetingLesson": "Working through “{{title}}”? Ask me to explain a step another way, show one more example, or give you a hint on the exercise before you check the answer.",
+  "greetingGeneral": "Describe the problem you're facing. I'll ask about your context first, then help you compare options and trade-offs, not just hand you code.",
+  "error": "Error communicating with the AI assistant. Please try again.",
+  "previewNotice": "Preview: the AI assistant isn’t connected yet, so it can’t answer questions.",
+  "notConnected": "I’m not connected yet. The AI assistant will run as a separate service, and this panel is a preview of how it will work.\n\nUntil then, the **How to Think** page walks through the same method: context, options, trade-offs, decision.",
+  "inputHint": "Enter to send · Shift+Enter for a new line"
+}

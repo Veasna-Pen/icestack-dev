@@ -1,0 +1,172 @@
+---
+title: "Fastify"
+question: "តើត្រូវរៀបចំ Undici Client Timeouts, Hook-based Idempotency, និង Rate Limiting ក្នុង Fastify ដោយរបៀបណា?"
+summary: "Undici Client Timeouts, @fastify/rate-limit, Redis Caching Plugins, Idempotency ផ្អែកលើ Fastify Hooks, និង Graceful Process Shutdown ក្នុង Fastify។"
+tags: [fastify, nodejs, typescript, undici, implementation]
+related: [patterns/retry, patterns/idempotency, patterns/caching, patterns/rate-limiting]
+order: 12
+updated: "2026-09-12"
+contributors: [veasna]
+translation: draft
+---
+
+ការអនុវត្ត Patterns សម្រាប់ Fastify v5 លើ Node.js 22+ ដែលមាន Overhead ទាបបំផុត។ ផ្តោតលើ Undici Connection Timeouts, Idempotency តាមរយៈ Lifecycle Hooks, Rate Limiting ជាមួយ Redis, និង Graceful Process Shutdown។
+
+## Timeouts first
+
+Fastify កំណត់ Connection Timeouts នៅលើ Server ហើយការហៅ HTTP ខាងក្រៅប្រើប្រាស់បណ្ណាល័យ `undici` ដែលមានល្បឿនលឿនបំផុតក្នុង Node.js៖
+
+```ts
+import Fastify from 'fastify';
+import { request, Agent } from 'undici';
+
+const fastify = Fastify({
+  connectionTimeout: 5000,
+  keepAliveTimeout: 5000,
+  requestTimeout: 10000 // រយៈពេលអតិបរមានៃសំណើនីមួយៗ
+});
+
+const dispatcher = new Agent({
+  connect: { timeout: 1500 },
+  headersTimeout: 2000,
+  bodyTimeout: 2000
+});
+
+fastify.get('/rates', async (req, reply) => {
+  try {
+    const { statusCode, body } = await request('https://api.example.com/rates', {
+      dispatcher,
+      signal: AbortSignal.timeout(2500)
+    });
+
+    if (statusCode !== 200) {
+      return reply.code(502).send({ error: `Upstream HTTP ${statusCode}` });
+    }
+
+    const data = await body.json();
+    return reply.send(data);
+  } catch (err: any) {
+    if (err.name === 'TimeoutError') {
+      return reply.code(504).send({ error: 'Gateway timeout កំពុងទាក់ទង rates provider' });
+    }
+    throw err;
+  }
+});
+```
+
+## Retry with backoff
+
+Retry កំហុសបណ្តាញ Transient និង 5xx ដោយប្រើ Exponential Backoff និង Full Jitter៖
+
+```ts
+import { request } from 'undici';
+
+const TRANSIENT_CODES = new Set([408, 429, 500, 502, 503, 504]);
+
+export async function fetchWithRetry<T>(url: string, maxRetries = 3): Promise<T> {
+  let attempt = 0;
+  while (attempt < maxRetries) {
+    attempt++;
+    try {
+      const res = await request(url, { signal: AbortSignal.timeout(2000) });
+      if (!TRANSIENT_CODES.has(res.statusCode)) {
+        return (await res.body.json()) as T;
+      }
+      if (attempt === maxRetries) {
+        throw new Error(`Upstream បរាជ័យជាមួយ Status ${res.statusCode} ក្រោយ ${attempt} ដង`);
+      }
+    } catch (err: any) {
+      if (attempt === maxRetries || (err.name !== 'TimeoutError' && err.code !== 'UND_ERR_CONNECT_TIMEOUT')) {
+        throw err;
+      }
+    }
+
+    const delay = Math.random() * Math.min(2000, 100 * 2 ** (attempt - 1));
+    await new Promise(resolve => setTimeout(resolve, delay));
+  }
+  throw new Error('Unreachable');
+}
+```
+
+## Idempotency keys តាមរយៈ Fastify hooks
+
+ប្រើប្រាស់ Lifecycle Hooks `preHandler` និង `onSend` របស់ Fastify ដើម្បីគ្រប់គ្រង Idempotency៖
+
+```ts
+import { FastifyPluginAsync } from 'fastify';
+import fp from 'fastify-plugin';
+
+export const idempotencyPlugin: FastifyPluginAsync = fp(async (fastify) => {
+  fastify.addHook('preHandler', async (request, reply) => {
+    if (request.method !== 'POST') return;
+
+    const key = request.headers['idempotency-key'] as string;
+    if (!key) return;
+
+    const cached = await fastify.redis.get(`idempotency:${key}`);
+    if (cached) {
+      if (cached === 'IN_FLIGHT') {
+        return reply.code(409).send({ error: 'សំណើកំពុងដំណើរការនៅឡើយ' });
+      }
+      const { status, body } = JSON.parse(cached);
+      return reply.code(status).send(body);
+    }
+
+    const acquired = await fastify.redis.set(`idempotency:${key}`, 'IN_FLIGHT', 'EX', 120, 'NX');
+    if (!acquired) {
+      return reply.code(409).send({ error: 'មានសំណើស្ទួនក្នុងពេលតែមួយ' });
+    }
+
+    (request as any).idempotencyKey = key;
+  });
+
+  fastify.addHook('onSend', async (request, reply, payload) => {
+    const key = (request as any).idempotencyKey;
+    if (key && reply.statusCode >= 200 && reply.statusCode < 300) {
+      const record = JSON.stringify({ status: reply.statusCode, body: JSON.parse(payload as string) });
+      await fastify.redis.set(`idempotency:${key}`, record, 'EX', 86400);
+    }
+    return payload;
+  });
+});
+```
+
+## Rate limiting (`@fastify/rate-limit`)
+
+Rate Limiter ចែករំលែកឆ្លងកាត់ Cluster តាមរយៈ Redis៖
+
+```ts
+import rateLimit from '@fastify/rate-limit';
+
+await fastify.register(rateLimit, {
+  max: 100,
+  timeWindow: '1 minute',
+  redis: fastify.redis,
+  keyGenerator: (req) => (req.headers['x-api-key'] as string) || req.ip,
+  errorResponseBuilder: (_req, context) => ({
+    statusCode: 429,
+    error: 'Too Many Requests',
+    message: `បានលើសកម្រិតកំណត់។ សូមព្យាយាមម្តងទៀតក្នុងរយៈពេល ${Math.ceil(context.ttl / 1000)} វិនាទី។`
+  })
+});
+```
+
+## Graceful shutdown
+
+ចាប់យក Signals (`SIGTERM`, `SIGINT`) ដើម្បីបញ្ចប់ការងារដែលកំពុងរត់ និងបិទ Database Pools ដោយសុវត្ថិភាព៖
+
+```ts
+const closeGracefully = async (signal: string) => {
+  fastify.log.info(`ទទួលបាន ${signal}។ កំពុងបិទ Fastify server...`);
+  try {
+    await fastify.close();
+    process.exit(0);
+  } catch (err) {
+    fastify.log.error(err, 'មានបញ្ហាពេលបិទ Server');
+    process.exit(1);
+  }
+};
+
+process.on('SIGINT', () => closeGracefully('SIGINT'));
+process.on('SIGTERM', () => closeGracefully('SIGTERM'));
+```

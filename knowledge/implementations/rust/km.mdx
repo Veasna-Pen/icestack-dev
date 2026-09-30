@@ -1,0 +1,196 @@
+---
+title: "Rust"
+question: "តើត្រូវអនុវត្ត Cancel-Safe Tokio Timeouts, SQLx Connection Pooling, និង Governor ក្នុង Rust ដោយរបៀបណា?"
+summary: "Cancel-safe timeouts ជាមួយ Tokio, retry ជាមួយ exponential backoff និង full jitter, connection pooling ជាមួយ SQLx, និង rate limiting ជាមួយ Governor ក្នុង async Rust។"
+tags: [rust, systems, backend, implementation, tokio]
+related: [patterns/retry, patterns/circuit-breaker, patterns/rate-limiting, patterns/idempotency]
+order: 7
+updated: "2026-09-12"
+contributors: [veasna]
+translation: draft
+---
+
+ការអនុវត្ត Patterns ប្រកបដោយភាពធន់សម្រាប់ Async Rust 1.78+។ ផ្តោតលើ Cancel-Safe Tokio Timeouts, Retries ជាមួយ Full Jitter, ការគ្រប់គ្រង SQLx Connection Pool, Governor Rate Limiting, និង Atomic Transaction Idempotency។
+
+## Timeouts first
+
+នៅក្នុង async Rust ការ drop future ចោល គឺជាការ cancel វា។ មុខងារ `tokio::time::timeout` របស់ Tokio កំណត់ deadline ដោយការ drop future ខាងក្នុងចោល ប្រសិនបើវាមិនទាន់បញ្ចប់ក្នុងរយៈពេលដែលបានកំណត់៖
+
+```rust
+use std::time::Duration;
+use reqwest::Client;
+
+pub async fn fetch_rates(client: &Client) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let request_future = async {
+        let res = client
+            .get("https://api.example.com/rates")
+            .send()
+            .await?
+            .error_for_status()?
+            .text()
+            .await?;
+        Ok::<String, reqwest::Error>(res)
+    };
+
+    // រុំព័ទ្ធ future ជាមួយ timeout ២ វិនាទី
+    match tokio::time::timeout(Duration::from_secs(2), request_future).await {
+        Ok(Ok(body)) => Ok(body),
+        Ok(Err(req_err)) => Err(Box::new(req_err)),
+        Err(_elapsed) => Err("Request ផុតពេលកំណត់ (timed out) ក្រោយ ២ វិនាទី".into()),
+    }
+}
+```
+
+<Callout type="warning" title="ប្រយ័ត្នចំពោះ Cancel-safety ក្នុង Rust">
+ដោយសារ Tokio ធ្វើការ cancel future ដោយការ drop វាចោល ត្រូវប្រាកដថា future ណាដែលបញ្ជូនទៅកាន់ `timeout` គឺមានលក្ខណៈ **cancel-safe** (ដូចជាការអានទិន្នន័យពី network)។ ប្រសិនបើអ្នក drop future នៅកណ្តាលទីពេលកំពុងសរសេរ state ចូល internal buffer ឬ channel នោះទិន្នន័យអាចនឹងខូចខាត។
+</Callout>
+
+## Retry with backoff
+
+Retry តែលើ transient network failures ជាមួយ exponential backoff, full jitter និងចំនួនដងអតិបរមា៖
+
+```rust
+use std::time::Duration;
+use rand::Rng;
+
+pub async fn with_retry<F, Fut, T, E>(
+    max_attempts: usize,
+    base_delay: Duration,
+    mut operation: F,
+) -> Result<T, E>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, E>>,
+{
+    let mut rng = rand::rng();
+
+    for attempt in 1..=max_attempts {
+        match operation().await {
+            Ok(val) => return Ok(val),
+            Err(err) if attempt == max_attempts => return Err(err),
+            Err(_) => {
+                // Exponential backoff ជាមួយ full jitter
+                let max_ms = base_delay.as_millis() * (1 << (attempt - 1));
+                let jittered_ms = rng.random_range(0..=max_ms);
+                tokio::time::sleep(Duration::from_millis(jittered_ms as u64)).await;
+            }
+        }
+    }
+    unreachable!()
+}
+```
+
+## Database connection pool (SQLx)
+
+SQLx ផ្តល់នូវ asynchronous connection pool សម្រាប់ PostgreSQL ដែលមានការត្រួតពិនិត្យ type តឹងរ៉ឹងតាំងពីពេល compile-time៖
+
+```rust
+use sqlx::postgres::{PgPool, PgPoolOptions};
+use std::time::Duration;
+
+pub async fn init_db_pool(database_url: &str) -> Result<PgPool, sqlx::Error> {
+    PgPoolOptions::new()
+        // រូបមន្តគណនាទំហំ៖ 2 * CPU_CORES + SPINDLES
+        .max_connections(10)
+        // រក្សាទុក connection ឱ្យក្តៅស្រាប់ដើម្បីចៀសវាង handshake delay
+        .min_connections(2)
+        // រយៈពេលរង់ចាំអតិបរមាដើម្បីទាញយក connection ពី pool
+        .acquire_timeout(Duration::from_secs(3))
+        // បង្វិល connection ថ្មីដើម្បីការពារ stale TCP socket ក្រោយ AWS NLB
+        .max_lifetime(Duration::from_secs(15 * 60))
+        // សម្អាត connection ណាដែលនៅទំនេរលើសពី ៥ នាទី
+        .idle_timeout(Duration::from_secs(5 * 60))
+        .connect(database_url)
+        .await
+}
+```
+
+## Rate limiting with Governor
+
+In-memory GCRA / token-bucket rate limiting ដោយប្រើប្រាស់ crate `governor`៖
+
+```rust
+use governor::{Quota, RateLimiter};
+use nonzero_ext::nonzero;
+use std::sync::Arc;
+
+// អនុញ្ញាត ១០០ requests ក្នុងមួយវិនាទី ជាមួយ burst capacity ចំនួន ២០
+pub fn create_rate_limiter() -> Arc<RateLimiter<governor::state::NotKeyed, governor::state::InMemoryState, governor::clock::DefaultClock>> {
+    let quota = Quota::per_second(nonzero!(100u32)).allow_burst(nonzero!(20u32));
+    Arc::new(RateLimiter::direct(quota))
+}
+
+pub async fn handle_request(limiter: &RateLimiter<governor::state::NotKeyed, governor::state::InMemoryState, governor::clock::DefaultClock>) -> Result<&'static str, &'static str> {
+    if limiter.check().is_ok() {
+        Ok("Request អនុញ្ញាត")
+    } else {
+        Err("HTTP 429: Too Many Requests")
+    }
+}
+```
+
+## Idempotency with SQL transactions
+
+កត់ត្រា idempotency key នៅក្នុង database transaction តែមួយជាមួយ business logic៖
+
+```rust
+use sqlx::{PgPool, Postgres, Transaction};
+
+pub async fn create_order_idempotent(
+    pool: &PgPool,
+    idempotency_key: &str,
+    customer_id: &str,
+    amount_cents: i64,
+) -> Result<String, sqlx::Error> {
+    let mut tx: Transaction<'_, Postgres> = pool.begin().await?;
+
+    // 1. សាកល្បងកក់ ឬពិនិត្យ idempotency key
+    let existing_response: Option<String> = sqlx::query_scalar!(
+        r#"
+        INSERT INTO idempotency_keys (key, status, created_at)
+        VALUES ($1, 'processing', NOW())
+        ON CONFLICT (key) DO UPDATE SET key = EXCLUDED.key
+        RETURNING response
+        "#,
+        idempotency_key
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+
+    if let Some(cached) = existing_response {
+        // ផ្តល់ទិន្នន័យពី cache មកវិញ
+        tx.rollback().await?;
+        return Ok(cached);
+    }
+
+    // 2. ដំណើរការ business logic
+    let order_id = sqlx::query_scalar!(
+        r#"
+        INSERT INTO orders (customer_id, amount_cents, status)
+        VALUES ($1, $2, 'confirmed')
+        RETURNING id
+        "#,
+        customer_id,
+        amount_cents
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+
+    // 3. រក្សាទុក response និង commit transaction
+    let response_body = format!(r#"{{"order_id":"{}","status":"confirmed"}}"#, order_id);
+    sqlx::query!(
+        r#"
+        UPDATE idempotency_keys
+        SET status = 'completed', response = $1
+        WHERE key = $2
+        "#,
+        response_body,
+        idempotency_key
+    )
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    Ok(response_body)
+}
+```

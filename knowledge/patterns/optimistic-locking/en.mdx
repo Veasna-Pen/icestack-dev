@@ -1,0 +1,171 @@
+---
+title: "Optimistic Locking"
+question: "How do I prevent concurrent updates from overwriting each other without blocking database rows?"
+summary: "Allow concurrent readers without locking. On write, verify that the record's version or timestamp has not changed since it was read (UPDATE ... WHERE id = ? AND version = ?). If changed, abort and retry."
+tags: [database, concurrency, optimistic-locking, postgresql, transactions]
+related: [problems/database-deadlocks, patterns/idempotency, patterns/distributed-lock]
+order: 16
+updated: "2026-09-12"
+contributors: [veasna]
+---
+
+## Context
+
+In web applications, the classic **Lost Update Problem** occurs when two users read the same record, edit it, and save it back:
+1. Alice reads article #10 (Title: "Draft A").
+2. Bob reads article #10 (Title: "Draft A").
+3. Alice updates the title to "Draft B" and saves.
+4. Bob updates the title to "Draft C" and saves.
+
+Bob's save overwrites Alice's changes completely without warning. Alice's edits are lost forever.
+
+There are two primary approaches to prevent this:
+- **Pessimistic Locking (`SELECT FOR UPDATE`):** Locks the row the moment Alice opens it, forcing Bob to wait or error out. (Horrible for web applications where human think time takes minutes, keeping database transactions open and exhausting pool connections).
+- **Optimistic Locking:** Assumes conflicts are rare. Reads never lock. Each record contains an incrementing `version` column. When saving, the application updates only if the version in the database still matches the version Alice read (`WHERE id = 10 AND version = 1`).
+
+## Symptoms
+
+- Users complain that their edits mysteriously disappear or get overwritten by another colleague working on the same record.
+- In e-commerce, two shoppers purchase the last available seat on a flight or item in stock because inventory checks happen before concurrent writes commit.
+- Using `SELECT ... FOR UPDATE` causes massive database lock contention, slow API response times, and frequent `deadlock detected` errors.
+- Database connection pools run dry because transactions are held open waiting for external validation or human review.
+
+<Callout type="warning" title="Pessimistic locks cannot span human think time">
+Never open a database transaction with `SELECT ... FOR UPDATE` while waiting for a user to fill out a form or click "Submit". Transactions must never wait on network clients or humans.
+</Callout>
+
+## Diagnose
+
+1. **Audit update queries:** Are your application's write statements blind overwrites (`UPDATE products SET stock = stock - 1 WHERE id = ?`) or do they verify state?
+2. **Review table schemas:** Does your table have a `version INT DEFAULT 1` or `updated_at TIMESTAMP` column used in update clauses?
+3. **Inspect lock waiting metrics:** Check `pg_stat_activity` for transactions in `idle in transaction` or waiting on row-level exclusive locks.
+4. **Evaluate conflict frequency:** How often do two writes realistically collide on the exact same row? If collisions happen on < 1% of writes, optimistic locking is vastly superior.
+
+## Options
+
+1. **Last Write Wins (Blind Update):** The default SQL behavior. The last query to execute overwrites whatever was there. (Causes silent data corruption).
+2. **Pessimistic Row Locking (`SELECT FOR UPDATE`):** Acquires an exclusive lock inside an open SQL transaction. (Safe for sub-10ms machine transactions, fatal if held across HTTP boundaries).
+3. **Optimistic Locking with Version Number:** Increment an integer `version` on every write (`UPDATE tbl SET val = ?, version = version + 1 WHERE id = ? AND version = ?`).
+4. **Optimistic Locking with Compare-and-Swap (CAS):** Check business fields directly (`UPDATE accounts SET balance = balance - 100 WHERE id = ? AND balance >= 100`).
+
+## Trade-offs
+
+| Strategy | Read Concurrency | Throughput Under Low Contention | Throughput Under High Contention | Risk of Stale Overwrite |
+| :--- | :--- | :--- | :--- | :--- |
+| **Last Write Wins** | Unlimited | High | High | **100% (Silent Data Loss)** |
+| **Pessimistic Locking** | Blocked | Low (lock waits) | Degrades (Deadlocks) | 0% |
+| **Optimistic (Version)** | Unlimited | **Maximum (zero locks)** | Degrades (frequent retries) | 0% |
+| **Compare-and-Swap** | Unlimited | **Maximum** | High | 0% |
+
+## Decision
+
+- **Use Optimistic Locking for human-driven web workflows:** When users load a form, edit fields, and submit changes (content management, customer profiles, CRM records), always use a `version` column.
+- **Return HTTP 409 Conflict on version mismatch:** If the update returns 0 affected rows, abort the transaction and return a `409 Conflict` to the client. The frontend can prompt the user: *"This record was modified by another user while you were editing. Would you like to review their changes?"*
+- **Use atomic Compare-and-Swap for counters and inventory:** For high-throughput automated updates (e.g. decrementing stock or deducting account balance), use atomic condition checks without full versioning:
+  ```sql
+  UPDATE inventory SET stock = stock - 1 WHERE product_id = $1 AND stock >= 1;
+  ```
+- **Use Pessimistic Locking only for tight, high-contention machine loops:** If 500 requests per second are competing for 1 concert ticket and collisions exceed 20%, optimistic retry loops will waste CPU; use `SELECT FOR UPDATE` inside a sub-5ms transaction instead.
+
+## Implementation
+
+### 1. Database Schema with Version Column:
+
+```sql
+CREATE TABLE articles (
+  id UUID PRIMARY KEY,
+  title VARCHAR(255) NOT NULL,
+  content TEXT NOT NULL,
+  version INT NOT NULL DEFAULT 1,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+```
+
+### 2. TypeScript Service with Optimistic Concurrency and Conflict Detection:
+
+```typescript
+export class ConflictError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ConflictError';
+  }
+}
+
+export class ArticleService {
+  constructor(private readonly db: any) {}
+
+  async updateArticle(id: string, newTitle: string, expectedVersion: number) {
+    // Execute atomic update verifying version has not changed
+    const result = await this.db.query(
+      `UPDATE articles 
+       SET title = $1, 
+           version = version + 1, 
+           updated_at = NOW() 
+       WHERE id = $2 AND version = $3 
+       RETURNING version`,
+      [newTitle, id, expectedVersion]
+    );
+
+    // If 0 rows were updated, a concurrent modification occurred!
+    if (result.rowCount === 0) {
+      // Fetch latest state to provide diagnostic details
+      const latest = await this.db.query('SELECT version, updated_at FROM articles WHERE id = $1', [id]);
+      const currentVersion = latest.rows[0]?.version;
+
+      throw new ConflictError(
+        `Optimistic lock failed for article ${id}. Expected version ${expectedVersion}, but found version ${currentVersion}.`
+      );
+    }
+
+    return { updatedVersion: result.rows[0].version };
+  }
+}
+```
+
+### 3. Automated Retry Wrapper for Machine-Driven Optimistic Updates:
+
+```typescript
+export async function withOptimisticRetry<T>(
+  operation: () => Promise<T>,
+  maxRetries = 3
+): Promise<T> {
+  let attempts = 0;
+  while (attempts < maxRetries) {
+    try {
+      return await operation();
+    } catch (err) {
+      if (err instanceof ConflictError && attempts < maxRetries - 1) {
+        attempts++;
+        // Small random jitter before retry to desynchronize concurrent workers
+        await new Promise((res) => setTimeout(res, Math.random() * 50));
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw new Error('Exceeded maximum optimistic locking retries');
+}
+```
+
+## Verification
+
+1. **Concurrent write collision test:** Run two concurrent processes updating the same article row with the same initial version. Verify that exactly one update succeeds with row count 1, while the second throws `ConflictError` with row count 0.
+2. **Zero database lock duration:** Measure database lock waits during 5,000 concurrent reads and updates. Confirm that `pg_locks` shows zero long-running exclusive locks on the target table.
+3. **HTTP 409 response verification:** In your web API tests, simulate a stale PUT request with `version: 1` when the database is at `version: 2`. Verify that the API returns `409 Conflict` with a helpful payload rather than corrupting the data.
+
+## Why
+
+Relational database transactions are expensive when they hold locks across long periods. Holding an exclusive row lock consumes memory, prevents other users from reading or writing, and drastically limits application throughput.
+
+Optimistic Locking recognizes that in the vast majority of real-world applications, concurrent collisions on the exact same row are rare. By shifting conflict detection from preventative blocking locks to validation at commit time, it unlocks maximum read concurrency, avoids deadlocks, and eliminates the risk of lost updates.
+
+## When Not To Use
+
+- **High-contention flash sales:** When 10,000 users are simultaneously trying to claim 50 items within 2 seconds, optimistic locking causes 9,950 failed updates and retry storms that overwhelm the database CPU. Use queuing (Redis queue) or pessimistic `SELECT FOR UPDATE SKIP LOCKED` instead.
+- **Append-only data:** If data is only inserted (e.g. logging, time-series events) and never updated, version checking is completely redundant.
+
+## Common Mistakes
+
+- **Forgetting to check the affected row count:** Executing `UPDATE ... WHERE version = ?` but failing to check whether `rowCount === 0` means the query silently does nothing while the application thinks it succeeded.
+- **Relying on timestamps instead of integer versions:** Timestamps can suffer from clock skew, insufficient microsecond precision, or identical sub-millisecond commits. Always prefer integer versions (`version + 1`).
+- **Infinite optimistic retry loops:** If retrying automatically without a max attempt limit, two competing workers can trigger an infinite livelock loop under heavy load.

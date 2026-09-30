@@ -1,0 +1,179 @@
+---
+title: "Django"
+question: "តើត្រូវកំណត់ Database Statement Timeouts, Atomic Idempotency, និង Redis Caching ក្នុង Django ដោយរបៀបណា?"
+summary: "Database Statement Timeouts, Atomic Idempotency Keys, Caching ជាមួយ django-redis, Rate Limiting ជាមួយ django-ratelimit, និង Celery Background Tasks ក្នុង Django។"
+tags: [django, python, celery, orm, implementation]
+related: [patterns/retry, patterns/idempotency, patterns/caching, patterns/rate-limiting]
+order: 9
+updated: "2026-09-12"
+contributors: [veasna]
+translation: draft
+---
+
+ការអនុវត្ត Patterns ជាក់ស្តែងសម្រាប់ Django 5+ និង Python 3.12+ ក្នុង Production។ ផ្តោតលើ Database Statement Timeouts, ការធានា Idempotency តាមរយៈ transaction.atomic(), ការប្រើប្រាស់ Redis Cache, Middleware Rate Limiting, និង Celery Retries។
+
+## Timeouts first
+
+ក្នុង Django រាល់ការហៅ Network ត្រូវកំណត់ Timeout ជាដាច់ខាត ហើយ Database Queries គួរកំណត់ Statement Timeout ក្នុង `settings.py`៖
+
+```python
+# settings.py
+DATABASES = {
+    'default': {
+        'ENGINE': 'django.db.backends.postgresql',
+        'NAME': 'production_db',
+        'USER': 'postgres',
+        'PASSWORD': 'secretpassword',
+        'HOST': 'localhost',
+        'PORT': '5432',
+        'CONN_MAX_AGE': 60, # ប្រើ connection ឡើងវិញក្នុងរយៈពេល ៦០ វិនាទី
+        'OPTIONS': {
+            'options': '-c statement_timeout=5000ms -c lock_timeout=2000ms',
+        },
+    }
+}
+```
+
+សម្រាប់ការហៅ Outbound HTTP ត្រូវបញ្ជាក់ Timeout ជានិច្ច៖
+
+```python
+import httpx
+from django.http import JsonResponse
+
+def get_rates(request):
+    try:
+        response = httpx.get("https://api.example.com/rates", timeout=2.0)
+        response.raise_for_status()
+        return JsonResponse(response.json())
+    except httpx.TimeoutException:
+        return JsonResponse({"error": "Rates provider ហួសពេលកំណត់ (Timeout)"}, status=504)
+    except httpx.HTTPStatusError as exc:
+        return JsonResponse({"error": f"Upstream API ឆ្លើយតប {exc.response.status_code}"}, status=502)
+```
+
+## Retry with backoff (Tenacity)
+
+ប្រើប្រាស់បណ្ណាល័យ `tenacity` ដើម្បី Retry ការហៅ API ដែលជួបបញ្ហា Transient ជាមួយ Exponential Backoff និង Jitter៖
+
+```python
+import httpx
+from tenacity import retry, stop_after_attempt, wait_exponential_jitter, retry_if_exception
+
+def is_transient_error(exception):
+    if isinstance(exception, httpx.TimeoutException):
+        return True
+    if isinstance(exception, httpx.HTTPStatusError):
+        return exception.response.status_code in {408, 429, 500, 502, 503, 504}
+    return False
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential_jitter(initial=0.2, max=2.0),
+    retry=retry_if_exception(is_transient_error),
+    reraise=True
+)
+def fetch_inventory(sku: str) -> dict:
+    resp = httpx.get(f"https://inventory.example.com/items/{sku}", timeout=1.5)
+    resp.raise_for_status()
+    return resp.json()
+```
+
+## Idempotency keys ជាមួយ `transaction.atomic()`
+
+ប្រើប្រាស់ Database Transaction របស់ Django និង Unique Constraint លើ `IdempotencyRecord` ដើម្បីការពារការកាត់ប្រាក់ ឬបង្កើត Order ត្រួតគ្នា៖
+
+```python
+from django.db import transaction, IntegrityError
+from django.http import JsonResponse
+from .models import IdempotencyRecord, Order
+
+def create_order(request):
+    key = request.headers.get("Idempotency-Key")
+    if not key:
+        return JsonResponse({"error": "តម្រូវឱ្យមាន Idempotency-Key header"}, status=400)
+
+    try:
+        with transaction.atomic():
+            record, created = IdempotencyRecord.objects.select_for_update().get_or_create(key=key)
+
+            if not created:
+                if record.response_body:
+                    return JsonResponse(record.response_body, status=record.status_code)
+                return JsonResponse({"error": "សំណើកំពុងស្ថិតក្នុងដំណើរការ"}, status=409)
+
+            order = Order.objects.create(
+                customer_id=request.POST["customer_id"],
+                total_cents=int(request.POST["total_cents"])
+            )
+
+            data = {"id": order.id, "total_cents": order.total_cents}
+            record.status_code = 201
+            record.response_body = data
+            record.save()
+
+            return JsonResponse(data, status=201)
+    except IntegrityError:
+        return JsonResponse({"error": "មានការប្រជែងសំណើក្នុងពេលតែមួយ"}, status=409)
+```
+
+## Caching ជាមួយ Redis (`django-redis`)
+
+កំណត់រចនាសម្ព័ន្ធ Redis Cache ក្នុង `settings.py` និងប្រើ `cache.get_or_set`៖
+
+```python
+from django.core.cache import cache
+from .models import Product
+
+def get_product_details(product_id: int):
+    cache_key = f"product:{product_id}"
+
+    def fetch_from_db():
+        return list(Product.objects.filter(id=product_id).values("id", "name", "price_cents"))
+
+    # រក្សាទុកក្នុង Cache រយៈពេល ៣០០ វិនាទី
+    return cache.get_or_set(cache_key, fetch_from_db, timeout=300)
+```
+
+## Rate limiting (`django-ratelimit`)
+
+ការពារ API ពីការបាញ់សំណើលើសកម្រិតដោយប្រើ Decorator៖
+
+```python
+from django_ratelimit.decorators import ratelimit
+from django.http import JsonResponse
+
+@ratelimit(key='ip', rate='60/m', block=False)
+def login_view(request):
+    was_limited = getattr(request, 'limited', False)
+    if was_limited:
+        return JsonResponse(
+            {"error": "សំណើច្រើនពេក សូមរង់ចាំមួយភ្លែតសិន"},
+            status=429
+        )
+    return JsonResponse({"status": "authenticated"})
+```
+
+## Background jobs ជាមួយ Celery
+
+បញ្ជូនការងារយឺតៗទៅកាន់ Celery Task បន្ទាប់ពី Transaction បាន Commit ជោគជ័យតាមរយៈ `transaction.on_commit`៖
+
+```python
+from celery import shared_task
+from django.db import transaction
+from .models import Order
+
+@shared_task(
+    bind=True,
+    autoretry_for=(httpx.HTTPError,),
+    retry_backoff=True,
+    retry_kwargs={'max_retries': 5}
+)
+def send_order_confirmation(self, order_id: int):
+    order = Order.objects.get(id=order_id)
+    if order.confirmation_sent_at:
+        return # Idempotent check ការពារផ្ញើសារពីរដង
+
+    # ដំណើរការផ្ញើ Email...
+    order.confirmation_sent_at = timezone.now()
+    order.save()
+```

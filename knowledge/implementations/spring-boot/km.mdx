@@ -1,0 +1,221 @@
+---
+title: "Spring Boot"
+question: "តើត្រូវកំណត់ RestClient Timeouts, Resilience4j Circuit Breakers, HikariCP, និង Bucket4j ក្នុង Spring Boot ដោយរបៀបណា?"
+summary: "Timeouts ជាមួយ RestClient, Resilience4j retry និង circuit breaker, ការកែសម្រួល HikariCP connection pool, Bucket4j rate limiting, និង transactional idempotency ក្នុង enterprise Spring Boot។"
+tags: [java, spring-boot, backend, implementation]
+related: [patterns/retry, patterns/circuit-breaker, patterns/idempotency, patterns/rate-limiting]
+order: 6
+updated: "2026-09-12"
+contributors: [veasna]
+translation: draft
+---
+
+ការអនុវត្ត Patterns សម្រាប់ Enterprise Spring Boot 3.3+ និង Java 21+។ ផ្តោតលើ RestClient Deadlines, Resilience4j Circuit Breakers និង Retries, ការកំណត់ HikariCP Pool ឱ្យមានប្រសិទ្ធភាពខ្ពស់, Bucket4j Rate Limiting, និង Transactional Idempotency។
+
+## Timeouts first
+
+Spring Boot 3 បានណែនាំ `RestClient` ជា synchronous HTTP client ទំនើប។ ត្រូវកំណត់ connect និង read timeouts ឱ្យបានច្បាស់លាស់ជានិច្ច៖
+
+```java
+package com.example.config;
+
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.http.client.SimpleClientHttpRequestFactory;
+import org.springframework.web.client.RestClient;
+
+import java.time.Duration;
+
+@Configuration
+public class HttpClientConfig {
+
+    @Bean
+    public RestClient ratesClient(RestClient.Builder builder) {
+        SimpleClientHttpRequestFactory factory = new SimpleClientHttpRequestFactory();
+        factory.setConnectTimeout(Duration.ofSeconds(2)); // fail fast បើភ្ជាប់ network មិនបានក្នុង 2s
+        factory.setReadTimeout(Duration.ofSeconds(3));    // deadline សម្រាប់រង់ចាំទទួលទិន្នន័យ
+
+        return builder
+                .baseUrl("https://api.example.com")
+                .requestFactory(factory)
+                .build();
+    }
+}
+```
+
+## Retry and Circuit Breaker with Resilience4j
+
+Resilience4j ផ្តល់នូវប្រព័ន្ធការពារកំហុសកម្រិត enterprise តាមរយៈ annotations យ៉ាងងាយស្រួល៖
+
+```yaml
+# application.yml
+resilience4j:
+  circuitbreaker:
+    instances:
+      paymentService:
+        slidingWindowSize: 10
+        failureRateThreshold: 50
+        waitDurationInOpenState: 15s
+        permittedNumberOfCallsInHalfOpenState: 3
+  retry:
+    instances:
+      paymentService:
+        maxAttempts: 3
+        waitDuration: 200ms
+        enableExponentialBackoff: true
+        exponentialBackoffMultiplier: 2
+        retryExceptions:
+          - java.io.IOException
+          - org.springframework.web.client.ResourceAccessException
+```
+
+ការប្រើប្រាស់ `@CircuitBreaker` និង `@Retry` នៅក្នុង Service៖
+
+```java
+package com.example.service;
+
+import io.github.resilience4j.circuitbreaker.annotation.CircuitBreaker;
+import io.github.resilience4j.retry.annotation.Retry;
+import org.springframework.stereotype.Service;
+import org.springframework.web.client.RestClient;
+
+@Service
+public class PaymentGatewayService {
+
+    private final RestClient restClient;
+
+    public PaymentGatewayService(RestClient.Builder builder) {
+        this.restClient = builder.baseUrl("https://api.stripe.com").build();
+    }
+
+    @Retry(name = "paymentService")
+    @CircuitBreaker(name = "paymentService", fallbackMethod = "chargeFallback")
+    public PaymentResponse processCharge(PaymentRequest request) {
+        return restClient.post()
+                .uri("/v1/charges")
+                .body(request)
+                .retrieve()
+                .body(PaymentResponse.class);
+    }
+
+    // Graceful fallback នៅពេល circuit breaker ផ្តាច់ចរន្ត
+    public PaymentResponse chargeFallback(PaymentRequest request, Throwable t) {
+        return new PaymentResponse("queued", "Payment gateway មិនដំណើរការ; បានរក្សាទុកក្នុង queue ដើម្បីដំណើរការពេលក្រោយ");
+    }
+}
+```
+
+## Database connection pool (HikariCP)
+
+Spring Boot ប្រើប្រាស់ HikariCP តាមលំនាំដើម។ កំណត់ទំហំ connection pool ក្នុង `application.properties`៖
+
+```properties
+# រូបមន្តកំណត់ទំហំ៖ connections = (2 * CPU_CORES) + SPINDLES
+# សម្រាប់ container ទំហំ 2-vCPU ចន្លោះ 5-10 connections គឺល្អបំផុត
+spring.datasource.hikari.maximum-pool-size=10
+spring.datasource.hikari.minimum-idle=5
+
+# រយៈពេលរង់ចាំអតិបរមាដើម្បីទាញយក connection មុនពេល fail
+spring.datasource.hikari.connection-timeout=3000
+
+# បង្វិល connection ថ្មីដើម្បីការពារ stale connection ក្រោយ AWS NLB ឬ Postgres restart
+spring.datasource.hikari.max-lifetime=900000
+
+# សម្អាត idle connections ចោលក្រោយ 5 នាទី
+spring.datasource.hikari.idle-timeout=300000
+```
+
+## Rate limiting with Bucket4j
+
+ការប្រើប្រាស់ Token Bucket Rate Limiting ជាមួយ Bucket4j ក្នុង memory៖
+
+```java
+package com.example.ratelimit;
+
+import io.github.bucket4j.Bandwidth;
+import io.github.bucket4j.Bucket;
+import jakarta.servlet.*;
+import jakarta.servlet.http.HttpServletResponse;
+import org.springframework.stereotype.Component;
+
+import java.io.IOException;
+import java.time.Duration;
+
+@Component
+public class RateLimitFilter implements Filter {
+
+    // ១០០ requests ក្នុងមួយនាទី ជាមួយ burst capacity ចំនួន ២០
+    private final Bucket bucket = Bucket.builder()
+            .addLimit(Bandwidth.builder()
+                    .capacity(20)
+                    .refillGreedy(100, Duration.ofMinutes(1))
+                    .build())
+            .build();
+
+    @Override
+    public void doFilter(ServletRequest req, ServletResponse res, FilterChain chain)
+            throws IOException, ServletException {
+        HttpServletResponse httpResponse = (HttpServletResponse) res;
+
+        if (bucket.tryConsume(1)) {
+            chain.doFilter(req, res);
+        } else {
+            httpResponse.setStatus(429);
+            httpResponse.setContentType("application/json");
+            httpResponse.getWriter().write("{\"error\": \"Too Many Requests\"}");
+        }
+    }
+}
+```
+
+## Idempotency with Spring `@Transactional`
+
+កត់ត្រា idempotency key នៅក្នុង database transaction តែមួយជាមួយ business logic៖
+
+```java
+package com.example.service;
+
+import com.example.repository.IdempotencyRepository;
+import com.example.repository.OrderRepository;
+import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+@Service
+public class OrderService {
+
+    private final IdempotencyRepository idempotencyRepo;
+    private final OrderRepository orderRepo;
+
+    public OrderService(IdempotencyRepository idempotencyRepo, OrderRepository orderRepo) {
+        this.idempotencyRepo = idempotencyRepo;
+        this.orderRepo = orderRepo;
+    }
+
+    @Transactional
+    public OrderResponse createOrder(String idempotencyKey, OrderRequest request) {
+        // 1. ពិនិត្យមើលថាតើ key មានរួចហើយឬនៅ
+        var existing = idempotencyRepo.findByKey(idempotencyKey);
+        if (existing.isPresent()) {
+            return existing.get().getResponse(); // ផ្តល់លទ្ធផលពី cache មកវិញ
+        }
+
+        // 2. កក់ key ទុកជាមុន
+        try {
+            idempotencyRepo.insertPending(idempotencyKey);
+        } catch (DataIntegrityViolationException e) {
+            // មាន concurrent request មកដល់ក្នុងពេលតែមួយជាមួយ key ដូចគ្នា
+            return idempotencyRepo.findByKey(idempotencyKey).get().getResponse();
+        }
+
+        // 3. ដំណើរការ business logic
+        Order order = orderRepo.save(new Order(request.getCustomerId(), request.getAmount()));
+        OrderResponse response = new OrderResponse(order.getId(), "confirmed");
+
+        // 4. Update response ក្នុង transaction ដដែល
+        idempotencyRepo.updateResponse(idempotencyKey, response);
+
+        return response;
+    }
+}
+```

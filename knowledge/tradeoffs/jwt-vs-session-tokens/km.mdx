@@ -1,0 +1,161 @@
+---
+title: "JWT vs Session Tokens"
+question: "តើនៅពេលណាដែលខ្ញុំគួរប្រើប្រាស់ Stateless JWTs ហើយនៅពេលណាដែលខ្ញុំគួរប្រើ Traditional Server-Side Session Tokens (Redis/Database)?"
+summary: "Stateless JWTs លុបបំបាត់តម្រូវការ Query Database លើរាល់សំណើទាំងអស់ ដែលល្អឥតខ្ចោះសម្រាប់ Microservices ដែលមាន Throughput ខ្ពស់។ រីឯ Server-side Session Tokens ក្នុង Redis ឬ SQL ផ្តល់នូវការលុបចោលសិទ្ធិ (Revocation) ភ្លាមៗក្នុងពេល ០ វិនាទី និងមានសុវត្ថិភាពខ្ពស់សម្រាប់ Web App ទូទៅ។"
+tags: [security, auth, jwt, sessions, api-design]
+related: [problems/jwt-revocation, patterns/api-gateway, tradeoffs/rest-vs-grpc]
+order: 8
+updated: "2026-09-12"
+contributors: [veasna]
+translation: draft
+---
+
+## Context
+
+រាល់កម្មវិធី Web Application និង API ទាំងអស់ត្រូវកំណត់អត្តសញ្ញាណរបស់អ្នកហៅចូលលើគ្រប់សំណើ HTTP ទាំងអស់។ មានទម្រង់ចម្បងពីរដែលគ្រប់គ្រងប្រព័ន្ធផ្ទៀងផ្ទាត់សិទ្ធិ (Authentication) សម័យទំនើប៖
+
+1. **Server-Side Session Tokens (Stateful)៖** Server បង្កើត Token ចៃដន្យសម្ងាត់មួយ (ឧ. `sess_abc123`) រក្សាទុកក្នុង Cookie។ Server រក្សាទុកទិន្នន័យ Session របស់អ្នកប្រើប្រាស់ក្នុង Database (Redis, PostgreSQL)។ រាល់ពេលមានសំណើចូល Server ត្រូវ Query រកទិន្នន័យតាមរយៈ Token នោះ។
+2. **JSON Web Tokens / JWT (Stateless)៖** Server ចុះហត្ថលេខាឌីជីថល (Cryptographic Signature) លើ JSON Payload ដែលផ្ទុក User ID, តួនាទី, និងម៉ោងផុតកំណត់។ Client បញ្ជូន Token នេះមកតាម Header `Authorization: Bearer <token>`។ សេវាកម្ម Backend ណាមួយក៏អាចផ្ទៀងផ្ទាត់ហត្ថលេខានោះក្នុងម៉ាស៊ីនផ្ទាល់បានដែរ ដោយមិនចាំបាច់ Query ទៅកាន់ Database កណ្តាលឡើយ។
+
+ក្រុមការងារជាច្រើនតែងតែជ្រើសរើសយក JWT ព្រោះគិតថា "វាជាស្តង់ដារទំនើប" ប៉ុន្តែក្រោយមកទើបដឹងថា ការដកហូតសិទ្ធិ (Revoke) គណនីដែលត្រូវគេលួច ឬការប្តូរតួនាទីភ្លាមៗ គឺជារឿងពិបាកខ្លាំងបើគ្មានទិន្នន័យ State។
+
+## Symptoms
+
+- សវនកម្មសុវត្ថិភាពរកឃើញថា ការ Block គណនី Hacker មិនបាន Log out គេភ្លាមៗឡើយ ដោយ Hacker នៅតែអាចទាញទិន្នន័យបានរហូតដល់ Token ផុតកំណត់។
+- CPU របស់ Redis ឬ Database ឡើងកម្តៅខ្លាំងដោយសារតែត្រូវដំណើរការ Query Session រាប់លានដងក្នុងមួយនាទី (`SELECT user_id FROM sessions WHERE token = ?`)។
+- Microservices ត្រូវខាតពេល ១៥ ms លើរាល់សំណើផ្ទៃក្នុង ដើម្បីគ្រាន់តែហៅទៅសួរ Authentication Service ថាតើនរណាជាអ្នកផ្ញើសំណើ។
+- ទំហំរបស់ JWT កើនឡើងធំពេក (លើសពី 4 KB) ដោយសារតែការញាត់បញ្ចូល Claims ច្រើន រហូតធ្វើឱ្យ Reverse Proxy បដិសេធសំណើជាមួយ Error `431 Request Header Fields Too Large`។
+
+<Callout type="warning" title="ភាព Stateless មានន័យថាមិនអាចដកហូតសិទ្ធិ (Revoke) ភ្លាមៗបានឡើយ">
+ប្រសិនបើអ្នកមិនអាចលុបចោល Token ក្នុងពេលជាក់ស្តែងដោយមិនបាច់ឆែក Database បានទេ នោះប្រព័ន្ធ JWT របស់អ្នកមិនមែនជា Stateless ពិតប្រាកដឡើយ។ ការឆែក Database រាល់ពេលមាន Request នឹងបំផ្លាញអត្ថប្រយោជន៍ចម្បងនៃ JWT ចោលទាំងស្រុង។
+</Callout>
+
+## Diagnose
+
+1. **វាយតម្លៃតម្រូវការបន្ទាន់នៃការដកសិទ្ធិ (Revocation Urgency)៖** ប្រសិនបើបុគ្គលិកម្នាក់ត្រូវបញ្ឈប់ពីការងារ ឬ User ផ្លាស់ប្តូរលេខសម្ងាត់ តើ Session ត្រូវតែបិទភ្លាមៗក្នុងពេល ០ វិនាទី ឬអាចរង់ចាំ ១៥ នាទីបាន?
+2. **វាស់វែងបន្ទុក Database ដោយសារ Auth៖** តើការផ្ទៀងផ្ទាត់ Session មានលើសពី ២០% នៃ Query សរុបលើ Redis ឬ PostgreSQL ដែរឬទេ?
+3. **ពិនិត្យស្ថាបត្យកម្មប្រព័ន្ធ៖** តើ Backend របស់អ្នកជា Monolith តែមួយ ឬជា Microservices រាប់សិបដែលសរសេរក្នុងភាសាផ្សេងៗគ្នា?
+4. **ពិនិត្យមើលទំហំ Payload៖** តើទិន្នន័យអ្វីខ្លះដែលត្រូវធ្វើដំណើរជាមួយ Request? តើមានត្រឹមតែ `userId` និង `tenantId` ឬមានបញ្ជីសិទ្ធិ Role-permissions វែងអន្លាយ?
+
+## Options
+
+1. **Traditional Server-Side Session (Redis / SQL)៖** ប្រើ Cookie ID សម្ងាត់។ ដកសិទ្ធិភ្លាមៗតាមរយៈ `DEL session:id`។ ងាយស្រួលក្នុងការ Log out គ្រប់ឧបករណ៍ទាំងអស់ពេលប្តូរ Password។
+2. **Pure Stateless JWT៖** Access Token មានអាយុកាលខ្លី (៥ ដល់ ១៥ នាទី) ចុះហត្ថលេខាដោយ Asymmetric Key (RS256/EdDSA)។ គ្មានការ Query Database លើរាល់ Request ឡើយ។
+3. **ស្ថាបត្យកម្ម Hybrid (Short-lived JWT + Refresh Token)៖** ប្រើ JWT មានអាយុកាលខ្លី (១០ នាទី) សម្រាប់ការហៅទូរស័ព្ទរវាង Microservices រួមផ្សំជាមួយ Refresh Token រក្សាទុកក្នុង Redis/DB សម្រាប់ការបន្ត Session ដែលអាចដកសិទ្ធិបាន។
+4. **JWT ជាមួយ Distributed Blocklist៖** ផ្ទៀងផ្ទាត់ JWT តាម Signature ដដែល ប៉ុន្តែពិនិត្យយ៉ាងលឿនលើ Redis Bloom Filter ឬ Set នៃ `jti` (JWT ID) ដែលត្រូវបាន Revoke។
+
+## Trade-offs
+
+| លក្ខណៈវិនិច្ឆ័យ | Server-Side Sessions (Redis) | Pure Stateless JWT | Hybrid (JWT + Refresh Token) |
+| :--- | :--- | :--- | :--- |
+| **បន្ទុក Database លើរាល់ Request** | ខ្ពស់ (១ Query ក្នុង ១ Request) | **សូន្យ (ឆែកតាមកូដ Cryptographic)** | **សូន្យសម្រាប់ Request សកម្ម** |
+| **ការដកហូតសិទ្ធិភ្លាមៗ (Revocation)** | **ភ្លាមៗ (០ ms)** | មិនអាចទៅរួចទាល់តែផុតកំណត់ | ភ្លាមៗពេល Refresh ម្តងទៀត (១០ នាទី) |
+| **លទ្ធភាពពង្រីកផ្ដេក (Scale)** | ទាមទារ Redis កណ្តាល | **គ្មានដែនកំណត់ (ផ្ទៀងផ្ទាត់ដោយខ្លួនឯង)** | ខ្ពស់ |
+| **ទំហំ Token (Bandwidth)** | តូច (~៣២ Bytes) | ធំ (៣០០ ដល់ ១,៥០០ Bytes) | Access ធំ, Refresh តូច |
+| **ការផ្តាច់ខ្លួននៃ Microservices** | សេវាកម្មត្រូវ Query រក Auth DB | **សេវាកម្មផ្ទៀងផ្ទាត់ដោយ Public Key** | សេវាកម្មផ្ទៀងផ្ទាត់ដោយ Public Key |
+| **ហានិភ័យ CSRF** | ប្រឈមបើដាក់ក្នុង Cookie | គ្មានបើដាក់ក្នុង Header | អាស្រ័យលើការរក្សាទុក |
+
+## Decision
+
+- **ជ្រើសរើស Server-Side Sessions (Redis) សម្រាប់៖**
+  - កម្មវិធី Web ទូទៅដែល Render ចេញពី Server (Next.js, Rails, Laravel, Django)។
+  - ប្រព័ន្ធធនាគារ និង Enterprise ដែលមានតម្រូវការច្បាប់តឹងរ៉ឹងថាត្រូវតែ Log out គណនីភ្លាមៗក្នុងពេល ០ វិនាទីនៅពេល Admin បញ្ជា។
+  - ប្រព័ន្ធ Monolith ដែលគ្រប់ Route ទាំងអស់ចែករំលែក Database ឬ Redis តែមួយ។
+- **ជ្រើសរើស Hybrid JWT + Refresh Token សម្រាប់៖**
+  - ស្ថាបត្យកម្ម Microservices ដែលការបញ្ជូន User Context ឆ្លងកាត់សេវាកម្ម ១០ ដោយមិនចាំបាច់ Query Database គឺជារឿងចាំបាច់សម្រាប់ល្បឿន។
+  - កម្មវិធីទូរស័ព្ទដៃ (iOS/Android Native Apps) ដែលអាចរក្សាទុក Token ក្នុង Keychain ដោយសុវត្ថិភាព។
+  - API សាធារណៈសម្រាប់ដៃគូខាងក្រៅ និងប្រព័ន្ធ OAuth2 / OpenID Connect។
+- **កំណត់អាយុកាល Access JWT ឱ្យខ្លីជានិច្ច៖** ហាមបង្កើត Access JWT ដែលមានអាយុកាលលើសពី ១៥ នាទីជាដាច់ខាត។ JWT ដែលមានអាយុកាល ៣០ ថ្ងៃបង្កើតនូវហានិភ័យសុវត្ថិភាពដ៏ធ្ងន់ធ្ងរ។
+
+## Implementation
+
+### 1. កូដ Middleware ផ្ទៀងផ្ទាត់ JWT (លឿនក្នុង CPU គ្មាន Database Query)៖
+
+```typescript
+import { Request, Response, NextFunction } from 'express';
+import jwt from 'jsonwebtoken';
+
+// ទាញយក Public Key តែម្តងគត់នៅពេល Startup
+const PUBLIC_KEY = process.env.JWT_PUBLIC_KEY!;
+
+export interface AuthenticatedUser {
+  userId: string;
+  tenantId: string;
+  roles: string[];
+}
+
+export function authenticateJwt(req: Request, res: Response, next: NextFunction) {
+  const authHeader = req.headers.authorization;
+  if (!authHeader?.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'ខ្វះ Authorization Header' });
+  }
+
+  const token = authHeader.substring(7);
+
+  try {
+    // ផ្ទៀងផ្ទាត់ក្នុង CPU ផ្ទាល់ (< 0.1 ms) ដោយមិនបាច់ Query Database ឡើយ!
+    const decoded = jwt.verify(token, PUBLIC_KEY, {
+      algorithms: ['RS256'],
+      issuer: 'https://auth.mycompany.com',
+    }) as AuthenticatedUser;
+
+    (req as any).user = decoded;
+    return next();
+  } catch (err) {
+    if ((err as Error).name === 'TokenExpiredError') {
+      return res.status(401).json({ error: 'Token ផុតកំណត់ហើយ។ សូម Refresh។', code: 'TOKEN_EXPIRED' });
+    }
+    return res.status(403).json({ error: 'ហត្ថលេខា Token មិនត្រឹមត្រូវ' });
+  }
+}
+```
+
+### 2. Traditional Stateful Redis Session Handler (ដកសិទ្ធិបានភ្លាមៗ)៖
+
+```typescript
+import { Redis } from 'ioredis';
+import { randomBytes } from 'crypto';
+
+const redis = new Redis(process.env.REDIS_URL!);
+
+export class SessionService {
+  async createSession(userId: string, ttlSeconds = 86400): Promise<string> {
+    const sessionId = randomBytes(32).toString('hex');
+    await redis.set(`sess:${sessionId}`, JSON.stringify({ userId, createdAt: Date.now() }), 'EX', ttlSeconds);
+    return sessionId;
+  }
+
+  async getSession(sessionId: string): Promise<{ userId: string } | null> {
+    const data = await redis.get(`sess:${sessionId}`);
+    return data ? JSON.parse(data) : null;
+  }
+
+  // ដកហូតសិទ្ធិភ្លាមៗក្នុងពេល ០ ms ទូទាំង Servers ទាំងអស់!
+  async revokeSession(sessionId: string): Promise<void> {
+    await redis.del(`sess:${sessionId}`);
+  }
+}
+```
+
+## Verification
+
+1. **ការវាស់ស្ទង់ Throughput នៃសំណើ៖** ប្រៀបធៀប Throughput រវាង Stateless JWT Validation ធៀបនឹង Redis Session Lookups នៅកម្រិត 20,000 req/sec។ Stateless JWT អាចពង្រីកសមត្ថភាពតាម CPU Cores និងមិនដាក់បន្ទុកលើ Redis សូម្បីតែបន្តិច។
+2. **ការធ្វើតេស្តដកសិទ្ធិភ្លាមៗ៖** សម្រាប់ Server-side Session ហៅ `revokeSession()` រួចផ្ទៀងផ្ទាត់ថាសំណើបន្ទាប់ដែលប្រើ Session នោះបរាជ័យជាមួយ HTTP 401 ក្នុងពេល < 1 ms។
+3. **ការពិនិត្យទំហំ Header៖** ពិនិត្យមើលទំហំនៃ Header `Authorization`។ ធានាថា JWT មានទំហំក្រោម 500 bytes ដោយដកចេញនូវ Claims ណាដែលមិនចាំបាច់។
+
+## Why
+
+ការជ្រើសរើសរវាង JWT និង Sessions គឺជាការសម្របសម្រួលរវាង **ភាពឯករាជ្យពី Database** និង **ការគ្រប់គ្រងកណ្តាល**៖
+- **Stateless JWTs** ផ្តល់អាទិភាពដល់ Throughput នៃការអាន និងការ Scale ឆ្លងកាត់សេវាកម្មជាច្រើន ដោយប្តូរការងារពី Database Query មកធ្វើការគណនា Cryptography លើ CPU វិញ។
+- **Server-Side Sessions** ផ្តល់អាទិភាពដល់ការគ្រប់គ្រងរបស់អ្នកគ្រប់គ្រង និងសុវត្ថិភាព ដោយរក្សាទុកប្រភពទិន្នន័យពិតប្រាកដនៅលើ Server កណ្តាល។
+
+## When Not To Use
+
+- **JWT ក្នុង Cookie សម្រាប់ HTML App ធម្មតា៖** ប្រសិនបើប្រព័ន្ធរបស់អ្នកជា Monolith តែមួយ ការប្រើ JWT នាំមកនូវភាពស្មុគស្មាញនៃ Token ដោយមិនបានទទួលផលប្រយោជន៍ពីការ Scale របស់ Distributed Systems សោះឡើយ។
+- **ការរក្សាទុកទិន្នន័យសម្ងាត់ក្នុង JWT៖** JWT គ្រាន់តែចុះហត្ថលេខាការពារការកែប្រែប៉ុណ្ណោះ មិនមែនជាការ Encrypt បំប្លែងបំបាត់ទិន្នន័យឡើយ។ នរណាក៏អាច Decode អាន Claims តាម Base64url បានដែរ។ ហាមដាក់ Password ឬ Credit Card ក្នុង JWT ជាដាច់ខាត។
+
+## Common Mistakes
+
+- **ចេញ JWT ដែលមានអាយុកាលច្រើនថ្ងៃ៖** ការផ្តល់ JWT រយៈពេល ៣០ ថ្ងៃមានន័យថា ប្រសិនបើទូរស័ព្ទត្រូវចោរលួច ចោរនឹងមានសិទ្ធិចូលប្រើរយៈពេល ៣០ ថ្ងៃដោយមិនអាចបិទបានឡើយ។
+- **ប្រើ Symmetric Key (HS256) ឆ្លងកាត់ច្រើន Microservices៖** ប្រសិនបើ ១៥ សេវាកម្មចែករំលែក Secret Key តែមួយ បើសេវាកម្មណាមួយត្រូវគេ Hack គេអាចក្លែងបន្លំ Token សម្រាប់គ្រប់សេវាកម្មដទៃទៀតបានទាំងអស់។ ត្រូវប្រើ Asymmetric Keys (RS256) ជានិច្ច។
+- **ញាត់ Claims ច្រើនហួសហេតុក្នុង JWT៖** ការដាក់បញ្ជីសិទ្ធិវែងអន្លាយ ឬរូបភាពក្នុង JWT នឹងធ្វើឱ្យ HTTP Header ឡើងធំខាតបង់ Bandwidth លើគ្រប់ជំហាន Network ទាំងអស់។

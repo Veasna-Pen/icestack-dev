@@ -1,0 +1,152 @@
+---
+title: "How do I handle 429 rate limits?"
+question: "Why are our requests being 429 rate-limited by upstream APIs?"
+summary: "When downstream APIs return HTTP 429 Too Many Requests, naive client retries amplify traffic into a self-inflicted retry storm. Implement proactive client-side token bucket rate limiters and honor Retry-After headers."
+tags: [rate-limiting, api, http, resilience, retry]
+related: [patterns/rate-limiting, patterns/retry, patterns/circuit-breaker]
+order: 15
+updated: "2026-09-12"
+contributors: [veasna]
+---
+
+## Context
+
+Your backend application integrates with critical third-party APIs: SendGrid for transactional emails, OpenAI for text generation, or a banking API for identity verification.
+
+The provider enforces a published quota limit, such as 100 requests per second. During a product launch or automated marketing blast, your services attempt 250 requests per second. The provider begins rejecting excess requests with `HTTP 429 Too Many Requests`.
+
+Your HTTP client has an automatic retry loop. Instead of backing off, every failed request retries immediately. Traffic to the provider doubles from 250 to 500 requests per second. The provider's firewall blocks your IP address entirely for "abusive API usage."
+
+## Symptoms
+
+- Upstream API calls return `HTTP 429 Too Many Requests`.
+- Application error rates jump to 90%+ as retry storms exhaust outbound socket pools.
+- Providers return error messages like `Quota exceeded. Please retry after 42 seconds.` or temporarily ban your organization's API key.
+- End-user requests stall and fail with 504 Gateway Timeouts as workers block waiting in retry loops.
+
+<Callout type="warning" title="Retrying HTTP 429 without backoff turns a minor spike into an outage">
+A 429 status is not a transient network glitch; it is an explicit instruction from the server to **stop sending traffic**. Retrying immediately guarantees that subsequent requests will also fail and extends your rate-limit penalty duration.
+</Callout>
+
+## Diagnose
+
+1. **Inspect response headers from the provider:** Look for standardized rate limit headers:
+   ```text
+   HTTP/1.1 429 Too Many Requests
+   Retry-After: 30
+   X-RateLimit-Limit: 100
+   X-RateLimit-Remaining: 0
+   X-RateLimit-Reset: 1718920120
+   ```
+2. **Calculate aggregate client throughput:** If you run 20 Kubernetes pods, and each pod allows up to 10 outbound requests per second, your aggregate cluster throughput is 20 × 10 = 200 req/sec, easily exceeding a 100 req/sec quota.
+3. **Audit retry logic:** Does your HTTP client treat 429 the same as a 503 network error and retry after 100 ms?
+
+## Options
+
+1. **Blind exponential retry.** Keep retrying with backoff. (Still causes traffic bursts and ignores provider instructions).
+2. **Honor `Retry-After` headers.** Parse the provider's `Retry-After` header and delay retries until the requested window expires.
+3. **Proactive Client-Side Rate Limiting (Token Bucket).** Throttles outbound requests locally before they leave your servers, queuing calls so you never exceed the provider's limit.
+4. **Distributed Redis Rate Limiter.** Coordinate rate limits across all 20 pods using a centralized Redis token bucket.
+
+## Trade-offs
+
+| Strategy | Outbound 429s | Provider Ban Risk | Implementation Effort |
+| :--- | :--- | :--- | :--- |
+| **Naive Retry** | Severe | **Extreme** | Zero |
+| **Honor `Retry-After`** | Occasional | Low | Low (10 lines of code) |
+| **Proactive Queue Limiter** | **Zero 429s** | **Zero** | Medium |
+| **Distributed Redis Limiter** | **Zero 429s** | **Zero** | Medium to High (Redis dependency) |
+
+## Decision
+
+1. **Client-side proactive throttling:** Do not let requests hit the provider if you know you are over quota. Queue outgoing requests in a token bucket rate limiter (e.g. BullMQ or local token bucket) capped at 90% of the provider's quota (leaving a 10% safety buffer).
+2. **Strictly respect `Retry-After`:** If a 429 response is received, read the `Retry-After` header. Pause all outgoing traffic for that duration instead of spamming retries.
+
+## Implementation
+
+### 1. HTTP Client honoring `Retry-After` and 429 backoff (TypeScript):
+
+```typescript
+export async function fetchWithRateLimitHandling(
+  url: string,
+  options: RequestInit,
+  maxRetries = 3
+): Promise<Response> {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    const res = await fetch(url, options);
+
+    if (res.status !== 429) {
+      return res; // Success or non-rate-limit response
+    }
+
+    if (attempt === maxRetries) {
+      throw new Error(`Upstream rate limit exceeded after ${maxRetries} attempts`);
+    }
+
+    // 1. Check for Retry-After header (can be seconds or HTTP Date)
+    const retryAfterHeader = res.headers.get('Retry-After');
+    let waitMs = 1000 * Math.pow(2, attempt); // Default exponential backoff
+
+    if (retryAfterHeader) {
+      const parsedSeconds = parseInt(retryAfterHeader, 10);
+      if (!isNaN(parsedSeconds)) {
+        waitMs = parsedSeconds * 1000;
+      } else {
+        const retryDate = new Date(retryAfterHeader).getTime();
+        if (!isNaN(retryDate)) {
+          waitMs = Math.max(0, retryDate - Date.now());
+        }
+      }
+    }
+
+    // Add jitter to avoid synchronized retry stampedes
+    waitMs += Math.random() * 500;
+    console.warn(`[HTTP 429] Rate limited on ${url}. Sleeping for ${waitMs.toFixed(0)} ms`);
+    await new Promise((r) => setTimeout(r, waitMs));
+  }
+
+  throw new Error('Retries exhausted');
+}
+```
+
+### 2. Proactive Outbound Rate Limiting (Token Bucket):
+
+```typescript
+import { RateLimiterMemory } from 'rate-limiter-flexible';
+
+// Limit outbound calls to 90 per second (provider quota: 100/sec)
+const outboundLimiter = new RateLimiterMemory({
+  points: 90,
+  duration: 1, // per second
+});
+
+export async function sendEmail(emailPayload: any) {
+  // Consume a token before sending; will throw or wait if points are exhausted
+  await outboundLimiter.consume('sendgrid-api', 1);
+  return await fetchWithRateLimitHandling('https://api.sendgrid.com/v3/mail/send', {
+    method: 'POST',
+    body: JSON.stringify(emailPayload),
+  });
+}
+```
+
+## Verification
+
+1. **Burst load test:** Fire 1,000 email send requests concurrently into the service.
+2. **Zero 429 status codes:** Inspect outbound network logs. All requests should be smoothed out and delivered at a steady 90 req/sec rate, with **zero HTTP 429 errors**.
+3. **Simulated 429 response:** In staging, return an artificial 429 with `Retry-After: 5`. Verify that the application pauses for exactly 5 seconds before retrying.
+
+## Why
+
+Rate limits are designed to protect multitenant infrastructure from noisy neighbors. When an API provider returns HTTP 429, they are signaling that their queues are full.
+
+Retrying immediately without backoff creates a **positive feedback loop**: failed requests are added back into the incoming queue, increasing congestion, causing more failures, which causes more retries. Proactive rate limiting converts spikes into smooth streams.
+
+## When Not To Use
+
+- **Interactive user actions that cannot wait:** If a user is waiting for an interactive credit card charge and the provider rate limits you, do not hold the user's browser for 60 seconds. Fail fast with an informative error message: "Payment network busy. Please try again shortly."
+
+## Common Mistakes
+
+- **Assuming rate limits are per-server.** Quotas are assigned to your API Key or IP address. If you scale from 2 to 20 servers, your aggregate request rate increases 10x.
+- **Ignoring the `Retry-After` unit.** Some providers send `Retry-After` in seconds (`Retry-After: 120`), while others send an HTTP timestamp (`Retry-After: Wed, 21 Oct 2026 07:28:00 GMT`). Parsing must handle both.

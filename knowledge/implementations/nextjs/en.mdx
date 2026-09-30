@@ -1,0 +1,179 @@
+---
+title: "Next.js"
+question: "How do I secure Server Actions with idempotency, request deadlines, and Upstash rate limiting in Next.js?"
+summary: "Route Handler execution limits, Server Actions with idempotency, unstable_cache, and Upstash Redis rate limiting in the App Router."
+tags: [nextjs, react, typescript, serveractions, implementation]
+related: [patterns/retry, patterns/idempotency, patterns/caching, patterns/rate-limiting]
+order: 18
+updated: "2026-09-12"
+contributors: [veasna]
+---
+
+Production patterns for Next.js 15+ App Router. Focuses on serverless execution deadlines, atomic Server Action idempotency, tag-based data caching with unstable_cache, and edge rate limiting with Upstash Redis.
+
+## Timeouts and execution deadlines
+
+In Next.js App Router Route Handlers, configure maximum execution durations with `maxDuration` and outbound fetch deadlines:
+
+```ts
+// app/api/rates/route.ts
+import { NextResponse } from 'next/server';
+
+// Enforce serverless function timeout (e.g. 5 seconds)
+export const maxDuration = 5;
+export const dynamic = 'force-dynamic';
+
+export async function GET() {
+  try {
+    const res = await fetch('https://api.example.com/rates', {
+      // Abort external fetch after 2000 ms
+      signal: AbortSignal.timeout(2000),
+      // Next.js caching policy
+      next: { revalidate: 60 }
+    });
+
+    if (!res.ok) {
+      return NextResponse.json({ error: `Upstream HTTP ${res.status}` }, { status: 502 });
+    }
+
+    const data = await res.json();
+    return NextResponse.json(data);
+  } catch (err: any) {
+    if (err.name === 'TimeoutError') {
+      return NextResponse.json({ error: 'Gateway timeout contacting rates API' }, { status: 504 });
+    }
+    return NextResponse.json({ error: 'Internal Server Error' }, { status: 500 });
+  }
+}
+```
+
+## Idempotency in Server Actions
+
+Prevent double submissions on form buttons and network retries using database idempotency records:
+
+```ts
+// app/actions/orders.ts
+'use server';
+
+import { prisma } from '@/lib/prisma';
+import { revalidatePath } from 'next/cache';
+
+export async function createOrderAction(formData: FormData) {
+  const idempotencyKey = formData.get('idempotencyKey') as string;
+  const customerId = formData.get('customerId') as string;
+  const totalCents = Number(formData.get('totalCents'));
+
+  if (!idempotencyKey) {
+    return { success: false, error: 'Missing idempotency key' };
+  }
+
+  try {
+    // Run in an atomic transaction
+    const result = await prisma.$transaction(async (tx) => {
+      const existing = await tx.idempotencyRecord.findUnique({
+        where: { key: idempotencyKey }
+      });
+
+      if (existing) {
+        if (existing.response) {
+          return JSON.parse(existing.response);
+        }
+        throw new Error('IN_FLIGHT');
+      }
+
+      // Claim key
+      await tx.idempotencyRecord.create({
+        data: { key: idempotencyKey }
+      });
+
+      // Create order
+      const order = await tx.order.create({
+        data: { customerId, totalCents }
+      });
+
+      const responsePayload = { orderId: order.id, status: 'created' };
+      await tx.idempotencyRecord.update({
+        where: { key: idempotencyKey },
+        data: { response: JSON.stringify(responsePayload) }
+      });
+
+      return responsePayload;
+    });
+
+    revalidatePath('/orders');
+    return { success: true, data: result };
+  } catch (err: any) {
+    if (err.message === 'IN_FLIGHT') {
+      return { success: false, error: 'Request currently processing' };
+    }
+    return { success: false, error: 'Failed to process order' };
+  }
+}
+```
+
+## Caching with `unstable_cache`
+
+Deduplicate and cache database calls across server component requests:
+
+```ts
+import { unstable_cache } from 'next/cache';
+import { prisma } from '@/lib/prisma';
+
+export const getCachedProduct = unstable_cache(
+  async (productId: string) => {
+    return await prisma.product.findUnique({
+      where: { id: productId }
+    });
+  },
+  ['product-details'], // Cache key parts
+  {
+    revalidate: 300,   // Cache for 5 minutes
+    tags: ['products'] // Allows targeted on-demand revalidation via revalidateTag('products')
+  }
+);
+```
+
+## Rate limiting with `@upstash/ratelimit`
+
+Enforce rate limits at the edge or in middleware across serverless lambdas:
+
+```ts
+// middleware.ts
+import { NextResponse } from 'next/server';
+import type { NextRequest } from 'next/server';
+import { Ratelimit } from '@upstash/ratelimit';
+import { Redis } from '@upstash/redis';
+
+const ratelimit = new Ratelimit({
+  redis: Redis.fromEnv(),
+  limiter: Ratelimit.slidingWindow(50, '10 s'), // 50 requests per 10 seconds
+  analytics: true,
+});
+
+export async function middleware(request: NextRequest) {
+  if (request.nextUrl.pathname.startsWith('/api/')) {
+    const ip = request.headers.get('x-forwarded-for')?.split(',')[0] ?? '127.0.0.1';
+    const { success, limit, remaining, reset } = await ratelimit.limit(ip);
+
+    if (!success) {
+      return NextResponse.json(
+        { error: 'Too Many Requests' },
+        {
+          status: 429,
+          headers: {
+            'X-RateLimit-Limit': limit.toString(),
+            'X-RateLimit-Remaining': remaining.toString(),
+            'X-RateLimit-Reset': reset.toString(),
+          },
+        }
+      );
+    }
+  }
+
+  return NextResponse.next();
+}
+
+export const config = {
+  matcher: '/api/:path*',
+};
+```

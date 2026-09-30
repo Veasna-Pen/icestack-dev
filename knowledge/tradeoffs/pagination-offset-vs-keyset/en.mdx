@@ -1,0 +1,155 @@
+---
+title: "Offset vs Keyset Pagination"
+question: "When should I abandon OFFSET pagination in favor of Keyset / Cursor pagination?"
+summary: "Offset pagination (OFFSET 100000) scans and discards millions of rows on deep pages and drifts when rows are inserted. Keyset pagination (WHERE id > last_seen) uses B-Tree index seeks for constant-time O(1) performance and stable infinite scrolls."
+tags: [database, pagination, performance, sql, api-design]
+related: [problems/pagination-performance, problems/database-is-slow, patterns/caching]
+order: 7
+updated: "2026-09-12"
+contributors: [veasna]
+---
+
+## Context
+
+When exposing lists of records via an API (e.g. products, transaction history, activity feeds), pagination is required to prevent queries from returning millions of rows in a single HTTP response.
+
+Most developers begin with **Offset Pagination**: `SELECT * FROM items ORDER BY created_at DESC LIMIT 20 OFFSET 40`. It directly maps to user interfaces with numbered page buttons (`[1] [2] [3] ... [45]`).
+
+However, as databases grow beyond tens of thousands of rows, offset pagination breaks down. The database cannot jump directly to row 100,000; it must read and discard 100,000 rows from disk into memory. Furthermore, if a new item is inserted while a user navigates between pages, items shift positions, causing duplicate or missing records.
+
+**Keyset Pagination** (also called Cursor-Based Pagination) replaces offsets with indexed value comparisons: `SELECT * FROM items WHERE (created_at, id) < ($last_seen_time, $last_seen_id) ORDER BY created_at DESC, id DESC LIMIT 20`.
+
+## Symptoms
+
+- Database CPU spikes to 100% when web crawlers, search bots, or users request deep pages (`?page=5000`).
+- Users complain about seeing the exact same product twice when scrolling down an infinite feed.
+- Users report missing items that were pushed to the next page before they navigated to it.
+- Latency on page 1 is 5 ms, but latency on page 500 is 4,500 ms for the exact same query.
+
+<Callout type="warning" title="OFFSET N is an O(N) full-table scan in disguise">
+The database engine must read and count N rows before returning the requested page. For OFFSET 1,000,000, the database reads 1,000,020 rows and throws away the first 1,000,000.
+</Callout>
+
+## Diagnose
+
+1. **Check query execution plans:** Run `EXPLAIN ANALYZE SELECT * FROM orders ORDER BY id LIMIT 20 OFFSET 50000`. Does it show high disk buffer reads and seconds of execution time?
+2. **Inspect API access patterns:** Do your clients consume infinite-scroll feeds (mobile apps, social media) or do they require jumping directly to page 25?
+3. **Audit data churn:** Are records frequently inserted, updated, or deleted on the table being paginated?
+4. **Identify bot activity:** Are scraping bots systematically cycling through `?page=1` to `?page=50000`, exhausting database connection pools?
+
+## Options
+
+1. **Offset-Based Pagination (`LIMIT size OFFSET (page - 1) * size`):** Simple, stateless, supports jumping directly to arbitrary page numbers. (Degrades exponentially on deep pages).
+2. **Keyset / Cursor Pagination (`WHERE id > cursor LIMIT size`):** Fast index seeks, constant O(1) time regardless of depth, immune to data drift. (Does not support jumping to arbitrary page numbers).
+3. **Hybrid Capped Offset:** Allow offset pagination, but enforce a hard ceiling (e.g., maximum page 50 or offset 1,000). For deeper exploration, require users to apply filters (date range, category).
+4. **Deferred Join Optimization:** If offset pagination is mandatory, perform the offset on an indexed primary key subquery first, then join back to the main table for payload columns.
+
+## Trade-offs
+
+| Dimension | Offset Pagination | Keyset / Cursor Pagination |
+| :--- | :--- | :--- |
+| **Performance on Page 1** | Fast (< 10 ms) | Fast (< 10 ms) |
+| **Performance on Deep Pages** | **Terrible (O(N) scan, seconds)** | **Instant (O(1) index seek, < 5 ms)** |
+| **Drift Stability (Inserts/Deletes)** | Poor (duplicates and skipped rows) | **Perfect (anchor never moves)** |
+| **Jump to Arbitrary Page** | Supported (`page=14`) | Not supported (sequential navigation only) |
+| **Total Row Count Display** | Supported (`SELECT COUNT(*)`) | Expensive / Discarded |
+| **Implementation Complexity** | Trivial | Moderate (requires composite index & cursor encoding) |
+
+## Decision
+
+- **Use Keyset Pagination for:**
+  - Infinite scroll interfaces (mobile feeds, social media, real-time activity logs).
+  - High-volume APIs, data export pipelines, and webhook backfills.
+  - Large tables with > 100,000 rows where scrapers or users frequently access deep records.
+- **Use Offset Pagination for:**
+  - Administrative back-office portals where datasets are small (< 10,000 rows) and operators must jump to page 12.
+  - Low-churn datasets where items are rarely inserted or deleted.
+- **Always cap Offset Pagination:** If offset pagination is exposed publicly, reject requests where `offset > 2000` with HTTP 400 Bad Request. Direct users to search or date-range filters instead.
+
+## Implementation
+
+### 1. Keyset Pagination SQL Query with Composite Tie-Breaker:
+
+```sql
+-- Composite index required for O(1) index seek
+CREATE INDEX idx_orders_created_id ON orders (created_at DESC, id DESC);
+
+-- Page 1 (initial request)
+SELECT id, customer_id, total_cents, created_at
+FROM orders
+ORDER BY created_at DESC, id DESC
+LIMIT 20;
+
+-- Page 2 (cursor request using created_at and id of item #20)
+SELECT id, customer_id, total_cents, created_at
+FROM orders
+WHERE (created_at, id) < ('2026-09-12 10:00:00+00', '0191eb58-0000-7000-8000-000000000014')
+ORDER BY created_at DESC, id DESC
+LIMIT 20;
+```
+
+### 2. TypeScript Cursor Serialization & API Handler:
+
+```typescript
+export interface PageCursor {
+  createdAt: string;
+  id: string;
+}
+
+export function encodeCursor(cursor: PageCursor): string {
+  return Buffer.from(JSON.stringify(cursor)).toString('base64url');
+}
+
+export function decodeCursor(cursorStr: string): PageCursor {
+  return JSON.parse(Buffer.from(cursorStr, 'base64url').toString('utf8'));
+}
+
+export async function getOrders(cursorParam?: string, limit = 20) {
+  let query = 'SELECT id, total_cents, created_at FROM orders';
+  const params: any[] = [];
+
+  if (cursorParam) {
+    const cursor = decodeCursor(cursorParam);
+    query += ' WHERE (created_at, id) < ($1, $2)';
+    params.push(cursor.createdAt, cursor.id);
+  }
+
+  query += ` ORDER BY created_at DESC, id DESC LIMIT ${limit + 1}`;
+  const { rows } = await db.query(query, params);
+
+  const hasNextPage = rows.length > limit;
+  const items = rows.slice(0, limit);
+
+  const nextCursor = hasNextPage && items.length > 0
+    ? encodeCursor({
+        createdAt: items[items.length - 1].created_at.toISOString(),
+        id: items[items.length - 1].id,
+      })
+    : null;
+
+  return { items, nextCursor, hasNextPage };
+}
+```
+
+## Verification
+
+1. **Benchmark deep page latency:** On a table with 5,000,000 rows, compare `OFFSET 1000000 LIMIT 20` against the keyset cursor query. Keyset pagination should execute in **< 5 ms** while offset takes > 2,500 ms.
+2. **Verify index utilization:** Run `EXPLAIN (ANALYZE, BUFFERS)` on the keyset query. Confirm that the query plan performs an `Index Scan` touching only 21 rows and reading negligible buffer pages.
+3. **Drift immunity test:** Request page 1. Insert 5 new rows into the database. Request page 2 using the keyset cursor. Verify that page 2 contains zero duplicate records from page 1.
+
+## Why
+
+B-Tree indexes are sorted balanced search trees. When executing `WHERE (created_at, id) < (...)`, the database engine navigates the tree logarithmically (depth 3 to 4) directly to the target record in microseconds, then scans forward 20 rows.
+
+With `OFFSET N`, the database cannot navigate to row $N$ because B-Trees do not maintain row position counts (since concurrent MVCC transactions hide and delete rows dynamically). The database is forced to perform an exhaustive linear scan through $N$ rows, burning disk I/O and CPU.
+
+## When Not To Use
+
+- **Small collections (< 500 rows):** For small lookup tables (e.g. countries, roles, categories), offset pagination is fast enough and simpler to code.
+- **Strict page-number jumping:** If UI requirements strictly mandate numbered page buttons (`Page 1`, `Page 2`, `Page 15`), keyset pagination cannot fulfill this without pre-computing offsets.
+
+## Common Mistakes
+
+- **Keyset on non-unique columns without tie-breaker:** Paginating on `created_at` alone will skip records if multiple rows share the exact same timestamp. Always include a unique column (like `id`) as a secondary tie-breaker.
+- **Missing composite index:** Writing `WHERE (created_at, id) < (...)` without a matching composite index `(created_at, id)` forces a sequential table scan, negating all benefits.
+- **Exposing raw database IDs in API URLs:** Exposing raw internal IDs or timestamps allows users to tamper with cursors; encode cursors into opaque Base64url tokens.

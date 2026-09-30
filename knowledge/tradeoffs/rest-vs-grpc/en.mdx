@@ -1,0 +1,139 @@
+---
+title: "REST vs gRPC"
+question: "When is gRPC worth the operational complexity over REST?"
+summary: "Use gRPC for high-throughput internal service-to-service communication where CPU, latency, and strict schema contracts matter. Stick with REST/JSON for public APIs, web browsers, and simpler architectures."
+tags: [api-design, rest, grpc, protobuf, networking, microservices]
+related: [tradeoffs/monolith-vs-microservices, tradeoffs/sync-vs-async, patterns/circuit-breaker]
+order: 4
+updated: "2026-09-12"
+contributors: [veasna]
+---
+
+## Context
+
+A growing engineering team is building microservices or modular distributed services. As the number of internal service-to-service RPC calls grows into the millions per day, discussions arise: should new internal services communicate via standard HTTP/1.1 JSON REST APIs, or should the team adopt gRPC with Protocol Buffers (Protobuf) over HTTP/2?
+
+Teams often jump to gRPC expecting instant 10x performance gains, only to find themselves struggling with browser incompatibility, complex debugging, proxy routing, and Protobuf build pipelines.
+
+## Symptoms
+
+Signs that JSON/REST between internal services is becoming a bottleneck:
+
+- **High serialization CPU load:** Profiling backend services shows 20–35% of total CPU time spent parsing and stringifying JSON.
+- **Contract drift:** Teams deploy changes that break downstream services because JSON schemas were undocumented, outdated, or loosely validated.
+- **Network bandwidth costs:** Large, verbose JSON payloads (with repeated key strings) saturate internal VPC bandwidth or cross-AZ transfer budgets.
+- **Multiplexing bottlenecks:** High request volumes over HTTP/1.1 exhaust TCP connection pools and suffer from head-of-line blocking.
+
+Things that do **not** justify gRPC: your API has fewer than 100 requests per second, or the API is primarily consumed by web browsers.
+
+## Diagnose
+
+Before deciding to adopt gRPC, profile your current system:
+
+1. **Measure CPU time in JSON serialization:** Run CPU profilers (`pprof` in Go, Node.js clinic, or Python cProfile). If JSON parsing accounts for less than 5% of CPU, gRPC will not meaningfully reduce your server bill.
+2. **Count contract breaking incidents:** How many production bugs this quarter were caused by missing fields, type mismatches (e.g. string vs number), or misspelled keys in internal JSON endpoints?
+3. **Assess client landscape:** Are callers internal microservices (Go, Java, Node.js), or are they frontend web browsers, mobile apps, and third-party developers?
+4. **Evaluate infrastructure readiness:** Do your load balancers, ingress controllers, and API gateways fully support HTTP/2 and gRPC trailers?
+
+## Options
+
+1. **REST with JSON over HTTP/1.1:** The universal default. Text-based, human-readable, universally supported by every tool, browser, and language.
+2. **REST with OpenAPI (Swagger) code generation:** Keep HTTP/JSON, but enforce contract validation and auto-generate client SDKs via OpenAPI specifications.
+3. **gRPC over HTTP/2 with Protocol Buffers:** Strongly typed binary protocol with strict schema contracts, multiplexed connections, and bidirectional streaming.
+4. **REST over HTTP/2 with JSON:** Upgrade transport to HTTP/2 multiplexing while keeping JSON payloads.
+
+## Trade-offs
+
+| Dimension | REST / JSON | REST + OpenAPI | gRPC / Protobuf |
+| :--- | :--- | :--- | :--- |
+| **Payload Size** | Larger (verbose text keys) | Larger | **3–10x smaller** (compact binary) |
+| **CPU Efficiency** | High CPU parsing cost | High CPU parsing cost | **Low CPU overhead** |
+| **Contract Safety** | Optional / Informal | Generated / Validated | **Strict by default** (`.proto` files) |
+| **Browser Support** | **Universal** | **Universal** | Requires gRPC-Web proxy |
+| **Debuggability** | **Trivial** (`curl`, Postman) | Trivial | Requires specialized tools (`grpcurl`) |
+| **Streaming** | Limited (SSE or WebSockets) | Limited | **Native Bidirectional Streaming** |
+| **Operational Tooling** | Ubiquitous | Ubiquitous | Requires HTTP/2 load balancing (Envoy) |
+
+## Decision
+
+- **Use REST with JSON for:**
+  - Public-facing APIs and third-party developer integrations.
+  - Frontend web clients (browsers communicate naturally with HTTP/1.1 and JSON).
+  - Early-stage startups and small teams where development velocity and zero-overhead debugging outweigh microsecond optimizations.
+- **Adopt gRPC for:**
+  - High-throughput internal microservice-to-microservice communication where tens of thousands of RPCs occur per second.
+  - Polyglot backend architectures (e.g. Go, Java, Python, C++) where generated Protobuf stubs guarantee compile-time type safety across language boundaries.
+  - Real-time bidirectional streaming (e.g. telemetry, chat pipelines, continuous sensor feeds).
+  - Mobile applications operating in bandwidth-constrained cellular environments.
+
+## Implementation
+
+### Defining the Protobuf contract (`orders.proto`):
+
+```protobuf
+syntax = "proto3";
+
+package orders.v1;
+
+option go_package = "github.com/example/orders/v1;ordersv1";
+
+service OrderService {
+  rpc CreateOrder (CreateOrderRequest) returns (OrderResponse);
+  rpc StreamOrderUpdates (OrderUpdatesRequest) returns (stream OrderStatusUpdate);
+}
+
+message CreateOrderRequest {
+  string customer_id = 1;
+  repeated OrderItem items = 2;
+  int64 total_cents = 3;
+}
+
+message OrderItem {
+  string product_id = 1;
+  int32 quantity = 2;
+  int64 price_cents = 3;
+}
+
+message OrderResponse {
+  string order_id = 1;
+  string status = 2;
+  int64 created_at = 3;
+}
+
+message OrderUpdatesRequest {
+  string order_id = 1;
+}
+
+message OrderStatusUpdate {
+  string order_id = 1;
+  string status = 2;
+  string message = 3;
+}
+```
+
+### Contrast with equivalent REST endpoint:
+
+In REST, validating item prices, nullability, missing fields, and type conversions requires manual validation libraries (such as Zod or Joi) at runtime. With gRPC, serialization, deserialization, and type checking are generated at build time with zero boilerplate.
+
+## Verification
+
+1. **Payload size benchmark:** Measure payload bytes across wire for a batch request of 500 items. gRPC binary Protobuf typically reduces payload size by **60–80%** compared to uncompressed JSON.
+2. **CPU and latency reduction:** Under 5,000 requests per second, observe caller and callee CPU utilization. Service CPU spent in serialization drops significantly, and p99 latency decreases due to HTTP/2 multiplexing avoiding TCP handshake overhead.
+3. **Load balancer verification:** Ensure your load balancer (such as AWS ALB or Envoy) is configured for gRPC/HTTP/2, routing individual RPCs evenly across backend pods rather than pinning all traffic to one pod over a single long-lived TCP connection.
+
+## Why
+
+JSON is human-readable text. To send a JSON object, the computer must convert native binary numbers into ASCII strings, quote keys, escape special characters, and transmit repetitive field names on every message. The receiving computer must tokenize the text and parse strings back into integers and floats.
+
+Protocol Buffers encode numbers directly into compact binary varints and replace field names with integer tags (e.g. tag `1` for `customer_id`). The resulting byte stream is smaller, decodes orders of magnitude faster, and enforces contracts before code ever runs.
+
+## When Not To Use
+
+- **Web frontends without a proxy:** Standard browsers cannot directly make arbitrary HTTP/2 gRPC requests due to lack of control over low-level HTTP/2 framing; you must deploy and maintain a gRPC-Web proxy (like Envoy).
+- **Public developer APIs:** External developers expect to inspect requests with standard browser developer tools, `curl`, and Postman. Forcing external developers to download Protobuf definitions and use gRPC clients creates unnecessary friction.
+
+## Common Mistakes
+
+- **L4 load balancing with gRPC.** Standard L4 (TCP) load balancers route connections, not requests. Because gRPC multiplexes all requests over a single long-lived HTTP/2 TCP connection, an L4 load balancer will send 100% of all requests to the first pod that connected, starving the rest of the cluster. Always use an **L7 load balancer** (like Envoy or AWS ALB configured for gRPC).
+- **Breaking Protobuf compatibility.** Changing the integer tag numbers in `.proto` files breaks binary compatibility. Always append new fields with new tag numbers, and never renumber existing tags.
+- **Rewriting everything at once.** Don't rewrite all REST endpoints into gRPC. Start by converting one high-volume, performance-critical internal service boundary.

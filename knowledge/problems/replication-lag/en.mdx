@@ -1,0 +1,131 @@
+---
+title: "Why do users see stale data?"
+question: "Why do users see old data right after updating their profile?"
+summary: "Asynchronous read replicas suffer from replication lag. When a user writes to primary and is immediately redirected to a read replica, they read stale data. Implement Read-Your-Own-Writes consistency by pinning the user's session to the primary for a few seconds."
+tags: [database, postgres, replication, consistency, read-replicas]
+related: [problems/database-is-slow, tradeoffs/sql-vs-nosql, patterns/caching]
+order: 12
+updated: "2026-09-12"
+contributors: [veasna]
+---
+
+## Context
+
+An application scales by splitting database traffic: all `INSERT`, `UPDATE`, and `DELETE` queries go to the PostgreSQL Primary instance, while read queries (`SELECT`) are load-balanced across one or more asynchronous Read Replicas.
+
+A user updates their display name from "Alice" to "Alicia". The update succeeds with HTTP 200, and the frontend immediately redirects the user to `/profile`. The profile page renders, but displays the old name "Alice". The user refreshes the page 2 seconds later, and the new name "Alicia" appears.
+
+## Symptoms
+
+- Users submit edits or post comments, but upon page reload, their changes seem to have vanished, prompting them to resubmit duplicate forms.
+- Automated end-to-end integration tests (Playwright / Cypress) fail intermittently: `Expected "Alicia" but received "Alice"`.
+- Support tickets file reports of "intermittent ghost data" or "updates not saving".
+- The issue worsens during peak write traffic or database maintenance.
+
+<Callout type="warning" title="Asynchronous replication means eventual consistency">
+Replicating WAL (Write-Ahead Log) records from primary to replica happens asynchronously over the network. Under heavy write loads or large transactions, replication lag can easily stretch from 10 ms to several seconds.
+</Callout>
+
+## Diagnose
+
+1. **Measure replication lag in PostgreSQL:**
+   On the primary, inspect connected standbys:
+   ```sql
+   SELECT
+     client_addr,
+     state,
+     now() - pg_last_xact_replay_timestamp() AS replication_lag
+   FROM pg_stat_replication;
+   ```
+   Or query the replica directly:
+   ```sql
+   SELECT EXTRACT(EPOCH FROM (now() - pg_last_xact_replay_timestamp())) AS lag_seconds;
+   ```
+2. **Trace the request flow:** Check your database routing middleware. Does `/api/update-profile` execute on Primary and the subsequent `/api/get-profile` execute on Replica? If replica lag is 300 ms and the redirect takes 50 ms, reading stale data is guaranteed.
+
+## Options
+
+1. **Synchronous Replication.** Force PostgreSQL to wait for replicas to acknowledge writes before committing. (Cuts write throughput drastically; if a replica hiccups, all primary writes stall).
+2. **Read all data from Primary.** Eliminate read replicas completely. (Overloads the primary database with read traffic).
+3. **Session Sticky Routing (Read-Your-Own-Writes).** After a user writes to the database, route all subsequent read requests from *that specific user* to the primary for a short window (e.g. 5–10 seconds).
+4. **Optimistic UI updates.** Keep the updated state in client-side memory (React state / React Query cache) instead of re-fetching from the server immediately.
+
+## Trade-offs
+
+| Strategy | Consistency | Write Latency | Primary DB Load |
+| :--- | :--- | :--- | :--- |
+| **Synchronous Replication** | Strict / Immediate | **Very High** (waits for network ACK) | High |
+| **Primary-Only Reads** | Strict / Immediate | Normal | **Excessive** (no read offloading) |
+| **Read-Your-Own-Writes (Sticky)** | **Immediate for the writer** | Normal | **Low** (only recent writers hit primary) |
+| **Optimistic UI only** | High for single tab | Normal | Minimal (breaks on multi-tab or mobile) |
+
+## Decision
+
+Implement **Read-Your-Own-Writes Consistency via Session Pinning**:
+
+1. When a user performs any mutating action (`POST`, `PUT`, `PATCH`, `DELETE`), set a lightweight cookie or header containing the current timestamp: `last_write_at = Date.now()`.
+2. On subsequent `GET` requests, check the `last_write_at` timestamp:
+   - If `Date.now() - last_write_at < 5000` (within 5 seconds), route the query to the **Primary database**.
+   - Otherwise, route to the **Read Replicas**.
+3. All other users (99% of readers who haven't modified data in the last 5 seconds) continue reading from replicas, preserving read scalability.
+
+## Implementation
+
+### Database Router Middleware with Read-Your-Own-Writes (Node.js / Express):
+
+```typescript
+import { Request, Response, NextFunction } from 'express';
+import { primaryPool, replicaPool } from './db';
+
+const REPLICATION_WINDOW_MS = 5000; // 5-second sticky window
+
+export function databaseRoutingMiddleware(req: Request, res: Response, next: NextFunction) {
+  const method = req.method;
+
+  // 1. All writes must go to Primary and set sticky cookie
+  if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(method)) {
+    req.db = primaryPool;
+    res.cookie('last_write_at', Date.now().toString(), {
+      maxAge: REPLICATION_WINDOW_MS,
+      httpOnly: true,
+      sameSite: 'lax',
+    });
+    return next();
+  }
+
+  // 2. For GET requests, check if user wrote recently
+  const lastWriteAt = parseInt(req.cookies.last_write_at || '0', 10);
+  const isRecentWriter = Date.now() - lastWriteAt < REPLICATION_WINDOW_MS;
+
+  if (isRecentWriter) {
+    // Route to Primary so the user sees their own recent update
+    req.db = primaryPool;
+  } else {
+    // Safe to route to Replica
+    req.db = replicaPool;
+  }
+
+  next();
+}
+```
+
+## Verification
+
+1. **Simulate replication lag in staging:** Introduce artificial 2-second replication delay on a replica (`recovery_min_apply_delay = '2s'` in `postgresql.conf`).
+2. **Execute write-and-redirect flow:** Submit an update and immediately query the profile endpoint. Verify that the response returns the updated value 100% of the time.
+3. **Verify primary load:** Ensure read-only non-authenticated traffic continues hitting replicas, with no unexpected CPU increase on the primary.
+
+## Why
+
+In distributed systems, the CAP theorem states that under network partitions, you must choose between Consistency and Availability. Read replicas prioritize Availability and Read Scalability over immediate consistency.
+
+However, humans expect **causal consistency**: if *I* cause a change, *I* should see that change. Other users on the other side of the world do not notice a 300 ms delay. By pinning only the active writer to the primary, we satisfy human expectations while maintaining distributed database scalability.
+
+## When Not To Use
+
+- **Critical financial ledgers:** Account balances, money transfers, and security permissions should never be read from an asynchronous replica; always read them directly from the primary.
+
+## Common Mistakes
+
+- **Assuming replication is instantaneous on local networks.** Even with 1 ms network ping, a heavy bulk update or index rebuild will stall the replication apply thread on the standby.
+- **Permanent sticky sessions.** Pinning a user to the primary for their entire login session negates the entire purpose of having read replicas. Keep the window short (3–5 seconds).

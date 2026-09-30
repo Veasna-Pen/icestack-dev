@@ -1,0 +1,61 @@
+{
+  "badge": "Open source",
+  "heroTitle": "Think before<br/><muted>you code.</muted>",
+  "heroLead": "Open-source knowledge for better engineering decisions. Start from a real problem, reason through context and trade-offs, then implement a decision you can verify.",
+  "searchPrompt": "What are you trying to decide?",
+  "aiPrompt": "or think it through with an AI assistant that asks about context first",
+  "questionsEyebrow": "Questions developers actually ask",
+  "browseAll": "Browse all {{total}} questions",
+  "workedExample": "Worked example",
+  "exampleFallbackTitle": "Why is my database slow?",
+  "stepsLabel": "steps",
+  "readFullReasoning": "Read the full reasoning",
+  "example": {
+    "problem": "Checkout API p95 went from 120 ms to 2.4 s.",
+    "context": "Postgres, 40M orders, traffic doubled this quarter.",
+    "diagnose": "pg_stat_statements: one query is 61% of DB time.",
+    "alternatives": "Index · rewrite · Redis cache · bigger instance.",
+    "tradeoffs": "An index is cheap and reversible; a cache adds stale data.",
+    "decision": "Composite index on (customer_id, created_at).",
+    "implement": "CREATE INDEX CONCURRENTLY, no downtime.",
+    "verify": "p95 back to 140 ms; the plan shows an Index Scan.",
+    "learn": "Cost grew with the table, not the traffic."
+  },
+  "why": {
+    "eyebrow": "Why this exists",
+    "title": "AI can write the code. The judgment is still yours.",
+    "body": "Assistants generate code and answers in seconds. They can't know your context, weigh the trade-offs you'll live with, or own the decision. That is the skill this project trains."
+  },
+  "approaches": {
+    "course": {
+      "label": "Traditional learning",
+      "steps": ["Course", "Lesson", "Quiz"],
+      "note": "Teaches a tool before you have a reason to use it."
+    },
+    "assistant": {
+      "label": "AI coding assistant",
+      "steps": ["Problem", "Generated solution"],
+      "note": "Fast answers. You inherit decisions you never made."
+    },
+    "icestack": {
+      "label": "IceStack",
+      "note": "Slower by minutes. You leave with the judgment, not just the code."
+    }
+  },
+  "path": {
+    "eyebrow": "The path",
+    "title": "From problem to implementation",
+    "body": "Start wherever you are. Most people arrive with a problem; the method, the patterns and the trade-offs are there for when the answer is “it depends”.",
+    "methodRole": "The method every page follows"
+  },
+  "openSource": {
+    "eyebrow": "Open source",
+    "title": "The repository is the source of truth.",
+    "body": "Every page is a Markdown file on GitHub; the website is a better way to read it. Anyone can fix a mistake, add a trade-off or share a production lesson with a pull request.",
+    "flow": ["GitHub repository", "Structured knowledge", "Website · Search · AI"],
+    "canAdd": "What experienced developers can add",
+    "howToContribute": "How to contribute",
+    "proposeProblem": "Propose a problem",
+    "sourceTreeCaption": "Markdown in, website out: navigation, search and the reasoning path are generated from these files."
+  }
+}

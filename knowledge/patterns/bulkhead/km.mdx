@@ -1,0 +1,173 @@
+---
+title: "Bulkhead"
+question: "តើខ្ញុំអាចញែកធនធាន (Resources) ដាច់ពីគ្នាយ៉ាងដូចម្តេចដើម្បីកុំឱ្យ Dependency យឺតមួយស៊ីអស់ Worker Threads ទាំងអស់?"
+summary: "បែងចែក Thread pools, Connection pools, និង Memory limits តាម dependency នីមួយៗ។ ប្រសិនបើ Service មួយគាំងឬយឺត មានតែ Pool ផ្ទាល់ខ្លួនរបស់វាប៉ុណ្ណោះដែលអស់ ចំណែកឯមុខងារសំខាន់ៗដទៃទៀតនៅដំណើរការធម្មតា។"
+tags: [resilience, reliability, concurrency, bulkhead, microservices]
+related: [patterns/circuit-breaker, patterns/rate-limiting, problems/running-out-of-connections]
+order: 8
+updated: "2026-09-12"
+contributors: [veasna]
+translation: draft
+---
+
+## Context
+
+នៅក្នុងវិស្វកម្មនាវា តួសំបកកប៉ាល់ត្រូវបានខណ្ឌចែកជាបន្ទប់មិនជ្រាបទឹកជាច្រើនហៅថា **Bulkheads**។ ប្រសិនបើទឹកលិចចូលបន្ទប់ណាមួយ បន្ទប់ខណ្ឌនោះនឹងទប់មិនឱ្យទឹកហូរទៅបន្ទប់ដទៃទៀត ដែលការពារកុំឱ្យកប៉ាល់ទាំងមូលត្រូវលិច។
+
+ក្នុងស្ថាបត្យកម្ម Software ប្រព័ន្ធមួយតែងតែទាក់ទងទៅកាន់ប្រព័ន្ធខាងក្រៅជាច្រើនដូចជា៖ ប្រព័ន្ធទូទាត់ប្រាក់ (Payment Gateway), Recommendation Engine, ប្រព័ន្ធត្រួតពិនិត្យ Fraud, និង Database។ នៅពេលដែល Request ទាំងអស់ប្រើប្រាស់ Global Thread Pool ឬ Connection Pool រួមគ្នាតែមួយ ភាពយឺតយ៉ាវក្នុងមុខងាររងណាមួយ (ឧ. Recommendation API ប្រើពេល ១០ វិនាទី) នឹងលេបត្របាក់ Worker Threads ដែលទំនេរទាំងអស់។ ជាលទ្ធផល មុខងារស្នូលសំខាន់ៗដូចជា Checkout ឬ Login នឹងដាច់ភ្លាមៗដោយសារតែ Thread Starvation។
+
+## Symptoms
+
+- ការដាច់សេវាកម្មរងដែលមិនសូវសំខាន់ (ដូចជា Search suggestions ឬ Review ratings) ធ្វើឱ្យ Endpoint ស្នូលរកចំណូល (Checkout, Login) ដាច់ទាំងស្រុង។
+- Web server worker threads ឬ Event loop connection slots ឡើងដល់ 100% saturation ដែលបិទមិនឱ្យមាន Connection ថ្មីចូលបាន។
+- Latency នៃគ្រប់ API routes ទាំងអស់កើនឡើងព្រមគ្នា ទោះបីជា Database និង Server CPU មិនសូវមានបន្ទុកក៏ដោយ។
+- Tenant ម្នាក់ដែលបង្កើត traffic ច្រើន (Noisy Neighbor) ស៊ី connection របស់ Database អស់ ធ្វើឱ្យ Tenant ដទៃទៀតក្នុងប្រព័ន្ធ Multi-tenant មិនអាច Query បាន។
+
+<Callout type="warning" title="Global thread pools បង្កើតចំណុចបរាជ័យរួមដ៏គ្រោះថ្នាក់">
+ប្រសិនបើ Checkout និង Recommendations ប្រើប្រាស់ Pool រួមគ្នាដែលមាន 100 worker threads នោះ request ចំនួន ១០០ របស់ Recommendations ដែលគាំង នឹងធ្វើឱ្យ Checkout ត្រូវគាំងដំណើរការទាំងស្រុង។
+</Callout>
+
+## Diagnose
+
+1. **ពិនិត្យមើល Thread និង Connection Pools៖** តើ Backend របស់អ្នកប្រើប្រាស់ HTTP client pool ឬ Database pool តែមួយសម្រាប់គ្រប់ Route ទាំងអស់មែនទេ?
+2. **ត្រួតពិនិត្យ Incident Post-mortems៖** ស្វែងរកថាតើការដាច់ប្រព័ន្ធកន្លងមក ចាប់ផ្តើមចេញពីសេវាកម្មរងតូចមួយ រួចរាលដាលពន្លិច Application ធំទាំងមូលឬទេ។
+3. **ពិនិត្យមើលឥរិយាបថ Timeout៖** នៅពេលដែល Call ទៅខាងក្រៅគាំង តើ In-flight requests តម្រង់ជួររង់ចាំគ្មានកំណត់ ឬដាច់ភ្លាមៗ (Fail-fast) នៅពេលដល់កម្រិតកំណត់?
+4. **វិភាគ Concurrency តាម Dependency នីមួយៗ៖** វាស់វែងចំនួន In-flight requests ស្របគ្នាដែលហៅទៅកាន់ External Service នីមួយៗអំឡុងពេល Peak load។
+
+## Options
+
+1. **បែងចែក Thread Pools ដាច់ដោយឡែក៖** កំណត់ Max concurrency ថេរ (ឧ. ២០ threads) សម្រាប់សេវាកម្មខាងក្រៅមិនសូវសំខាន់ និង Pool ដាច់ដោយឡែក (ឧ. ៨០ threads) សម្រាប់ប្រតិបត្តិការស្នូល។
+2. **Semaphore Concurrency Limiters៖** ស្រោប Outbound HTTP clients ជាមួយ Semaphore (ឧ. អនុញ្ញាតឱ្យហៅទៅ Recommendation API ស្របគ្នាយ៉ាងច្រើនបំផុតត្រឹម ១៥ requests)។ Request លើសពីនេះត្រូវបដិសេធភ្លាមៗ ឬតម្រង់ជួរក្នុង Buffer ដែលមានទំហំកំណត់។
+3. **ញែកកម្រិត Container (Microservices)៖** បំបែក Background processing ដែលប្រឈមហានិភ័យខ្ពស់ ទៅដាក់ក្នុង Container ដាច់ដោយឡែកជាមួយដែនកំណត់ CPU និង RAM ក្នុង Kubernetes។
+4. **បែងចែក Database Connection Pool៖** ប្រើប្រាស់ PgBouncer pools ផ្សេងគ្នា ឬ Connection strings ផ្សេងគ្នាសម្រាប់ Query របាយការណ៍/Analytics និង Transaction របស់អ្នកប្រើប្រាស់។
+
+## Trade-offs
+
+| យុទ្ធសាស្ត្រ | ការទប់ស្កាត់ការរាលដាល | ប្រសិទ្ធភាពធនធាន | កម្លាំងអនុវត្ត | ភាពស្មុគស្មាញ |
+| :--- | :--- | :--- | :--- | :--- |
+| **Shared Global Pool (លំនាំដើម)** | គ្មាន (រាលដាលដាច់ទាំងអស់) | អតិបរមា (ចែករំលែក 100%) | គ្មាន | ទាបបំផុត |
+| **Semaphore Limiter** | ខ្ពស់ (កម្រិត In-process) | ខ្ពស់ខ្លាំង | ទាប (TypeScript Semaphore) | ទាប |
+| **Dedicated Thread Pools** | ខ្ពស់ខ្លាំង | មធ្យម (ខ្ជះខ្ជាយពេល Idle) | មធ្យម | មធ្យម |
+| **បំបែក Containers (Microservices)** | អតិបរមា (ញែកតាម Hardware) | ទាបជាង (Container Overhead) | ខ្ពស់ (Deployment, K8s) | ខ្ពស់ |
+
+## Decision
+
+- **ប្រើប្រាស់ Semaphore Bulkheads សម្រាប់ Outbound Calls ទាំងអស់៖** ស្រោបការហៅទៅកាន់ API ខាងក្រៅដែលយឺត ជាមួយ Concurrency Limiter តឹងរ៉ឹង (ឧ. អតិបរមា ១០ requests ស្របគ្នា)។ បដិសេធ request លើសភ្លាមៗជាមួយ Fallback។
+- **ញែក Database Pool តាមប្រភេទការងារ៖** កុំអនុញ្ញាតឱ្យ Batch analytics ឬ Admin reports ដំណើរការយូរ ចែករំលែក Pool ជាមួយ Checkout flow របស់អ្នកប្រើប្រាស់ឡើយ។
+- **ភ្ជាប់ Bulkhead ជាមួយ Short Timeouts ជានិច្ច៖** Concurrency limit ការពារកុំឱ្យអស់ Pool ចំណែកឯ Timeouts ការពារកុំឱ្យកកស្ទះជួរវែងក្នុង Bulkhead។
+- **Fail-fast ឬផ្តល់តម្លៃជំនួស (Fallback)៖** នៅពេល Bulkhead ពេញ ត្រូវប្រគល់ Cached data, បញ្ជីទទេ, ឬឆ្លើយតប 503 ភ្លាមៗ ជាជាងទុកឱ្យអ្នកប្រើប្រាស់រង់ចាំដោយគ្មានកំណត់។
+
+## Implementation
+
+ការបង្កើត Bulkhead Concurrency Limiter ស្រាលមួយក្នុង TypeScript៖
+
+```typescript
+export interface BulkheadOptions {
+  maxConcurrent: number;
+  maxQueue: number;
+}
+
+export class Bulkhead {
+  private activeCount = 0;
+  private queue: Array<() => void> = [];
+
+  constructor(
+    private readonly name: string,
+    private readonly options: BulkheadOptions
+  ) {}
+
+  async execute<T>(task: () => Promise<T>): Promise<T> {
+    // បើនៅសល់កន្លែងទំនេរ អនុវត្តភ្លាមៗ
+    if (this.activeCount < this.options.maxConcurrent) {
+      this.activeCount++;
+      try {
+        return await task();
+      } finally {
+        this.release();
+      }
+    }
+
+    // បើ pool សកម្មពេញ ពិនិត្យមើលចំណុះជួររង់ចាំ (Queue)
+    if (this.queue.length >= this.options.maxQueue) {
+      throw new Error(`[Bulkhead:${this.name}] បដិសេធ៖ Bulkhead ពេញចំណុះ (${this.options.maxConcurrent} កំពុងដំណើរការ, ${this.options.maxQueue} ក្នុងជួរ)`);
+    }
+
+    // រង់ចាំក្នុងជួរសម្រាប់ slot ទំនេរបន្ទាប់
+    return new Promise<T>((resolve, reject) => {
+      this.queue.push(async () => {
+        try {
+          const result = await task();
+          resolve(result);
+        } catch (err) {
+          reject(err);
+        } finally {
+          this.release();
+        }
+      });
+    });
+  }
+
+  private release() {
+    if (this.queue.length > 0) {
+      const nextTask = this.queue.shift();
+      if (nextTask) nextTask();
+    } else {
+      this.activeCount--;
+    }
+  }
+
+  getMetrics() {
+    return { active: this.activeCount, queued: this.queue.length };
+  }
+}
+```
+
+### ការញែកសេវាកម្ម Recommendations ដោយប្រើ Bulkhead៖
+
+```typescript
+// អនុញ្ញាតឱ្យហៅស្របគ្នាយ៉ាងច្រើន ១០ requests និង queue បាន ៥
+const recommendationBulkhead = new Bulkhead('recommendations', {
+  maxConcurrent: 10,
+  maxQueue: 5,
+});
+
+export async function getProductRecommendations(userId: string): Promise<string[]> {
+  try {
+    return await recommendationBulkhead.execute(async () => {
+      const res = await fetch(`https://api.recommendations.internal/users/${userId}`, {
+        signal: AbortSignal.timeout(1500),
+      });
+      if (!res.ok) throw new Error('Recommendation API failed');
+      return await res.json();
+    });
+  } catch (err) {
+    // Graceful fallback៖ ពេល recommendations យឺតឬលើសចំណុះ ប្រគល់ផលិតផលលក់ដាច់ទូទៅជំនួស
+    console.warn(`[Recommendations] Bulkhead ពេញ ឬ Call បរាជ័យ៖ ${(err as Error).message}។ ប្រគល់ Fallback។`);
+    return ['item-popular-1', 'item-popular-2'];
+  }
+}
+```
+
+## Verification
+
+1. **ការធ្វើតេស្ត Fault Injection៖** បង្កើត Mock server ដែលមាន Delay ៣០ វិនាទីលើ Recommendation endpoint។
+2. **ការធ្វើតេស្តបន្ទុក (Load Test)៖** បញ្ជូន traffic 1,000 req/sec ទៅកាន់ទាំង Checkout និង Product page ព្រមគ្នា (`k6 run loadtest.js`)។
+3. **ផ្ទៀងផ្ទាត់ភាពដាច់ដោយឡែក៖** ពិនិត្យឱ្យប្រាកដថា Latency របស់ Checkout នៅក្រោម 50 ms និង Error rate គឺ 0% ខណៈដែល Recommendation calls ឆ្លើយតប Fallback យ៉ាងលឿនក្នុងពេល < 2 ms នៅពេល Bulkhead 15-slot ពេញ។
+4. **តាមដាន Metrics៖** ធានាថា `activeCount` មិនដែលកើនលើសពី ១០ ឡើយ។
+
+## Why
+
+នៅក្នុងស្ថាបត្យកម្មស្មុគស្មាញ ភាពបរាជ័យគឺជារឿងដែលមិនអាចជៀសផុតឡើយ។ Service មួយមិនអាចគ្រប់គ្រងស្ថិរភាពរបស់ Cloud API ដៃគូខាងក្រៅ ឬបណ្តាញ Network របស់គេបានទេ។
+
+បើគ្មានការញែកបន្ទប់ (Isolation) ទេ ប្រព័ន្ធរបស់អ្នកនឹងផុយស្រួយស្មើនឹង Dependency ដែលខ្សោយជាងគេបំផុតរបស់វា។ Bulkhead Pattern កំណត់ដែនកំណត់ច្បាស់លាស់លើការប្រើប្រាស់ធនធាន។ តាមរយៈការធានាថាបញ្ហាស្ថិតនៅក្នុងបន្ទប់តែមួយ ម៉ាស៊ីនអាជីវកម្មស្នូលរបស់អ្នកនៅតែអាចបើកបន្តទៅមុខដោយរលូនជានិច្ច។
+
+## When Not To Use
+
+- **Monolithic Single-purpose Scripts៖** ក្នុង CLI tools ឬ Batch scripts ដែលដំណើរការការងារតាមលំដាប់លំដោយមួយៗ ការបែងចែក Concurrency បង្កើតតែភាពស្មុគស្មាញឥតប្រយោជន៍។
+- **ប្រតិបត្តិការក្នុង Local Memory លឿនបំផុត៖** ប្រតិបត្តិការដែលចំណាយពេលក្រោម 1 ms (ឧ. Redis GET) មិនកាន់កាប់ Threads យូររហូតដល់អស់ Pool ឡើយ។
+
+## Common Mistakes
+
+- **ទំហំ Queue គ្មានដែនកំណត់៖** ការកំណត់ `maxQueue: Infinity` ធ្វើឱ្យបាត់បង់អត្ថន័យរបស់ Bulkhead ព្រោះ request នឹងកកកុញក្នុង RAM រហូតដល់ Node.js គាំង។
+- **ប្រើ Bulkhead ដោយគ្មាន Timeout៖** បើការងារខាងក្នុងគ្មាន Timeout ទេ Task ដែលជាប់គាំងនឹងកាន់កាប់ Slot ជារៀងរហូតទាល់តែ Restart Server។
+- **មិនបានត្រៀមតម្លៃ Fallback៖** ការច្រានចោល request ដោយគ្មាន fallback នឹងធ្វើឱ្យអ្នកប្រើប្រាស់ឃើញ Error ចំៗ ជំនួសឱ្យការបង្ហាញទិន្នន័យទូទៅ។

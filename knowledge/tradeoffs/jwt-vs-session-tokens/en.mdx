@@ -1,0 +1,160 @@
+---
+title: "JWT vs Session Tokens"
+question: "When should I use stateless JWTs versus traditional server-side database/Redis sessions?"
+summary: "Stateless JWTs eliminate database lookups on every request, making them ideal for high-throughput distributed microservices. Server-side session tokens in Redis or SQL provide instant revocation and tighter security, ideal for stateful web apps."
+tags: [security, auth, jwt, sessions, api-design]
+related: [problems/jwt-revocation, patterns/api-gateway, tradeoffs/rest-vs-grpc]
+order: 8
+updated: "2026-09-12"
+contributors: [veasna]
+---
+
+## Context
+
+Every web application and API must identify the caller on incoming HTTP requests. Two primary paradigms dominate modern software authentication:
+
+1. **Server-Side Session Tokens (Stateful):** The server generates an opaque random token (e.g. `sess_abc123`) saved in a cookie. The server stores user session data in a database (Redis, PostgreSQL). On every request, the server performs a lookup by token.
+2. **JSON Web Tokens / JWT (Stateless):** The server signs a cryptographically verifiable JSON payload containing the user's ID, roles, and expiration timestamp. The client sends this token in an `Authorization: Bearer <token>` header. Any backend service can verify the cryptographic signature locally without querying a central database.
+
+Teams frequently pick JWTs because "it is the modern standard", only to discover that revoking a compromised user token or changing permissions in real time is fundamentally difficult without state.
+
+## Symptoms
+
+- Security audit flags that blocking a compromised user account does not immediately log them out, allowing the attacker to access data until the token expires.
+- Database or Redis CPU is overwhelmed by millions of session lookup queries (`SELECT user_id FROM sessions WHERE token = ?`) per minute.
+- Microservices waste 15 ms on every internal request making a round-trip to an authentication service just to validate who the user is.
+- In-flight JWT tokens grow so large (> 4 KB) with claims and roles that HTTP reverse proxies drop requests with `431 Request Header Fields Too Large`.
+
+<Callout type="warning" title="Statelessness means inability to revoke immediately">
+If you cannot revoke a token in real time without querying a shared database, your JWT system is not actually stateless. Adding a database lookup on every request destroys the primary benefit of JWTs.
+</Callout>
+
+## Diagnose
+
+1. **Assess revocation urgency:** If an employee is terminated or an account password is reset, must their active sessions be terminated in 0 seconds, or is a 15-minute expiration window acceptable?
+2. **Measure auth database load:** Does session verification account for more than 20% of your total Redis or PostgreSQL query throughput?
+3. **Map service architecture:** Is your backend a single monolithic application, or a distributed mesh of 20 microservices written in different languages?
+4. **Audit payload size:** What user data needs to travel with requests? Is it just `userId` and `tenantId`, or extensive role-permission arrays?
+
+## Options
+
+1. **Traditional Server-Side Session (Redis / SQL):** Opaque ID cookie. Instant revocation via `DEL session:id`. Easy to invalidate all sessions on password change.
+2. **Pure Stateless JWT:** Short-lived access tokens (e.g. 5–15 minutes) signed with asymmetric keys (RS256/EdDSA). No database query on requests.
+3. **Hybrid Architecture (Short-lived JWT + Refresh Token):** Short-lived access JWTs (10 min) for stateless microservice calls, paired with a stateful refresh token stored in Redis/DB for revocable session renewals.
+4. **JWT with Distributed Blocklist:** Stateless JWT verification, but checking a fast Redis Bloom filter or set of revoked `jti` (JWT ID) tokens.
+
+## Trade-offs
+
+| Dimension | Server-Side Sessions (Redis) | Pure Stateless JWT | Hybrid (JWT + Refresh Token) |
+| :--- | :--- | :--- | :--- |
+| **Database Load on Request** | High (1 lookup per request) | **Zero (cryptographic check)** | **Zero for active requests** |
+| **Instant Revocation** | **Immediate (0 ms)** | Impossible until expiry | Immediate on next refresh (10m) |
+| **Horizontal Scalability** | Requires centralized Redis | **Infinite (independent nodes)** | High |
+| **Token Size (Bandwidth)** | Tiny (~32 bytes) | Large (300–1,500 bytes) | Large access, tiny refresh |
+| **Microservice Decoupling** | Services must query auth DB | **Services verify with public key** | Services verify with public key |
+| **CSRF Vulnerability** | Vulnerable if in cookie | Immune if in header | Depends on storage |
+
+## Decision
+
+- **Use Server-Side Sessions (Redis) for:**
+  - Standard web applications rendered via server-side templates (Next.js, Rails, Laravel, Django).
+  - High-security enterprise and banking applications where instant session revocation on admin action is a mandatory compliance requirement.
+  - Monolithic backends where all routes share the same database or low-latency Redis instance.
+- **Use the Hybrid JWT + Refresh Token pattern for:**
+  - Distributed microservice architectures where passing authenticated context across 10 internal services without hitting a database is essential.
+  - Native mobile applications (iOS/Android) where storing tokens in secure storage (Keychain) is native and natural.
+  - Public third-party APIs and OAuth2 / OpenID Connect identity providers.
+- **Keep access JWT expiration short:** Never issue an access JWT with an expiration longer than 15 minutes. Long-lived JWTs (e.g. 30 days) create catastrophic security exposure.
+
+## Implementation
+
+### 1. Hybrid JWT Verification Middleware (Fast, Local Cryptographic Check):
+
+```typescript
+import { Request, Response, NextFunction } from 'express';
+import jwt from 'jsonwebtoken';
+
+// Public key loaded once at startup
+const PUBLIC_KEY = process.env.JWT_PUBLIC_KEY!;
+
+export interface AuthenticatedUser {
+  userId: string;
+  tenantId: string;
+  roles: string[];
+}
+
+export function authenticateJwt(req: Request, res: Response, next: NextFunction) {
+  const authHeader = req.headers.authorization;
+  if (!authHeader?.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'Missing or malformed Authorization header' });
+  }
+
+  const token = authHeader.substring(7);
+
+  try {
+    // Verified entirely locally in CPU (< 0.1 ms) without any database queries!
+    const decoded = jwt.verify(token, PUBLIC_KEY, {
+      algorithms: ['RS256'],
+      issuer: 'https://auth.mycompany.com',
+    }) as AuthenticatedUser;
+
+    (req as any).user = decoded;
+    return next();
+  } catch (err) {
+    if ((err as Error).name === 'TokenExpiredError') {
+      return res.status(401).json({ error: 'Token expired. Please refresh.', code: 'TOKEN_EXPIRED' });
+    }
+    return res.status(403).json({ error: 'Invalid token signature' });
+  }
+}
+```
+
+### 2. Traditional Stateful Redis Session Handler (Instant Revocation):
+
+```typescript
+import { Redis } from 'ioredis';
+import { randomBytes } from 'crypto';
+
+const redis = new Redis(process.env.REDIS_URL!);
+
+export class SessionService {
+  async createSession(userId: string, ttlSeconds = 86400): Promise<string> {
+    const sessionId = randomBytes(32).toString('hex');
+    await redis.set(`sess:${sessionId}`, JSON.stringify({ userId, createdAt: Date.now() }), 'EX', ttlSeconds);
+    return sessionId;
+  }
+
+  async getSession(sessionId: string): Promise<{ userId: string } | null> {
+    const data = await redis.get(`sess:${sessionId}`);
+    return data ? JSON.parse(data) : null;
+  }
+
+  // Instant 0ms revocation across all servers!
+  async revokeSession(sessionId: string): Promise<void> {
+    await redis.del(`sess:${sessionId}`);
+  }
+}
+```
+
+## Verification
+
+1. **Request throughput benchmark:** Compare API endpoint throughput using stateless JWT validation versus Redis session lookups under 20,000 req/sec. Stateless JWT verification scales with CPU cores and places 0 load on Redis.
+2. **Immediate revocation test:** For server-side sessions, call `revokeSession()` and verify that the next request with that session cookie fails with HTTP 401 in < 1 ms.
+3. **Payload header size audit:** Inspect the size of outgoing `Authorization` headers. Confirm that JWTs remain under 500 bytes by omitting unnecessary claim objects.
+
+## Why
+
+The choice between JWTs and Sessions is an explicit trade-off between **database decoupling** and **centralized control**:
+- **Stateless JWTs** optimize for read throughput and horizontal scaling across independent services by shifting verification from database queries to CPU cryptography.
+- **Server-Side Sessions** optimize for administrative control and security hygiene by keeping the source of truth centralized on the server.
+
+## When Not To Use
+
+- **JWTs in cookies for server-rendered HTML apps:** If your app is a single monolith server, using JWTs gives you all the security complexities of tokens without any of the distributed scaling benefits.
+- **Storing sensitive secrets inside JWTs:** JWTs are signed, not encrypted. Anyone who intercepts a JWT can read all payload claims via `base64url` decode. Never put passwords, API keys, or credit card numbers in claims.
+
+## Common Mistakes
+
+- **Issuing multi-day stateless JWTs:** Giving users a 30-day stateless JWT means that if their device is stolen or their password is reset, the attacker has 30 days of unrevocable access.
+- **Using symmetric secrets (HS256) across multiple microservices:** If 15 microservices share the same secret key, any compromised service can forge tokens for all other services. Use asymmetric keys (RS256/EdDSA) where only the auth service holds the private key.
+- **Putting too many claims in the JWT:** Packing entire user permission lists or profile images into JWT claims causes massive HTTP header overhead on every network hop.

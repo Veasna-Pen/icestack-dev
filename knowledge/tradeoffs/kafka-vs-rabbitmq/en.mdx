@@ -1,0 +1,159 @@
+---
+title: "Kafka vs RabbitMQ"
+question: "When should I use a distributed event log (Kafka) versus a traditional smart message broker (RabbitMQ)?"
+summary: "RabbitMQ is a smart broker with dumb consumers, excelling at complex routing, priority queues, and transient work distribution. Kafka is a dumb broker with smart consumers, excelling at high-throughput event streaming, message replay, and distributed partition ordering."
+tags: [messaging, kafka, rabbitmq, event-driven, architecture]
+related: [problems/should-i-use-kafka, patterns/dead-letter-queue, problems/unbounded-queue-backpressure]
+order: 14
+updated: "2026-09-12"
+contributors: [veasna]
+---
+
+## Context
+
+When moving from synchronous monoliths to asynchronous, event-driven architectures, software teams must choose a messaging backbone. The two most prominent open-source technologies represent fundamentally different paradigms:
+
+1. **RabbitMQ (Message Queue):** Built on the AMQP standard. RabbitMQ is a "Smart Broker with Dumb Consumers". It tracks message delivery, acknowledges individual messages, deletes messages once consumed, and features powerful routing keys, topic exchanges, priority queues, and dead-lettering.
+2. **Apache Kafka (Distributed Event Streaming Platform):** Built as an append-only distributed commit log. Kafka is a "Dumb Broker with Smart Consumers". Messages are written sequentially to immutable partitions and retained on disk for days or months regardless of whether they have been read. Consumers track their own read position (offset) and can replay historical events on demand.
+
+Teams frequently adopt Kafka for simple background task distribution (e.g. sending emails), only to struggle with partition rebalancing, ZooKeeper/KRaft cluster overhead, lack of per-message acknowledgment, and complex client libraries.
+
+## Symptoms
+
+- **Kafka Misuse:** A team wants to retry individual failed tasks or prioritize VIP user jobs, but discovers Kafka cannot acknowledge individual messages out of order or re-route failed messages without creating new topics.
+- **RabbitMQ Misuse:** A team pushes 500,000 sensor telemetry events per second into RabbitMQ; queue memory fills up, broker RAM limits trigger connection blocking, and disk performance degrades because RabbitMQ is tracking per-consumer delivery states in RAM.
+- **Lost Event Replay:** A bug is discovered in an analytics worker; with RabbitMQ, the historical events are already deleted from the queue; with Kafka, the consumer offset is simply reset to replay the past 30 days of data.
+
+<Callout type="warning" title="RabbitMQ deletes on ack; Kafka retains on disk">
+In RabbitMQ, a message exists to be consumed and deleted. In Kafka, a message is an immutable record in a ledger that remains available for multiple independent consumer groups to replay.
+</Callout>
+
+## Diagnose
+
+1. **Measure throughput requirements:** Do you process 5,000 messages/sec (RabbitMQ sweet spot) or 500,000 messages/sec (Kafka sweet spot)?
+2. **Evaluate message replay requirements:** Do downstream services need to replay historical events from yesterday to re-train a model or backfill a new database?
+3. **Audit routing complexity:** Do you need flexible topic wildcard routing, fan-outs, headers exchanges, and per-message dead-lettering?
+4. **Assess operational team capacity:** Can your team manage partition rebalancing, cluster sizing, and consumer offset commits, or do you need a lightweight broker with an easy management web UI?
+
+## Options
+
+1. **RabbitMQ (AMQP):** Ephemeral queues, complex exchange routing, per-message ACKs, priority queues, built-in management UI.
+2. **Apache Kafka:** Persistent partitioned log, sequential disk I/O, event streaming, stream processing (Kafka Streams/ksqlDB), multi-consumer event replay.
+3. **Redis Streams / PubSub:** Lightweight alternative for modest throughput (< 50,000 msg/sec) if Redis already exists in your stack.
+4. **Cloud Managed Queues (AWS SQS / EventBridge):** Zero-maintenance serverless alternatives when avoiding self-hosted broker operations.
+
+## Trade-offs
+
+| Dimension | RabbitMQ | Apache Kafka |
+| :--- | :--- | :--- |
+| **Architectural Model** | Smart Broker / Message Queue | Dumb Broker / Distributed Commit Log |
+| **Max Throughput** | ~20,000 – 50,000 msg/sec per node | **1,000,000+ msg/sec per cluster** |
+| **Message Persistence** | Deleted immediately upon ACK | **Retained on disk (days/weeks/forever)** |
+| **Event Replay** | Not supported (messages vanish) | **Native (rewind consumer offset)** |
+| **Message Routing** | **Extremely flexible (Exchanges, Bindings)** | Simple (Topics and Partitions only) |
+| **Ordering Guarantee** | FIFO within single queue | Strict ordering **per partition only** |
+| **Per-Message ACK / Retry** | **Native (`ack`, `nack`, `reject`)** | Coarse-grained (Offset commits) |
+| **Operational Complexity** | Low to Moderate (Erlang, Web GUI) | High (JVM, Partitions, Rebalancing) |
+
+## Decision
+
+- **Choose RabbitMQ for:**
+  - Traditional background worker job queues (PDF generation, email dispatch, video transcoding, payment webhooks).
+  - Complex routing topologies (routing events dynamically to different queues based on wildcard routing keys).
+  - Workloads requiring per-message acknowledgments, exponential retry queues, and Dead Letter Exchanges.
+  - Granular job prioritization (processing VIP user tasks ahead of free tier tasks).
+- **Choose Apache Kafka for:**
+  - High-volume clickstream tracking, IoT telemetry, and distributed system metrics.
+  - Event Sourcing and CQRS architectures where the event log is the durable source of truth.
+  - Complex stream processing pipelines (joining multiple real-time streams, windowed aggregations).
+  - Multi-consumer data broadcast where 10 different internal systems (analytics, fraud, notifications, search indexers) consume the exact same event stream at their own pace.
+
+## Implementation
+
+### 1. RabbitMQ Consumer: Granular Per-Message ACK & Selective Rejection (TypeScript):
+
+```typescript
+import amqp from 'amqplib';
+
+export async function startRabbitWorker() {
+  const conn = await amqp.connect(process.env.RABBITMQ_URL!);
+  const channel = await conn.createChannel();
+  await channel.prefetch(10);
+
+  channel.consume('email_tasks', async (msg) => {
+    if (!msg) return;
+
+    try {
+      const task = JSON.parse(msg.content.toString());
+      await sendEmail(task);
+
+      // Acknowledge individual message - RabbitMQ removes it from memory
+      channel.ack(msg);
+    } catch (err) {
+      console.error('[RabbitMQ] Email delivery failed:', err);
+      // Selective reject: Send directly to Dead Letter Exchange without requeue
+      channel.nack(msg, false, false);
+    }
+  });
+}
+```
+
+### 2. Kafka Consumer: Offset-Based Batch Processing & Stream Replay:
+
+```typescript
+import { Kafka } from 'kafkajs';
+
+const kafka = new Kafka({ clientId: 'analytics-worker', brokers: ['kafka:9092'] });
+const consumer = kafka.consumer({ groupId: 'analytics-group' });
+
+export async function startKafkaStreaming() {
+  await consumer.connect();
+  await consumer.subscribe({ topic: 'user-clicks', fromBeginning: false });
+
+  // Stream processing: High throughput batch execution
+  await consumer.run({
+    eachBatch: async ({ batch, resolveOffset, heartbeat }) => {
+      for (const message of batch.messages) {
+        if (!message.value) continue;
+        const clickEvent = JSON.parse(message.value.toString());
+        await processAnalytics(clickEvent);
+
+        // Commit offset mark
+        resolveOffset(message.offset);
+        await heartbeat();
+      }
+    },
+  });
+}
+
+// Rewind offset to replay past 24 hours of data!
+export async function replayEvents(topic: string, timestamp: number) {
+  // Can rewind partition offsets to historical timestamp
+  console.log(`Rewinding consumer group offsets for topic ${topic} to ${new Date(timestamp).toISOString()}`);
+}
+```
+
+## Verification
+
+1. **Throughput stress test:** Benchmark publishing 100,000 messages. Kafka achieves this with minimal CPU via sequential batch disk I/O, while RabbitMQ uses more CPU maintaining in-memory queue states.
+2. **Replay validation:** In Kafka, stop the consumer, rewind its offset by 5,000, and restart. Verify that all 5,000 events are re-read and re-processed cleanly.
+3. **Queue routing flexibility test:** In RabbitMQ, configure a `topic` exchange with routing keys `orders.us.*` and `orders.eu.*`. Confirm that messages route to respective queues without application-level filtering.
+
+## Why
+
+The divergence between RabbitMQ and Kafka stems from their fundamental view of data:
+- **RabbitMQ views messages as transient commands:** Work to be completed. Once done, the message is garbage-collected.
+- **Kafka views messages as historical facts:** An immutable log of events that occurred in the past. What happened cannot be un-happened; it can only be recorded and re-analyzed by any interested consumer.
+
+Choosing the right tool aligns your messaging infrastructure with your data's fundamental lifecycle.
+
+## When Not To Use
+
+- **Kafka for simple transactional email queues:** You will spend weeks wrestling with consumer group rebalances, partition keys, and offset commit semantics when RabbitMQ or AWS SQS would take 10 minutes to set up.
+- **RabbitMQ for big data stream processing:** Buffering millions of retained events over 30 days in RabbitMQ will exhaust RAM and crash the Erlang VM.
+
+## Common Mistakes
+
+- **Using Kafka partitions like individual queues:** Kafka scales by partition; you cannot dynamically create a partition per tenant or per job.
+- **Unbounded queue backpressure in RabbitMQ:** Allowing millions of messages to accumulate in a RabbitMQ queue without consumers will consume all broker RAM and trigger connection alarms.
+- **Committing Kafka offsets before processing:** Calling `resolveOffset()` before writing the data to the database causes silent message loss if the worker crashes midway.

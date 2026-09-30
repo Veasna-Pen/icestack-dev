@@ -1,0 +1,26 @@
+{
+  "problems": {
+    "label": "Problems",
+    "singular": "Problem",
+    "description": "Real questions developers face, reasoned through from context to decision.",
+    "role": "Start from what hurts"
+  },
+  "patterns": {
+    "label": "Patterns",
+    "singular": "Pattern",
+    "description": "Reusable solutions, and the conditions under which they stop working.",
+    "role": "Reusable answers"
+  },
+  "tradeoffs": {
+    "label": "Trade-offs",
+    "singular": "Trade-off",
+    "description": "Head-to-head comparisons with a clear answer for each context.",
+    "role": "Weigh the options"
+  },
+  "implementations": {
+    "label": "Implementation",
+    "singular": "Implementation",
+    "description": "How the patterns look in real code, stack by stack.",
+    "role": "Write the code"
+  }
+}

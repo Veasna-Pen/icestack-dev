@@ -1,0 +1,161 @@
+---
+title: "Strong vs Eventual Consistency"
+question: "តើនៅពេលណាដែលប្រព័ន្ធ Distributed ត្រូវតែធានានូវភាពស៊ីសង្វាក់ដាច់ខាត (Strong Consistency) ហើយនៅពេលណាដែលគួរប្រើប្រាស់ Eventual Consistency?"
+summary: "Strong Consistency ធានាថារាល់ការអានទាំងអស់នឹងទទួលបានទិន្នន័យដែលទើបតែសរសេរចុងក្រោយបង្អស់ជានិច្ច ដែលចាំបាច់បំផុតសម្រាប់សមតុល្យលុយ និងស្តុកទំនិញ តែត្រូវប្តូរមកវិញនូវ Latency ខ្ពស់ជាងមុន។ រីឯ Eventual Consistency ធានាថាទិន្នន័យនឹងត្រូវគ្នាទៅតាមពេលវេលា (ពីរបីមិល្លីវិនាទីទៅពីរបីវិនាទី) ដែលជួយដោះសោសមត្ថភាពពង្រីកប្រព័ន្ធផ្ដេក (Scale) និងភាពអាចរកបានខ្ពស់ (High Availability)។"
+tags: [distributed-systems, cap-theorem, database, consistency, architecture]
+related: [tradeoffs/sql-vs-nosql, problems/replication-lag, patterns/cqrs]
+order: 13
+updated: "2026-09-12"
+contributors: [veasna]
+translation: draft
+---
+
+## Context
+
+នៅក្នុង Database ម៉ាស៊ីនតែមួយ ភាពស៊ីសង្វាក់គ្នានៃទិន្នន័យ (Consistency) មានលក្ខណៈសាមញ្ញបំផុត៖ ប្រតិបត្តិការទាំងអស់ដំណើរការតាមលំដាប់លំដោយ (ACID) ហើយរាល់ការអានទាំងអស់មើលឃើញទិន្នន័យដែលបាន Commit ភ្លាមៗ។
+
+ប៉ុន្តែនៅក្នុងប្រព័ន្ធ Distributed Systems សម័យទំនើប (Multi-Region Clusters, Read Replicas, NoSQL, Microservices) ទិន្នន័យត្រូវបានចម្លង (Replicate) ឆ្លងកាត់ម៉ាស៊ីនឯករាជ្យជាច្រើនជុំវិញពិភពលោក។ យោងតាមទ្រឹស្តីបទ **CAP Theorem** របស់លោក Eric Brewer នៅពេលដែលបណ្តាញ Network រវាងម៉ាស៊ីនមានបញ្ហារអាក់រអួល ឬដាច់ពីគ្នា ប្រព័ន្ធត្រូវតែជ្រើសរើសរវាង៖
+1. **Strong Consistency (Linearizability)៖** រាល់ការអានទាំងអស់លើគ្រប់ Node ត្រូវបានធានាថានឹងប្រគល់ទិន្នន័យថ្មីបំផុត។ ប្រសិនបើ Node មិនអាចទាក់ទងគ្នាបានទេ សំណើនឹងត្រូវច្រានចោលដើម្បីការពារកុំឱ្យអានប៉ះទិន្នន័យចាស់ (CP System)។
+2. **Eventual Consistency៖** Node នីមួយៗទទួលការអាន និងសរសេរដោយឯករាជ្យ។ ទិន្នន័យថ្មីត្រូវបានបញ្ជូនបន្តទៅកាន់ Replicas ផ្សេងទៀតបែប Asynchronous។ ក្នុងរយៈពេលខ្លី Node មួយចំនួនអាចនឹងប្រគល់ទិន្នន័យចាស់ ប៉ុន្តែនៅពេលដែលគ្មានការកែប្រែថ្មីៗទៀត Replicas ទាំងអស់នឹងស្របគ្នាដូចគ្នាបេះបិទ (AP System)។
+
+ការជ្រើសរើស Strong Consistency គ្រប់ទីកន្លែង នឹងទាញទម្លាក់ Throughput យ៉ាងធ្ងន់ធ្ងរ និងបង្កើន Latency ឆ្លងកាត់ទ្វីប។ ផ្ទុយទៅវិញ ការជ្រើសរើស Eventual Consistency សម្រាប់ប្រតិបត្តិការហិរញ្ញវត្ថុ នឹងបង្កឱ្យមានបញ្ហាគណនេយ្យខុសតួលេខដ៏មហន្តរាយ។
+
+## Symptoms
+
+- **រោគសញ្ញាបរាជ័យនៃ Eventual Consistency៖** អតិថិជនផ្ទេរប្រាក់រួច Refresh មើលទំព័រ Profile ស្រាប់តែឃើញសមតុល្យលុយចាស់ដដែល ធ្វើឱ្យគេភ័យស្លន់ស្លោរួចចុចផ្ទេរលុយម្តងទៀតស្ទួនពីរដង។
+- **រោគសញ្ញាបរាជ័យនៃ Strong Consistency៖** ខ្សែកាបអុបទិកឆ្លងកាត់មហាសមុទ្រអាត្លង់ទិកជួបបញ្ហារអាក់រអួលបន្តិចបន្តួច; ជំនួសឱ្យការបន្តបង្ហាញទំព័រទំនិញដល់អតិថិជន វេបសាយទាំងមូលបែរជាបង្ហាញ Error 500 ដាច់ប្រព័ន្ធទូទាំងពិភពលោក។
+- Distributed Locks ឬ Two-Phase Commit ឆ្លងកាត់ Region បន្ថែម Latency ៣០០ ms លើគ្រប់សកម្មភាពរបស់អ្នកប្រើប្រាស់។
+
+<Callout type="warning" title="Consistency គឺជាជម្រើសចម្រុះ មិនមែនជាការជ្រើសរើសដាច់ខាតសឬខ្មៅឡើយ">
+ស្ថាបត្យកម្មកម្រិត Production ភាគច្រើនប្រើប្រាស់ទម្រង់ Hybrid៖ ប្រើប្រាស់ Strong Consistency លើប្រតិបត្តិការសរសេរស្នូលតែមួយគត់ (ការកាត់ស្តុកទំនិញ) និងប្រើប្រាស់ Eventual Consistency សម្រាប់ទិដ្ឋភាពទូទៅ (ប្រព័ន្ធស្វែងរក, ការបង្ហាញទំនិញស្រដៀងគ្នា, ការផ្ញើ Email)។
+</Callout>
+
+## Diagnose
+
+1. **វាយតម្លៃការខាតបង់នៃទិន្នន័យចាស់៖** ប្រសិនបើអ្នកប្រើប្រាស់អានទិន្នន័យដែលយឺតជាងពេលពិត ៥០០ មិល្លីវិនាទី តើអាជីវកម្មខាតបង់ប្រាក់កាស ឬគ្រាន់តែជាការយឺតយ៉ាវធម្មតា?
+2. **ពិនិត្យទីតាំងភូមិសាស្ត្ររបស់ម៉ាស៊ីន៖** តើម៉ាស៊ីន និងអ្នកប្រើប្រាស់របស់អ្នកស្ថិតនៅឆ្លងកាត់ទ្វីបផ្សេងៗគ្នា (ដែលល្បឿនពន្លឺក្នុងខ្សែកាបបង្កើន Latency ពី ៧០ ដល់ ១៥០ ms រាល់ពេលសម្របសម្រួល Consensus) ដែរឬទេ?
+3. **ពិនិត្យការរំពឹងទុករបស់ User (Read-your-own-writes)៖** តើអ្នកប្រើប្រាស់កែប្រែទិន្នន័យរួចត្រូវបានបញ្ជូនទៅកាន់ទំព័រដែលបង្ហាញការកែប្រែនោះភ្លាមៗដែរឬទេ?
+4. **ពិនិត្យការដោះស្រាយពេល Network ដាច់៖** នៅពេល Data Center មួយជួបបញ្ហា Network តើសេវាកម្មរបស់អ្នកត្រូវតែបន្តបើកឱ្យអាន ១០០% ដែរឬទេ?
+
+## Options
+
+1. **Linearizable Strong Consistency (Postgres Master, Spanner)៖** ប្រើប្រាស់ Raft/Paxos ឬ Single Primary Node។ រាល់ការអានធានាថានឹងឆ្លុះបញ្ចាំងពីស្ថានភាព Commit ចុងក្រោយបង្អស់។
+2. **Read-Your-Own-Writes (Causal Consistency)៖** ធានាថាអ្នកដែលកែប្រែទិន្នន័យ នឹងមើលឃើញការកែប្រែរបស់ខ្លួនភ្លាមៗ ខណៈដែលអ្នកដទៃទៀតនឹងមើលឃើញតាមក្រោយបន្តិចម្តងៗ។
+3. **Eventual Consistency (DynamoDB, Cassandra, Read Replicas)៖** Replicas ធ្វើសមកាលកម្មទិន្នន័យបែប Asynchronous។ ការអានត្រូវបានបម្រើក្នុងម៉ាស៊ីនក្បែរបំផុតក្នុងពេល < 2 ms។
+4. **Monotonic Read Consistency៖** ធានាថានៅពេលដែលអ្នកអានបានឃើញ Version ណាមួយហើយ ពួកគេនឹងមិនដែលឃើញ Version ចាស់ជាងនេះនៅលើសំណើបន្ទាប់ឡើយ។
+
+## Trade-offs
+
+| លក្ខណៈវិនិច្ឆ័យ | Strong Consistency (CP) | Eventual Consistency (AP) | Causal / Session Consistency |
+| :--- | :--- | :--- | :--- |
+| **Latency នៃការអាន** | ខ្ពស់ជាង (ត្រូវសួរ Quorum) | **លឿនបំផុត (< 2 ms ក្នុងម៉ាស៊ីន)** | លឿន |
+| **Latency នៃការសរសេរ** | ខ្ពស់ជាង (រង់ចាំ Quorum ឆ្លើយតប) | **លឿន (Commit ក្នុងម៉ាស៊ីន)** | មធ្យម |
+| **ភាពអាចរកបានពេល Network ដាច់** | ច្រានចោលសំណើ (ដើម្បីសុវត្ថិភាព) | **ដំណើរការ ១០០% (ប្រគល់ទិន្នន័យចាស់)** | ខ្ពស់ |
+| **សមត្ថភាពពង្រីកផ្ដេក (Scale)** | កម្រិតដោយ Consensus Coordinator | **គ្មានដែនកំណត់ (Sharded Replicas)** | ខ្ពស់ |
+| **បទពិសោធន៍អ្នកប្រើប្រាស់ (UX)** | គ្មានការភ្ញាក់ផ្អើលទិន្នន័យចាស់ | ត្រូវការ Optimistic UI លើ Client | **ល្អបំផុត (User ឃើញកូដខ្លួនឯង)** |
+| **ភាពស្មុគស្មាញនៃប្រព័ន្ធ** | សាមញ្ញក្នុងការយល់ | ស្មុគស្មាញ (ត្រូវដោះស្រាយ Conflict) | មធ្យម |
+
+## Decision
+
+- **ត្រូវតែប្រើ Strong Consistency សម្រាប់៖**
+  - សមតុល្យហិរញ្ញវត្ថុ, ការផ្ទេរប្រាក់ក្នុងធនាគារ, ការអនុញ្ញាតទូទាត់ប្រាក់។
+  - ការកក់ទំនិញក្នុងស្តុកដែលមានចំនួនតិច (ការពារកុំឱ្យលក់លើសចំនួន)។
+  - ព័ត៌មានសម្ងាត់ចូលប្រើប្រាស់, ការផ្លាស់ប្តូរ Password, ការដកហូតសិទ្ធិ។
+  - Primary Key Constraints និងការបង្កើតលេខរាប់កើនឡើងតាមលំដាប់។
+- **ជ្រើសរើស Eventual Consistency សម្រាប់៖**
+  - Feed បណ្តាញសង្គម, ចំនួន Like, Comments, និងចំនួន Follower។
+  - Search Engine (Elasticsearch, Typesense)។
+  - ការបង្ហាញទំនិញស្រដៀងគ្នា និងការវាយតម្លៃ Review របស់អតិថិជន។
+  - Dashboard របាយការណ៍, Logging, និង Analytics។
+- **អនុវត្ត "Read-Your-Own-Writes" សម្រាប់បទពិសោធន៍ Hybrid៖** នៅពេល User កែប្រែ Profile ត្រូវកត់ត្រា Timestamp នៃការសរសេរក្នុង Cookie។ ប្រសិនបើ User ដដែលនោះបើកមើល Profile ក្នុងរយៈពេល ៥ វិនាទី ត្រូវបង្វែរ Query ទៅកាន់ Primary Database; ចំពោះការអានផ្សេងទៀត ត្រូវបង្វែរទៅកាន់ Read Replica ដែលប្រើ Eventual Consistency។
+
+## Implementation
+
+### 1. កូដ Router បែងចែក Read-Your-Own-Writes ក្នុង TypeScript៖
+
+```typescript
+import { Request, Response, NextFunction } from 'express';
+import { primaryDb, replicaDb } from './database';
+
+export function getDatabaseForRequest(req: Request) {
+  const lastWriteTimestamp = req.cookies['last_write_at'];
+
+  if (lastWriteTimestamp) {
+    const elapsedSeconds = (Date.now() - parseInt(lastWriteTimestamp, 10)) / 1000;
+    // ប្រសិនបើ User ទើបតែសរសេរទិន្នន័យក្នុងរង្វង់ ៥ វិនាទីចុងក្រោយ បង្វែរទៅ Primary ដើម្បីជៀសវាង Replication Lag
+    if (elapsedSeconds < 5) {
+      console.log(`[DB Router] បង្វែរទៅ PRIMARY (User ទើបកែប្រែទិន្នន័យ ${elapsedSeconds.toFixed(1)} វិនាទីមុន)`);
+      return primaryDb;
+    }
+  }
+
+  // ក្រៅពីនេះ បង្វែរទៅ Read Replica ដែលលឿន (Eventual Consistency)
+  return replicaDb;
+}
+
+export async function handleUpdateProfile(req: Request, res: Response) {
+  // ១. សរសេរចូល Primary DB ដាច់ខាត
+  await primaryDb.query('UPDATE profiles SET bio = $1 WHERE user_id = $2', [req.body.bio, req.user.id]);
+
+  // ២. បង្កើត Cookie កត់ត្រាម៉ោងដែលបានសរសេរ
+  res.cookie('last_write_at', Date.now().toString(), { httpOnly: true, maxAge: 10000 });
+
+  return res.json({ success: true });
+}
+```
+
+### 2. ការកំណត់ Strong ទល់នឹង Eventual Consistency ក្នុង DynamoDB៖
+
+```typescript
+import { DynamoDBClient, GetItemCommand } from '@aws-sdk/client-dynamodb';
+
+const client = new DynamoDBClient({});
+
+export async function fetchAccountBalance(accountId: string) {
+  // Strong Consistency: ធានាថានឹងទទួលបានសមតុល្យចុងក្រោយបង្អស់ (ស៊ី Capacity ពីរដង)
+  return await client.send(
+    new GetItemCommand({
+      TableName: 'Accounts',
+      Key: { id: { S: accountId } },
+      ConsistentRead: true, // បើក Strong Consistency
+    })
+  );
+}
+
+export async function fetchPublicReviews(productId: string) {
+  // Eventual Consistency: តម្លៃថោកជាងពាក់កណ្តាល, លឿនបំផុត, ទទួលយក Lag ២០០ ms បាន
+  return await client.send(
+    new GetItemCommand({
+      TableName: 'Reviews',
+      Key: { productId: { S: productId } },
+      ConsistentRead: false, // Eventual Consistency
+    })
+  );
+}
+```
+
+## Verification
+
+1. **ការវាស់ស្ទង់ Replication Lag៖** កត់ត្រា Timestamp ចូល Primary DB ជាបន្តបន្ទាប់ រួចវាស់វែងរយៈពេលដែលទិន្នន័យនោះលេចឡើងលើ Read Replica (`lag_ms = replica.timestamp - primary.timestamp`)។
+2. **ការធ្វើតេស្ត Read-your-own-writes៖** Update Profile អ្នកប្រើប្រាស់តាម API រួចផ្ញើសំណើ GET ភ្លាមៗ។ ផ្ទៀងផ្ទាត់ថាលទ្ធផលបង្ហាញទិន្នន័យថ្មី ១០០% គ្រប់ពេល។
+3. **ការធ្វើតេស្តរស់រានពេល Network Partition៖** សាកល្បងផ្តាច់ Network លើ Read Replica។ ផ្ទៀងផ្ទាត់ថាការសរសេរលើ Primary Database នៅតែជោគជ័យធម្មតាដោយគ្មាន Deadlock ឡើយ។
+
+## Why
+
+ល្បឿនពន្លឺក្នុងខ្សែកាបអុបទិកមានប្រហែល ២០០,០០០ គីឡូម៉ែត្រក្នុងមួយវិនាទី។ វាគឺជាច្បាប់រូបវិទ្យាដែលការសម្របសម្រួលទិន្នន័យឆ្លងកាត់ទ្វីបត្រូវចំណាយពេលវេលាពិតប្រាកដ (រាប់សិបទៅរាប់រយមិល្លីវិនាទី)។
+
+- បើអ្នកទាមទារ **Strong Consistency** អ្នកត្រូវបង់ថ្លៃ Latency ដោយត្រូវរង់ចាំម៉ាស៊ីននៅឆ្ងាយយល់ព្រមសិន ទើបអាចបន្តទៅមុខទៀតបាន។
+- បើអ្នកទទួលយក **Eventual Consistency** អ្នកបានផ្តាច់ការដំណើរការក្នុងស្រុកចេញពីការសម្របសម្រួលសកល ដែលជួយឱ្យ Application អាចឆ្លើយតបលឿនដូចផ្លេកបន្ទោរចេញពី Edge Nodes គ្រប់ទិសទីលើផែនដី។
+
+ការកសាងប្រព័ន្ធធំៗទាមទារការយល់ដឹងពីភាពខុសគ្នារវាងប្រតិបត្តិការដែលត្រូវការភាពត្រឹមត្រូវភ្លាមៗជាចាំបាច់ និងប្រតិបត្តិការដែលអាចទទួលយកភាពយឺតយ៉ាវបន្តិចបន្តួចបាន។
+
+## When Not To Use
+
+- **Eventual Consistency សម្រាប់ការកក់កៅអីយន្តហោះ៖** ប្រសិនបើមនុស្សពីរនាក់អាចកក់កៅអី 14B បានព្រមគ្នាព្រោះតែទិន្នន័យមិនទាន់ Sync នោះក្រុមការងារ Support នឹងត្រូវឈឺក្បាលដោះស្រាយវិវាទនៅមាត់ទ្វារយន្តហោះជាមិនខាន។
+- **Strong Consistency សម្រាប់ការរាប់ចំនួនអ្នកមើលវីដេអូ YouTube៖** ការផ្អាកមិនឱ្យគេមើលវីដេអូបាន គ្រាន់តែដើម្បីរង់ចាំឱ្យលេខរាប់អ្នកមើលនៅតូក្យូត្រូវគ្នានឹងម៉ាស៊ីននៅអាល្លឺម៉ង់ គឺជាការសរសេរកូដដែលខុសឆ្គងទាំងស្រុង។
+
+## Common Mistakes
+
+- **សន្មតថា Read Replica មានទិន្នន័យស្រស់ជានិច្ច (Strongly Consistent)៖** ការបង្វែរការអាន Profile ទៅកាន់ PostgreSQL Read Replica ដោយគ្មាន Session Stickiness នឹងធ្វើឱ្យ User ឃើញទិន្នន័យចាស់ភ្លាមៗក្រោយពេលគេទើបតែចុច Save។
+- **ភ្លេចបើក ConsistentRead ក្នុង DynamoDB៖** DynamoDB កំណត់លំនាំដើម `ConsistentRead: false`។ បើ Developer ភ្លេចកំណត់ `true` ពេលឆែកសមតុល្យប្រាក់ បញ្ហា Race Condition នឹងកើតឡើង។
+- **ផ្នត់គំនិតជ្រុលនិយម (All-or-Nothing)៖** ការទាមទារឱ្យប្រព័ន្ធទាំងមូលប្រើតែ Strong Consistency ឬ Eventual Consistency តែមួយមុខ។ ស្ថាបត្យកម្មដែលឆ្លាតវៃ ប្រើប្រាស់ Strong លើការសរសេរស្នូល និងប្រើប្រាស់ Eventual លើការអានទូទៅ។

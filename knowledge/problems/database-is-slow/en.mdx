@@ -1,0 +1,171 @@
+---
+title: "Why is my database slow?"
+summary: "Usually because of one or two queries, not the database. Find them with pg_stat_statements and EXPLAIN before you reach for a cache, a replica or a bigger instance."
+tags: [database, postgres, performance, indexing]
+related: [problems/should-i-use-redis, patterns/caching, tradeoffs/sql-vs-nosql]
+order: 3
+updated: "2026-09-11"
+---
+
+## Context
+
+A checkout API on a Node.js service, one Postgres 16 primary (8 vCPU, 32 GB RAM), about 40 million rows in `orders`. Traffic doubled this quarter after a marketing push. The team is four backend developers, with no dedicated DBA.
+
+This is the most common shape of the question: a mid-sized relational database that was fine for a year and then wasn't. The examples use Postgres, but the reasoning carries over to MySQL.
+
+## Symptoms
+
+- Checkout p95 went from **120 ms to 2.4 s** over about three weeks, not overnight.
+- Database CPU sits at 85–95% during business hours. It used to be under 40%.
+- Connection pool timeouts (`TimeoutError: acquiring connection`) appear at peak.
+- Everyone's first guess is "traffic doubled, so the database needs to be bigger."
+
+<Callout type="warning" title="A slow database is a symptom">
+Slowness is almost never spread evenly. In most incidents a handful of queries account for most of the database's time. Find them before you change anything.
+</Callout>
+
+## Diagnose
+
+Work from the top down: first find which queries use the most **total** time, then work out why each one is slow.
+
+**1. Rank queries by total time.** `pg_stat_statements` ships with Postgres. Turn it on once and leave it on.
+
+```sql
+-- postgresql.conf: shared_preload_libraries = 'pg_stat_statements' (one restart)
+CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
+
+SELECT
+  round(total_exec_time)                                          AS total_ms,
+  calls,
+  round(mean_exec_time::numeric, 1)                               AS mean_ms,
+  round((100 * total_exec_time / sum(total_exec_time) OVER ())::numeric, 1) AS pct,
+  left(query, 80)                                                 AS query
+FROM pg_stat_statements
+ORDER BY total_exec_time DESC
+LIMIT 10;
+```
+
+In this example one query is **61% of all database time**:
+
+```sql
+SELECT * FROM orders
+WHERE customer_id = $1
+ORDER BY created_at DESC
+LIMIT 20;
+```
+
+**2. Ask the planner what it is doing.** Run the query with real parameters:
+
+```sql
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT * FROM orders WHERE customer_id = 4821 ORDER BY created_at DESC LIMIT 20;
+```
+
+```text
+Limit  (actual time=1912.4..1912.6 rows=20 loops=1)
+  ->  Index Scan Backward using orders_created_at_idx on orders
+        (actual time=0.9..1912.5 rows=20 loops=1)
+        Filter: (customer_id = 4821)
+        Rows Removed by Filter: 3148022
+        Buffers: shared hit=91210 read=38112
+```
+
+Postgres walks the `created_at` index backwards and throws away 3.1 million rows to find the 20 that belong to this customer. There is no index on `customer_id`. Every order anyone places makes this query slower for everyone, which is why it degraded over weeks instead of breaking overnight.
+
+What to look for in any plan:
+
+| In the plan | Usually means |
+| :--- | :--- |
+| `Seq Scan` on a large table | No usable index for the filter |
+| `Rows Removed by Filter` in the millions | An index is used, but on the wrong column |
+| `Sort` above a scan | The index doesn't match the `ORDER BY` |
+| Estimated `rows` far from actual | Stale statistics; run `ANALYZE` |
+| Large `Buffers: shared read` | Reading from disk rather than memory |
+
+**3. Check the rest of the list** before deciding: N+1 patterns (a fast query called thousands of times), lock waits (`pg_stat_activity` where `wait_event_type = 'Lock'`), and connection count against `max_connections`.
+
+## Options
+
+1. **Do nothing.** Not viable here: p95 is already far past the checkout target.
+2. **Add the right index.** A composite index that matches both the filter and the sort.
+3. **Rewrite the query.** Select only the columns the page needs.
+4. **Cache the result in Redis.** Serve each customer's order list from memory.
+5. **Add a read replica.** Move read traffic off the primary.
+6. **Scale the instance up.** More CPU and RAM.
+
+## Trade-offs
+
+| Option | Cost | Time to ship | Reversible? | New failure modes |
+| :--- | :--- | :--- | :--- | :--- |
+| Index | Slight write overhead, disk space | Hours | Yes, `DROP INDEX` | Almost none |
+| Query rewrite | Developer time | A day | Yes | Regressions in callers |
+| Redis cache | A new service, invalidation logic | Days | Hard, once relied on | Stale data, stampedes, Redis outages |
+| Read replica | Roughly double the database bill | Days | Yes | Replication lag, read-your-writes bugs |
+| Bigger instance | Roughly double the database bill | Minutes | Yes | None, but the problem returns as the table grows |
+
+The cache and the replica both treat the symptom (too much load) instead of the cause (one query doing a million times more work than it needs to). They also add moving parts that a four-person team has to run at 3 a.m.
+
+## Decision
+
+**Add a composite index on `(customer_id, created_at DESC)`** and trim the query to the columns the page uses.
+
+Revisit caching or replicas only if the database is still the bottleneck **after** the top queries are fixed, for example if CPU stays above about 70% at peak with a healthy `pg_stat_statements` top 10.
+
+## Implementation
+
+Build the index without blocking writes. `CONCURRENTLY` takes longer but doesn't lock the table:
+
+```sql
+CREATE INDEX CONCURRENTLY IF NOT EXISTS orders_customer_created_idx
+  ON orders (customer_id, created_at DESC);
+```
+
+If the build fails part-way it leaves an `INVALID` index behind. Find it, drop it, and retry:
+
+```sql
+SELECT indexrelid::regclass FROM pg_index WHERE NOT indisvalid;
+DROP INDEX CONCURRENTLY orders_customer_created_idx;
+```
+
+Then stop fetching columns nobody reads:
+
+```sql
+SELECT id, order_number, status, total_cents, created_at
+FROM orders
+WHERE customer_id = $1
+ORDER BY created_at DESC
+LIMIT 20;
+```
+
+If you use a migration tool, make sure this migration doesn't run inside a transaction, because `CREATE INDEX CONCURRENTLY` refuses to.
+
+## Verification
+
+1. **The plan changed.** `EXPLAIN (ANALYZE, BUFFERS)` now shows `Index Scan using orders_customer_created_idx`, no `Rows Removed by Filter`, and a few dozen buffers instead of 129,000.
+2. **The number from the problem moved.** Checkout p95 is back to about **140 ms** and peak database CPU is around 35%.
+3. **Nothing else got worse.** Insert latency on `orders` is unchanged within noise.
+4. **It stays fixed.** Reset the statistics (`SELECT pg_stat_statements_reset();`) and check the top 10 again in a week. Alert on endpoint p95, not only on database CPU.
+
+## Why
+
+A query's cost depends on how much data the database has to touch, not only on how often you ask. Without the right index, "the last 20 orders for one customer" means stepping over every newer order in the table, and that grows with the table. Doubled traffic made the problem visible; the growing table created it.
+
+An index turns a query that scales with the size of the table into one that scales with the size of the result. That is why it beat every infrastructure option: it removed the work instead of buying more capacity to do it.
+
+## When Not To Use
+
+"Add an index" is not always the answer:
+
+- **Write-heavy tables** such as event logs or metrics, where every extra index slows every insert. Consider partitioning or a different store.
+- **Low-selectivity columns** such as a boolean `is_active`. The planner often ignores the index anyway.
+- **Analytical queries** that read most of a table (monthly reports). Those want a replica, a materialized view or a warehouse.
+- **When no single query dominates.** If time is spread evenly across thousands of cheap queries, look at N+1 patterns, connection pooling, or genuinely too much traffic.
+
+## Common Mistakes
+
+- **Scaling up first.** A bigger instance buys a few months, then the table outgrows it again, at twice the monthly bill.
+- **Putting a cache over a missing index.** You now have a slow query *and* an invalidation problem. See [Should I use Redis?](../should-i-use-redis).
+- **Indexing every column "just in case".** Unused indexes cost write speed and disk. Look for `idx_scan = 0` in `pg_stat_user_indexes`.
+- **Wrong column order.** `(created_at, customer_id)` serves `WHERE customer_id = ? ORDER BY created_at` far worse. Put equality columns first, then the sort column.
+- **A plain `CREATE INDEX` on a busy production table**, which blocks writes until it finishes.
+- **Testing on a laptop with a thousand rows**, where every plan is fast. Test with production-sized data, or read the plan from production.

@@ -1,0 +1,179 @@
+---
+title: "Transactional Outbox"
+question: "How do I update a database and publish an event without data inconsistency?"
+summary: "Write the outgoing message into an outbox table in the same ACID database transaction as the business entity. A separate relay process publishes the events reliably, eliminating dual-write failures."
+tags: [patterns, outbox, event-driven, messaging, microservices, reliability]
+related: [problems/should-i-use-kafka, patterns/idempotency, tradeoffs/sync-vs-async]
+order: 6
+updated: "2026-09-12"
+contributors: [veasna]
+---
+
+## Context
+
+An order service receives an HTTP request to create an order. The service must persist the order in PostgreSQL and publish an `order.created` event to a message broker (such as Kafka, RabbitMQ, or AWS SQS) so downstream inventory, billing, and notification services can process it.
+
+Writing to two independent storage systems (the relational database and the message broker) is known as a **dual write**. Because distributed transactions across disparate systems are impractical, one write will eventually succeed while the other fails.
+
+## Symptoms
+
+- **Lost Events:** The database transaction commits successfully, but the network call to Kafka times out or the process crashes before publishing. The customer sees their order on the website, but warehouse and shipping services never receive the event.
+- **Phantom Events:** The service sends the event to the message broker first; then the database transaction fails due to a unique constraint violation and rolls back. Downstream services ship goods for an order that does not exist in the primary database.
+- **Support escalations:** "Order #4829 exists in the database, but was never billed or fulfilled."
+- **Ad-hoc reconciliation scripts:** Engineers running daily SQL scripts to manually backfill missing events.
+
+<Callout type="warning" title="Dual writes cannot be solved with try/catch">
+Wrapping your broker publish in a `try/catch` or retry loop does not solve the problem. If the server loses power or restarts between committing the database transaction and sending the message, the event is permanently lost.
+</Callout>
+
+## Diagnose
+
+1. **Scan your codebase for dual writes:** Search for code where a database query and a message publisher execute sequentially:
+   ```typescript
+   // DUAL WRITE BUG: Either line can fail while the other succeeds
+   await db.orders.create({ data: orderData });
+   await messageBroker.publish('order.created', orderData);
+   ```
+2. **Measure event discrepancy:** Count orders created in the database over the past month versus the total count of events received by downstream queues.
+3. **Audit crash recovery:** Review what happens when an application pod is killed with `SIGKILL` in between the two operations.
+
+## Options
+
+1. **Dual write with client retry.** Keep the sequential writes, but retry the broker publish if it fails. (Fails completely if the process crashes or network partition lasts).
+2. **Two-Phase Commit (2PC / XA Transactions).** Coordinate transactions across Postgres and the broker using a distributed transaction coordinator. (Horizontally unscalable, high latency, unsupported by most modern cloud brokers like Kafka/SQS).
+3. **Transactional Outbox with Polling Relay.** Save the event as a row in an `outbox` table within the same database transaction. A separate worker polls the table with `FOR UPDATE SKIP LOCKED` and publishes to the broker.
+4. **Transactional Outbox with Change Data Capture (CDC / Debezium).** Save the event to the outbox table, but read the database transaction write-ahead log (WAL) using a tool like Debezium.
+
+## Trade-offs
+
+| Strategy | Consistency Guarantee | Operational Complexity | Performance / Throughput |
+| :--- | :--- | :--- | :--- |
+| **Dual Write** | Inconsistent (eventual drift) | Minimal | High until failure |
+| **2PC / XA** | Strong | Extreme (coordinators, blocking locks) | Terrible throughput |
+| **Outbox + Polling** | **At-least-once delivery** | **Low** (one extra table & SQL query) | Hundreds to thousands of events/sec |
+| **Outbox + CDC (Debezium)** | **At-least-once delivery** | High (Kafka Connect, Debezium cluster) | Tens of thousands of events/sec |
+
+## Decision
+
+- **Use the Transactional Outbox Pattern with Polling** for most teams.
+- Save domain records and events in the same ACID transaction. Since both writes target the same PostgreSQL instance, ACID guarantees that either **both succeed or both fail**.
+- A lightweight background relay worker continuously polls unprocessed outbox records using `FOR UPDATE SKIP LOCKED`, publishes them to the message broker, and marks them as published.
+- Pair with **Consumer Idempotency**: Because the relay delivers messages **at least once**, downstream consumers must deduplicate messages using the event ID.
+
+## Implementation
+
+### 1. The Outbox Table Schema
+
+```sql
+CREATE TABLE outbox_events (
+  id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  aggregate_type VARCHAR(64) NOT NULL,
+  aggregate_id   VARCHAR(64) NOT NULL,
+  event_type     VARCHAR(64) NOT NULL,
+  payload        JSONB NOT NULL,
+  created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  published_at   TIMESTAMPTZ
+);
+
+-- Partial index for fast polling of unpublished events
+CREATE INDEX idx_outbox_unpublished 
+ON outbox_events (created_at ASC) 
+WHERE published_at IS NULL;
+```
+
+### 2. Atomic Write in Application Code
+
+```typescript
+import { PoolClient } from 'pg';
+
+export async function createOrder(client: PoolClient, orderData: OrderInput) {
+  // 1. Insert domain entity
+  const orderRes = await client.query(
+    `INSERT INTO orders (customer_id, total_cents, status) 
+     VALUES ($1, $2, 'pending') RETURNING id`,
+    [orderData.customerId, orderData.totalCents]
+  );
+  const orderId = orderRes.rows[0].id;
+
+  // 2. Insert outbox event in the EXACT SAME transaction
+  await client.query(
+    `INSERT INTO outbox_events (aggregate_type, aggregate_id, event_type, payload)
+     VALUES ('order', $1, 'order.created', $2)`,
+    [orderId, JSON.stringify({ orderId, ...orderData })]
+  );
+
+  // Both operations commit together atomically
+  await client.query('COMMIT');
+}
+```
+
+### 3. Background Polling Relay Worker
+
+The relay uses `FOR UPDATE SKIP LOCKED` to allow multiple concurrent relay pods to process events without duplicating work or locking each other out:
+
+```typescript
+export async function relayOutboxEvents() {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // Select up to 50 unpublished events, locking them and skipping rows locked by other workers
+    const res = await client.query(`
+      SELECT id, aggregate_type, aggregate_id, event_type, payload
+      FROM outbox_events
+      WHERE published_at IS NULL
+      ORDER BY created_at ASC
+      LIMIT 50
+      FOR UPDATE SKIP LOCKED
+    `);
+
+    for (const event of res.rows) {
+      // Publish to message broker
+      await messageBroker.publish(event.event_type, {
+        id: event.id,
+        aggregateId: event.aggregate_id,
+        data: event.payload,
+      });
+
+      // Mark as published
+      await client.query(
+        `UPDATE outbox_events SET published_at = NOW() WHERE id = $1`,
+        [event.id]
+      );
+    }
+
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('Outbox relay failed, will retry next tick', err);
+  } finally {
+    client.release();
+  }
+}
+
+// Run polling loop every 500 ms
+setInterval(relayOutboxEvents, 500);
+```
+
+## Verification
+
+1. **Zero lost events:** Simulate a power failure or process termination (`kill -9`) immediately after order creation. Verify that upon service restart, the outbox relay automatically detects the row and delivers the event.
+2. **Broker outage resilience:** Disconnect Kafka or RabbitMQ for 5 minutes. Application orders should continue creating successfully without errors, buffering events safely inside PostgreSQL. Once the broker reconnects, the relay drains the backlog.
+3. **Outbox table size:** Ensure old processed rows are cleaned up with a daily archiving job (`DELETE FROM outbox_events WHERE published_at < NOW() - INTERVAL '7 days'`).
+
+## Why
+
+ACID transactions are designed to guarantee atomicity across multiple tables inside a single relational database. They cannot cross network boundaries to external services.
+
+By converting an external asynchronous side-effect (publishing a message) into an internal database write (inserting a row into a table), we bring the event into the database's atomic boundary. The database's write-ahead log (WAL) guarantees the message will survive any system crash.
+
+## When Not To Use
+
+- **Non-critical fire-and-forget events:** For high-volume UI analytics, page clicks, or telemetry where losing 0.01% of messages during a deploy is acceptable, direct asynchronous publishing is simpler.
+- **Extremely high event volume (>50,000 writes/sec):** Polling an outbox table at this scale can cause database write amplification. Use Kafka directly or CDC (Debezium) reading Postgres replication logs.
+
+## Common Mistakes
+
+- **Publishing first, then committing.** If the database transaction rolls back, downstream systems process a ghost transaction that never existed.
+- **Deleting outbox rows immediately in production.** Deleting rows immediately can cause table bloat in PostgreSQL. Use `published_at = NOW()` and purge in batches overnight.
+- **Forgetting consumer deduplication.** Because the relay might crash after publishing to the broker but before marking the row in the DB, events are delivered **at least once**. Downstream consumers must check event IDs for idempotency.

@@ -1,0 +1,178 @@
+---
+title: "តើខ្ញុំដោះស្រាយ queue backpressure ដោយរបៀបណា?"
+question: "ហេតុអ្វីបានជា Message Queue Consumer របស់ខ្ញុំចេះតែអស់ Memory (OOM)?"
+summary: "Message queue consumers ជួបប្រទះការគាំងដោយសារ Out-Of-Memory នៅពេលដែល broker បញ្ជូនសាររាប់ពាន់ចូលមកលឿនជាងសមត្ថភាពដែល worker អាចដំណើរការបានទាន់។ កំណត់កម្រិត consumer prefetch limit និង reactive backpressure។"
+tags: [queues, rabbitmq, kafka, memory, backpressure, nodejs]
+related: [problems/memory-leak-in-production, problems/should-i-use-kafka, patterns/transactional-outbox]
+order: 20
+updated: "2026-09-12"
+contributors: [veasna]
+translation: draft
+---
+
+## Context
+
+សេវាកម្ម background worker មួយទទួលការងារពី message broker (ដូចជា RabbitMQ, AWS SQS, ឬ Redis BullMQ)។ ការងារទាំងនោះជាប្រភេទ I/O ធ្ងន់ៗ៖ ការទាញយកឯកសារ PDF, ការកាត់តម្រឹមទំហំរូបភាព, ឬការបង្កើត AI transcription ដែលការងារនីមួយៗស៊ីពេលប្រហែល 2,000 ms ទើបចប់។
+
+អំឡុងពេលម៉ោងធ្វើការធម្មតា ការងារមកដល់ក្នុងកម្រិត 5 ការងារក្នុងមួយវិនាទី។ Worker process អាចបំពេញការងារបានយ៉ាងស្រួលដោយស៊ី RAM ត្រឹមតែ 150 MB ប៉ុណ្ណោះ។
+
+នៅម៉ោង 9:00 AM ការងារ batch cron មួយបានបញ្ជូនកិច្ចការចំនួន 25,000 ចូលទៅក្នុង queue ក្នុងរយៈពេលតែ ១០ វិនាទី។ Message broker ក៏បានរុញសារទាំង 25,000 នោះទៅកាន់ worker ដែលកំពុងភ្ជាប់ភ្លាមៗ។ ត្រឹមតែ ៤ វិនាទីក្រោយមក Memory របស់ worker container ស្ទុះឡើងហួសកម្រិត 512 MB ហើយ Kubernetes ក៏បានសម្លាប់ container នោះចោលជាមួយ error `OOMKilled` (Exit Code 137)។
+
+Container ចាប់ផ្តើម restart ឡើងវិញ ភ្ជាប់ទៅកាន់ queue សារជាថ្មី ហើយក៏ត្រូវរងការជន់លិចដោយសារទាំង 25,000 ដដែលនោះម្តងទៀត រួចក៏គាំងស្លាប់វិលជុំក្នុង loop ឥតឈប់ឈរ។
+
+## Symptoms
+
+- Pods របស់ Queue worker ជួបប្រទះការ restart វិលជុំគ្មានទីបញ្ចប់ (`CrashLoopBackOff / OOMKilled`) រាល់ពេលចំនួនសារក្នុង queue កើនឡើងខ្លាំង។
+- Message broker បង្ហាញថាសារ unacknowledged ស្មើ 0 មុនពេលភ្ជាប់ ប៉ុន្តែឡើងដល់រាប់ពាន់ភ្លាមៗនៅវិនាទីដែល worker ចាប់ផ្តើមភ្ជាប់។
+- ការប្រើប្រាស់ Memory ស្ទុះឡើងបញ្ឈរត្រឹមតែប៉ុន្មានវិនាទីក្រោយ startup ទោះបីជា worker នោះត្រូវបានរចនាឡើងដើម្បីដំណើរការការងារត្រឹមតែ ៥ ក្នុងពេលតែមួយក៏ដោយ។
+- Consumers ផ្សេងទៀតដែលកំពុងដំណើរការល្អ បែរជាគ្មានការងារធ្វើទៅវិញ ដោយសារតែ consumer តែមួយនោះបានលេបយកសារទាំងអស់ក្នុង queue ទៅទុកក្នុង RAM របស់ខ្លួនឯងអស់។
+
+<Callout type="warning" title="តាមលំនាំដើម Message Brokers រុញសារចេញលឿនបំផុតតាមដែល Network អាចធ្វើបាន">
+នៅក្នុង protocols ដូចជា AMQP (RabbitMQ) broker មិនរង់ចាំឱ្យ worker បញ្ចប់ការងារទី ១ រួចរាល់មុននឹងបញ្ជូនការងារទី ២ នោះឡើយ។ ប្រសិនបើអ្នកមិនបានកំណត់ **Prefetch Count** ឱ្យច្បាស់លាស់ទេ នោះ broker នឹងចាក់ទម្លាក់រាល់សារទាំងអស់ដែលកំពុងរង់ចាំ ចូលទៅក្នុង memory buffer របស់ worker ភ្លាមៗ។
+</Callout>
+
+## Diagnose
+
+1. **ពិនិត្យចំនួន Unacked Messages លើ Consumer៖** មើលផ្ទាំងគ្រប់គ្រង RabbitMQ ឬ SQS។ ប្រសិនបើ consumer តែមួយមានសារ "Unacknowledged" រាប់ពាន់កំពុងហោះហើរលើ network នោះមានន័យថា consumer នោះខ្វះប្រព័ន្ធទប់សម្ពាធ (backpressure)។
+2. **ពិនិត្យមើលកូដបង្កើត Consumer៖**
+   ```typescript
+   // កំហុស UNBOUNDED CONSUMER (RabbitMQ)
+   await channel.assertQueue('tasks');
+   // ខ្វះ៖ channel.prefetch(N)
+   channel.consume('tasks', async (msg) => {
+     await processTask(msg); // Promises ចំនួន 25,000 ត្រូវបានបង្កើតព្រមគ្នាក្នុង RAM!
+     channel.ack(msg);
+   });
+   ```
+   បើគ្មាន `channel.prefetch(10)` ទេ RabbitMQ នឹងបញ្ជូនសារទាំង 25,000 ចូលទៅក្នុង heap memory របស់ Node.js ទាំងអស់ ដែលបង្កើតជា JavaScript Promises ចំនួន 25,000 ក្នុងពេលតែមួយ។
+3. **គណនា Memory ក្នុងសារមួយ៖** ប្រសិនបើសារមួយមានទំហំ 50 KB ហើយបង្កើត context ការងារទំហំ 100 KB នោះការ buffer សារ ២០,០០០ នឹងស៊ី RAM រហូតដល់ 20,000 × 150 KB = 3 GB!
+
+## Options
+
+1. **ដំឡើង Container RAM ដល់ 8 GB។** (ចំណាយច្រើន ហើយនៅតែគាំងដដែលប្រសិនបើសារកើនដល់ ១០០,០០០)។
+2. **កំណត់ Consumer Prefetch Limit (`prefetch`)។** ប្រាប់ message broker ឱ្យបញ្ជូនសារ unacknowledged យ៉ាងច្រើនបំផុតត្រឹម $N$ សារក្នុងពេលតែមួយ (ឧ. `prefetch: 10`)។ Broker នឹងរក្សាទុកសារ ២៤,៩៩០ ទៀតនៅលើ disk របស់វាដោយសុវត្ថិភាព។
+3. **ការទាញយកបែប Pull-based (Long Polling)។** ប្តូរពីការរុញ (push) មកជាការស្នើសុំទាញយកតាមតម្រូវការ (`sqs.receiveMessage({ MaxNumberOfMessages: 10 })`)។
+4. **Stream Backpressure។** ប្រើប្រាស់ Node.js Streams ឬ Reactive Streams ជាមួយកម្រិត high-watermark ដែលផ្អាក socket ពេល memory ចាប់ផ្តើមពេញ។
+
+## Trade-offs
+
+| យុទ្ធសាស្ត្រ | សុវត្ថិភាព Memory | Throughput របស់ Queue | កម្លាំងអនុវត្ត |
+| :--- | :--- | :--- | :--- |
+| **គ្មានដែនកំណត់ (លំនាំដើម)** | **គ្រោះថ្នាក់ខ្លាំង (OOM Crash)** | ខ្ពស់រហូតដល់ពេលគាំង | គ្មាន |
+| **កំណត់ Prefetch Limit (ឧ. 10)** | **សុវត្ថិភាព ១០០% (Memory ថេរ)** | **ល្អប្រសើរបំផុត** | **កូដតែ ១ ជួរ** |
+| **Pull-based (SQS Polling)** | **សុវត្ថិភាព ១០០%** | Latency ខ្ពស់ជាងបន្តិច | ទាប |
+| **Dynamic Concurrency Tuning** | សុវត្ថិភាព + Auto-tune | អតិបរមា | ខ្ពស់ |
+
+## Decision
+
+1. **ត្រូវកំណត់ Prefetch Count ជានិច្ច៖** មុននឹងទាញយកសារពី push-based broker ណាមួយ (RabbitMQ, Redis Streams, Kafka) ត្រូវកំណត់ `channel.prefetch(N)` ជានិច្ច។
+   - រូបមន្តកំណត់ Prefetch ដ៏ល្អប្រសើរ៖
+     ```text
+     prefetch = ចំនួនការងារស្របគ្នា × 2
+     ```
+   - សម្រាប់ worker ដែលដំណើរការ ៥ ការងារស្របគ្នា ត្រូវកំណត់ `prefetch = 10`។ វិធីនេះជួយកុំឱ្យ worker ត្រូវនៅទំនេរ និងការពារកុំឱ្យ memory ឡើងពេញ។
+2. **Acknowledge (`ack`) តែនៅពេលការងារចប់សព្វគ្រប់ប៉ុណ្ណោះ៖** បញ្ជាក់ការទទួលសារទៅកាន់ broker លុះត្រាតែ business logic និងការសរសេរចូល database ត្រូវបានបញ្ចប់ដោយជោគជ័យ ដើម្បីឱ្យសារអាចត្រឡប់ចូល queue វិញបានបើ worker ត្រូវគាំង។
+
+## Implementation
+
+### 1. ការកំណត់ Prefetch Limit ក្នុង RabbitMQ / amqplib (TypeScript)៖
+
+```typescript
+import amqp from 'amqplib';
+
+const CONCURRENT_JOBS = 5;
+
+export async function startWorker() {
+  const connection = await amqp.connect(process.env.RABBITMQ_URL!);
+  const channel = await connection.createChannel();
+
+  const queueName = 'heavy_video_processing';
+  await channel.assertQueue(queueName, { durable: true });
+
+  // ដំណោះស្រាយសំខាន់៖ ប្រាប់ RabbitMQ ឱ្យផ្ញើយ៉ាងច្រើនបំផុត ១០ សារដែលមិនទាន់ ack
+  await channel.prefetch(CONCURRENT_JOBS * 2);
+
+  console.log(`Worker បានចាប់ផ្តើមជាមួយ prefetch limit៖ ${CONCURRENT_JOBS * 2}`);
+
+  channel.consume(
+    queueName,
+    async (msg) => {
+      if (!msg) return;
+
+      try {
+        const data = JSON.parse(msg.content.toString());
+        console.log(`កំពុងដំណើរការការងារ ${data.id}...`);
+
+        // ការងារ I/O ធ្ងន់ៗ (ឧទាហរណ៍ ២,០០០ ms)
+        await processVideoJob(data);
+
+        // Acknowledge តែនៅពេលដំណើរការជោគជ័យប៉ុណ្ណោះ
+        channel.ack(msg);
+      } catch (err) {
+        console.error('ការងារបរាជ័យ; ច្រានចោលដោយមិនដាក់ចូល queue វិញ', err);
+        // បញ្ជូនទៅកាន់ Dead Letter Queue (DLQ)
+        channel.nack(msg, false, false);
+      }
+    },
+    { noAck: false } // បង្ខំឱ្យមានការ ack ដោយដៃ
+  );
+}
+```
+
+### 2. ការទាញយកទិន្នន័យបែប Pull-Based ក្នុង AWS SQS៖
+
+```typescript
+import { SQSClient, ReceiveMessageCommand, DeleteMessageCommand } from '@aws-sdk/client-sqs';
+
+const sqs = new SQSClient({ region: process.env.AWS_REGION });
+
+export async function pollSQSQueue() {
+  while (true) {
+    // Pull-based៖ Worker ជាអ្នកកំណត់ថាខ្លួនអាចទទួលការងារបានប៉ុន្មាន
+    const response = await sqs.send(
+      new ReceiveMessageCommand({
+        QueueUrl: process.env.SQS_QUEUE_URL,
+        MaxNumberOfMessages: 5, // មិនទាញយកលើសពី ៥ សារជាដាច់ខាត!
+        WaitTimeSeconds: 20,    // Long polling ដើម្បីកុំឱ្យស៊ី request ទទេ
+      })
+    );
+
+    if (response.Messages && response.Messages.length > 0) {
+      await Promise.all(
+        response.Messages.map(async (message) => {
+          await processJob(message.Body);
+          await sqs.send(
+            new DeleteMessageCommand({
+              QueueUrl: process.env.SQS_QUEUE_URL,
+              ReceiptHandle: message.ReceiptHandle,
+            })
+          );
+        })
+      );
+    }
+  }
+}
+```
+
+## Verification
+
+1. **តេស្តទឹកជំនន់សារក្នុង Queue៖** បញ្ជូនសារ ២០,០០០ ចូលក្នុង queue ខណៈពេល worker កំពុង offline។
+2. **បើក Worker ដំណើរការ៖** ចាប់ផ្តើមបើក worker container។
+3. **ផ្ទៀងផ្ទាត់ស្ថិរភាព Memory៖** ពិនិត្យមើល memory របស់ container តាមរយៈ `kubectl top pod` ឬ Datadog។ Memory ត្រូវតែ **នៅថេរដដែល (< 120 MB)** ពេញមួយដំណើរការនៃការទាញយកទិន្នន័យជាច្រើនម៉ោង។
+4. **ការបែងចែកការងារក្នុង Queue៖** បើអ្នក scale ដល់ ៤ worker pods នោះសារទាំង ២០,០០០ ត្រូវតែចែករំលែកស្មើៗគ្នា (១០ unacked messages ក្នុងមួយ pod)។
+
+## Why
+
+គំរូសារបែប Push-based ជួយកាត់ផ្តាច់ producer ពី consumer។ ខណៈពេលដែលវាជួយកុំឱ្យ producer ត្រូវយឺតយ៉ាវ វាបានទម្លាក់បន្ទុកនៃការគ្រប់គ្រង buffer មកលើ network និង consumer ទៅវិញ។
+
+បើគ្មាន backpressure ទេ TCP socket receive buffer របស់ consumer នឹងបន្តអានសារដែលចូលមកឥតឈប់ឈរ ហើយញាត់ពួកវាចូលក្នុង JavaScript heap memory។ Backpressure ជួយទប់ល្បឿន producer ដោយផ្អាក TCP window updates ដែលបង្ខំឱ្យ message broker ត្រូវរក្សាទុកសារដែលកកស្ទះនៅលើ disk ផ្ទាល់ខ្លួនរបស់វាវិញ។
+
+## When Not To Use
+
+- **Telemetry ក្នុងហ្គេមល្បឿនលឿនកម្រិត Sub-millisecond៖** សម្រាប់ទិន្នន័យស្រាលៗដែលមិនខ្វល់ពីការបាត់បង់ទិន្នន័យ (loss-tolerant) ការប្រើ UDP stream ឬ drop-tail queue គឺល្អជាង flow-controlled queue។
+
+## Common Mistakes
+
+- **កំណត់ `noAck: true`។** ក្នុង RabbitMQ ការកំណត់ `noAck: true` ប្រាប់ broker ថាសារត្រូវបានទទួលស្គាល់ភ្លាមៗនៅពេលវាចាកចេញពី socket របស់ broker។ វិធីនេះបិទដំណើរការ prefetch ទាំងស្រុង និងលុបសារចោលទោះបីជា worker គាំងពាក់កណ្តាលទីក៏ដោយ!
+- **កំណត់ Prefetch ត្រឹម 1 លើ Queue ដែលមាន Throughput ខ្ពស់។** ទោះបីជាមានសុវត្ថិភាព `prefetch: 1` នាំមកនូវ network latency bubbles៖ ពេល worker ធ្វើការងារចប់ វាត្រូវរង់ចាំ network round-trip មួយជុំទៀតទើបបានសារបន្ទាប់។ ការកំណត់ `prefetch = concurrent_jobs * 2` ជួយឱ្យ worker មានការងារធ្វើជាប់រហូត។
+- **ភ្លេចរៀបចំ Dead-Letter Queue (DLQ)។** ប្រសិនបើសារខូចមួយបង្កឱ្យមានការ crash រាល់ពេលដំណើរការ ហើយត្រូវច្រានចោលជាមួយ `requeue: true` នោះវានឹងបង្កើតជា loop វិលជុំបំផ្លាញ CPU ឥតឈប់ឈរ។ ត្រូវរៀបចំ dead-letter exchange ជានិច្ច។

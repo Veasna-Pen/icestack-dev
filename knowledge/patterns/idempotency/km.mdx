@@ -1,0 +1,148 @@
+---
+title: "Idempotency"
+question: "តើធ្វើដូចម្តេចឱ្យ operation មួយអាចធ្វើម្តងទៀតបានដោយសុវត្ថិភាព?"
+summary: "ផ្តល់ key មួយដល់រាល់ write ដែលអាចត្រូវធ្វើម្តងទៀត កត់ត្រាលទ្ធផលក្រោម key នោះនៅក្នុង transaction ដដែលជាមួយការងារ ហើយផ្តល់លទ្ធផលដែលបានរក្សាទុកត្រឡប់ទៅវិញនៅពេលមានការធ្វើម្តងទៀត។ វាជាអ្វីដែលធ្វើឱ្យ retries, queues និងការចុចពីរដងមានសុវត្ថិភាព។"
+tags: [idempotency, reliability, payments, api-design]
+related: [patterns/retry, problems/should-i-use-kafka, tradeoffs/sync-vs-async]
+order: 3
+updated: "2026-09-11"
+translation: draft
+---
+
+## Context
+
+Operation មួយគឺ idempotent ប្រសិនបើការធ្វើវាពីរដង មានឥទ្ធិពលដូចការធ្វើវាតែម្តង។ Reads គឺ idempotent តាមធម្មជាតិ ហើយ «កំណត់ status ទៅជា shipped» ក៏ដូច្នោះដែរ។ «កាត់លុយពីកាត», «ផ្ញើ email» និង «បន្ថែម 1 ទៅសមតុល្យ» មិនមែនទេ។
+
+នៅក្នុងប្រព័ន្ធ distributed ការធ្វើម្តងទៀតគឺជារឿងធម្មតា មិនមែនជាករណីពិសេសទេ។ Clients retry បន្ទាប់ពី timeout, queues បញ្ជូន at-least-once, អ្នកប្រើចុចពីរដង, បណ្តាញទូរស័ព្ទចល័តផ្ញើម្តងទៀត ហើយ outbox relays publish ម្តងទៀតបន្ទាប់ពីគាំង។ រាល់ write ដែល *អាច* ត្រូវធ្វើម្តងទៀត *នឹង* ត្រូវធ្វើម្តងទៀតនៅថ្ងៃណាមួយ។
+
+## Symptoms
+
+- អតិថិជនម្នាក់ត្រូវកាត់លុយពីរដង ឬ checkout តែមួយបង្កើត orders ពីរ។
+- Email, SMS ឬ push notifications ស្ទួនគ្នា បន្ទាប់ពី deploy ឬ incident។
+- Counters, សមតុល្យ ឬកម្រិតស្តុក ដែលរសាត់ចេញពីអ្វីដែល logs និយាយ។
+- សំបុត្រជំនួយ (support tickets) ដែលចាប់ផ្តើមដោយ «ខ្ញុំចុចតែម្តងទេ»។
+
+## Diagnose
+
+1. **រាយ writes ដែលអាចត្រូវធ្វើម្តងទៀត៖** អ្វីៗដែលនៅពីក្រោយ retry, queue consumer, webhook handler ឬ form ដែលអ្នកប្រើអាច submit ពីរដង។
+2. **សម្រាប់នីមួយៗ សូមសួរថាការហៅលើកទីពីរធ្វើអ្វី។** ដើរតាមកូដពិតប្រាកដ មិនមែនឥរិយាបថដែលគេចង់បាននោះទេ។
+3. **ស្វែងរកករណី timeout។** នៅកន្លែងណាដែលអ្នកហៅអាច timeout ខណៈដែលការងារនៅតែបញ្ចប់ អ្នកហៅមិនអាចដឹងថាគួរ retry ឬអត់។ នោះហើយជាកន្លែងដែល duplicates កើតចេញ។
+4. **ពិនិត្យការហៅទៅខាងក្រៅ។** តើ payment ឬ email provider ទទួលយក idempotency key ដែរឬទេ? Payment APIs ភាគច្រើនទទួលយក។
+5. **ស្វែងរក natural keys។** Operations ជាច្រើនមានលេខសម្គាល់អាជីវកម្មដែលមិនស្ទួនស្រាប់ហើយ៖ លេខ order, webhook event ID, message ID។
+
+## Options
+
+1. **ធ្វើឱ្យ operation ក្លាយជា idempotent តាមធម្មជាតិ៖** ជំនួស «បង្កើន» ដោយ «កំណត់», ប្រើ `INSERT … ON CONFLICT DO NOTHING` លើ natural unique key, ផ្តល់ឱ្យ endpoints នូវអត្ថន័យរបស់ `PUT`។
+2. **Idempotency keys៖** client ផ្ញើ key តែមួយគត់សម្រាប់ operation ឡូជីខលនីមួយៗ; server រក្សាទុក key ជាមួយលទ្ធផល ហើយផ្តល់លទ្ធផលដែលបានរក្សាទុកនោះត្រឡប់វិញសម្រាប់ការធ្វើម្តងទៀត។
+3. **Deduplicate នៅក្នុង consumer៖** កត់ត្រា message IDs ដែលបានដំណើរការរួច ហើយរំលង IDs ណាដែលធ្លាប់ឃើញ។
+4. **ទទួលយក duplicates ហើយផ្ទៀងផ្ទាត់ពេលក្រោយ៖** job តាមកាលវិភាគមួយស្វែងរក និងជួសជុលវា។ ពេលខ្លះអាចទទួលយកបាន សម្រាប់ទិន្នន័យដែល duplicate មិនបង្កគ្រោះថ្នាក់។
+
+## Trade-offs
+
+| ជម្រើស | ការធានា | ការចំណាយ | ល្អសម្រាប់ |
+| :--- | :--- | :--- | :--- |
+| Idempotency តាមធម្មជាតិ | រឹងមាំ គ្មាន storage បន្ថែម | Operation ប្រហែលជាត្រូវរចនាឡើងវិញ | ការផ្លាស់ប្តូរ status, upserts |
+| Idempotency keys | រឹងមាំ ប្រសិនបើរក្សាទុកក្នុង transaction ដដែលជាមួយការងារ | Table មួយ ការផុតកំណត់ key និងការសហការពី client | Payments, ការបង្កើត order, public APIs |
+| Deduplication ក្នុង consumer | រឹងមាំសម្រាប់ consumer នីមួយៗ | Table processed-IDs សម្រាប់ consumer នីមួយៗ | Queue និង webhook handlers |
+| ផ្ទៀងផ្ទាត់ពេលក្រោយ | ត្រឹមត្រូវនៅទីបំផុត | Duplicates អាចមើលឃើញមួយរយៈ | Analytics, notifications ដែលមិនបង្កគ្រោះថ្នាក់ |
+
+ចំណុចលម្អិតដែលសម្រេចភាពត្រឹមត្រូវ៖ **key ត្រូវតែកត់ត្រានៅក្នុង transaction ដដែលជាមួយឥទ្ធិពលរបស់ការងារ។** ការពិនិត្យរក key ធ្វើការងារ រួចរក្សាទុក key បន្សល់ទុកចន្លោះពេលមួយ ដែល requests ពីរដែលកើតឡើងព្រមគ្នា ឆ្លងកាត់ការពិនិត្យបានទាំងពីរ។
+
+## Decision
+
+- ធ្វើឱ្យ operations ក្លាយជា **idempotent តាមធម្មជាតិ** នៅកន្លែងណាដែលការរចនាអនុញ្ញាត។
+- សម្រាប់អ្វីៗដែលផ្លាស់ទីលុយ បង្កើត orders ឬបើកជា public API **តម្រូវឱ្យមាន idempotency key** ហើយរក្សាទុកវាក្រោម unique constraint នៅក្នុង transaction ដដែលជាមួយការងារ។
+- នៅក្នុង queue និង webhook consumers **deduplicate តាម message ឬ event ID** ហើយម្តងទៀត នៅក្នុង transaction។
+- បញ្ជូន keys ទៅកាន់ providers ដែលគាំទ្រវា ដូចជា payment APIs។
+- រក្សា keys ឱ្យយូរជាងរយៈពេល retry វែងបំផុតរបស់អ្នក; 24 ម៉ោងគឺជារឿងធម្មតា។
+
+## Implementation
+
+Idempotency key លើ endpoint បង្កើត order ក្នុង Node.js ជាមួយ Postgres។ Unique constraint លើ `key` ធ្វើការងារទាក់ទងនឹង concurrency៖
+
+```sql
+CREATE TABLE idempotency_keys (
+  key          text        PRIMARY KEY,
+  request_hash text        NOT NULL,
+  response     jsonb,
+  created_at   timestamptz NOT NULL DEFAULT now()
+);
+```
+
+```ts
+import { createHash } from 'node:crypto';
+
+app.post('/orders', async (req, res) => {
+  const key = req.header('Idempotency-Key');
+  if (!key) return res.status(400).json({ error: 'Idempotency-Key header is required' });
+
+  const requestHash = createHash('sha256').update(JSON.stringify(req.body)).digest('hex');
+
+  const result = await db.transaction(async tx => {
+    // Claim the key. Only one of several concurrent requests can insert it.
+    const claimed = await tx.query(
+      `INSERT INTO idempotency_keys (key, request_hash) VALUES ($1, $2)
+       ON CONFLICT (key) DO NOTHING RETURNING key`,
+      [key, requestHash]
+    );
+
+    if (claimed.rowCount === 0) {
+      const { rows } = await tx.query(
+        'SELECT request_hash, response FROM idempotency_keys WHERE key = $1',
+        [key]
+      );
+      if (rows[0].request_hash !== requestHash) {
+        return { status: 422, body: { error: 'This key was used for a different request' } };
+      }
+      if (!rows[0].response) {
+        return { status: 409, body: { error: 'The original request is still in progress' } };
+      }
+      return { status: 200, body: rows[0].response };   // a repeat: return what we returned before
+    }
+
+    const order = await createOrder(tx, req.body);       // the real work, in the same transaction
+    await tx.query('UPDATE idempotency_keys SET response = $2 WHERE key = $1', [key, order]);
+    return { status: 201, body: order };
+  });
+
+  res.status(result.status).json(result.body);
+});
+```
+
+Client បង្កើត key ម្តងសម្រាប់ operation ឡូជីខលនីមួយៗ (ឧទាហរណ៍ UUID ដែលបង្កើតនៅពេលបង្ហាញ checkout form) ហើយផ្ញើ key ដដែលរាល់ពេល retry។
+
+Queue consumers ប្រើគំនិតដដែល ជាមួយ message ID៖
+
+```sql
+INSERT INTO processed_messages (message_id) VALUES ($1) ON CONFLICT DO NOTHING;
+-- Zero rows inserted means this message was already handled: acknowledge it and skip.
+```
+
+លុប keys ចាស់ៗ ដោយប្រើ `DELETE FROM idempotency_keys WHERE created_at < now() - interval '24 hours'` តាមកាលវិភាគ។
+
+## Verification
+
+- **ផ្ញើ request ដដែលពីរដង** ជាមួយ key ដដែល ទាំងម្តងមួយៗ និងព្រមគ្នា៖ order តែមួយ និង responses ពីរដែលដូចគ្នា។
+- **ប្រើ key ឡើងវិញជាមួយ body ផ្សេង៖** API បដិសេធវា។
+- **សម្លាប់ process ពាក់កណ្តាល request** បន្ទាប់ពីការងារ តែមុនពេល response រួច retry៖ នៅតែគ្មាន duplicate។
+- **Replay batch នៃ queue messages** នៅក្នុង staging៖ គ្មានឥទ្ធិពលស្ទួន។
+- **រាប់ការធ្វើម្តងទៀត។** ការកើនឡើងភ្លាមៗ បង្ហាញថាមាន client ដែល retry ខ្លាំងពេក។
+
+## Why
+
+Network មិនអាចប្រាប់អ្នកបានថា request ដែល timeout ត្រូវបានដំណើរការរួចឬនៅ។ Exactly-once *delivery* មិនមែនជាអ្វីដែលអ្នកអាចទិញបានទេ; ឥទ្ធិពលតែម្តងគត់ (exactly-once *effects*) គឺជាអ្វីដែលអ្នកសាងសង់ ដោយទទួលយកការបញ្ជូន at-least-once ហើយធ្វើឱ្យការដំណើរការជា idempotent។ Idempotency ប្រែក្លាយ «retry អាចកាត់លុយពីរដង» ទៅជា «retry តែងតែមានសុវត្ថិភាព» ហើយនោះហើយជាអ្វីដែលធ្វើឱ្យ retries, queues និង failover អាចប្រើបានតាំងពីដំបូង។
+
+## When Not To Use
+
+- **Reads សុទ្ធ** ដែលជា idempotent ស្រាប់ហើយ។
+- **Operations ដែលជា idempotent តាមធម្មជាតិរួចហើយ** ដូចជាការកំណត់តម្លៃ ឬការលុបតាម ID។ Table key នៅទីនោះ បន្ថែមបន្ទុក ដោយគ្មានសុវត្ថិភាពបន្ថែម។
+- **Writes ខាងក្នុងដែលមានហានិភ័យទាប** ដែល duplicate ដែលកម្រកើតឡើងមិនបង្កគ្រោះថ្នាក់ ហើយការទទួលយកវាថោកជាងការការពារ ដូចជា counter រាប់ចំនួនអ្នកមើលទំព័រ។
+
+## Common Mistakes
+
+- **Check-then-act៖** អានថាតើ key មានឬអត់ ធ្វើការងារ រួចសរសេរ key។ Requests ដែលកើតឡើងព្រមគ្នាឆ្លងកាត់បានទាំងពីរ។ សូមប្រើ unique constraint។
+- **រក្សាទុក key នៅខាងក្រៅ transaction** ដែលធ្វើការងារ ដូច្នេះការគាំងបន្សល់ key ដោយគ្មានឥទ្ធិពល ឬឥទ្ធិពលដោយគ្មាន key។
+- **បង្កើត key នៅខាង server** ឬ key ថ្មីសម្រាប់ retry នីមួយៗ។ Client ត្រូវតែប្រើ key តែមួយឡើងវិញសម្រាប់ operation ឡូជីខលតែមួយ។
+- **ឱ្យ keys ផុតកំណត់មុនពេល retries ឈប់** ដូច្នេះ retry ដែលមកយឺតក្លាយជា duplicate។
+- **មិនអើពើ request body** ដូច្នេះ key ដែលប្រើឡើងវិញ ផ្តល់ response របស់ request ផ្សេងដោយស្ងាត់ៗ។
+- **ភ្លេច side effects នៅខាងក្រៅ database** ដូចជា emails និងការហៅទៅភាគីទីបី។ បញ្ជូន key ទៅ provider ឬផ្ញើវាពី outbox បន្ទាប់ពី commit។

@@ -1,0 +1,87 @@
+---
+title: "Every network call needs a timeout"
+summary: "Set a deadline on every outgoing call so one slow service can't use up all of your app's capacity."
+minutes: 10
+related: [patterns/bulkhead, problems/running-out-of-connections]
+updated: "2026-09-29"
+contributors: [Veasna-Pen]
+---
+
+## The problem
+
+Your checkout calls a shipping-rate API. One afternoon that API starts taking **60 seconds** to answer instead of 200 ms. Within minutes your **whole site** stops responding, even pages that have nothing to do with shipping.
+
+Nothing crashed. Your app is just **waiting**.
+
+## The idea
+
+Every request your server handles uses something limited while it runs: a worker, a thread, a database connection, memory. If each request waits 60 seconds for a slow service, those resources fill up, and new requests, for any page, queue behind them.
+
+A **timeout** is a deadline: "if there is no answer in N milliseconds, give up and handle it as a failure". It turns a slow dependency into a **fast failure** you can deal with, by showing a default, an error, or trying again.
+
+How to choose the value:
+
+- Look at how long the call **normally** takes. If 99% of calls finish within 300 ms, a timeout of about 1 second leaves room for the occasional slow one.
+- It must be **shorter than your own deadline**. If your endpoint must answer within 2 seconds, a single call cannot be allowed 5.
+- Many HTTP clients have **no timeout by default**, or a very long one. Never assume.
+
+## Example
+
+Node.js `fetch` waits as long as it takes unless you tell it not to. `AbortSignal.timeout` adds a deadline:
+
+```ts
+async function getShippingRate(order: Order): Promise<Rate> {
+  try {
+    const res = await fetch(`${SHIPPING_API}/rates`, {
+      method: 'POST',
+      body: JSON.stringify(order),
+      signal: AbortSignal.timeout(1000) // give up after 1 second
+    });
+    if (!res.ok) throw new Error(`shipping API returned ${res.status}`);
+    return await res.json();
+  } catch (error) {
+    logger.warn({ error }, 'shipping rate unavailable, using flat rate');
+    return FLAT_RATE; // a safe default keeps checkout working
+  }
+}
+```
+
+When the shipping API slows to 60 seconds, each checkout now waits at most 1 second, shows a flat shipping rate, and the rest of the site keeps working.
+
+<Tip title="Database calls count too">
+Database queries and connection-pool waits need timeouts as well, for example `statement_timeout` in PostgreSQL and a pool acquire timeout in your driver.
+</Tip>
+
+## Try it
+
+1. List every outgoing call in one service: HTTP APIs, database, cache, queues.
+2. For each one, find the timeout that is actually set. Check the client library's default; "none" is a common answer.
+3. Measure normal latency for one call and set a timeout a few times that value.
+4. Decide what the user sees when it fires: a default value, a cached value, or a clear error.
+
+## Check yourself
+
+**1. Your endpoint must answer within 3 seconds and calls two services one after the other. Can each call have a 3-second timeout?**
+
+<Answer>
+No. Together they could take 6 seconds. Their timeouts, plus your own work, must fit inside the 3-second budget, for example 1 second each.
+</Answer>
+
+**2. Why can a slow dependency be worse than one that is completely down?**
+
+<Answer>
+A service that is down fails at once, so your resources are freed at once. A slow one holds workers and connections for the full wait, so they pile up until your whole app stops serving other requests.
+</Answer>
+
+**3. A call normally takes 50 ms, and 99% finish within 120 ms. Is a 30-second timeout reasonable?**
+
+<Answer>
+No. It is far above normal behaviour and lets one bad dependency hold resources for 30 seconds. Something like 300 ms to 1 second fits better.
+</Answer>
+
+## Key takeaways
+
+- **Every** network call needs a timeout, and many clients have none by default.
+- A timeout turns a **slow** dependency into a **fast failure** you can handle.
+- Set it from **normal latency**, and keep it inside your own response deadline.
+- Decide in advance what users get when it fires.

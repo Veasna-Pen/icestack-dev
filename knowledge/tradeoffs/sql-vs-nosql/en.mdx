@@ -1,0 +1,121 @@
+---
+title: "SQL vs NoSQL"
+question: "Should I use SQL or NoSQL?"
+summary: "Default to a relational database: it handles changing questions, relationships and transactions well, and scales further than most products need. Pick a NoSQL store for a specific access pattern it serves better, not for a vague need for 'scale' or 'flexibility'."
+tags: [database, sql, nosql, postgres, mongodb, data-modeling]
+related: [problems/database-is-slow, problems/should-i-use-redis, tradeoffs/monolith-vs-microservices]
+order: 3
+updated: "2026-09-11"
+---
+
+## Context
+
+A new product, or a new service inside an existing one, needs a primary database. The team knows SQL; someone suggests MongoDB, DynamoDB or Cassandra because "it scales" or "the schema is flexible". This is one of the hardest decisions to reverse, because data outlives code.
+
+"NoSQL" covers very different systems: document stores (MongoDB), key-value stores (DynamoDB, Redis), wide-column stores (Cassandra) and graph databases (Neo4j). The only thing they share is what they aren't.
+
+## Symptoms
+
+What usually triggers the question:
+
+- A data model that seems to change every week.
+- Deeply nested data, such as a document with embedded arrays, that feels awkward in tables.
+- Expected high write volume: events, IoT readings, logs.
+- A belief that relational databases "don't scale".
+- A team that is more comfortable with JSON than with SQL.
+
+## Diagnose
+
+Write down the **access patterns**, not the entities:
+
+1. **What questions will you ask the data?** List the ten most important queries. Do they filter, sort, join or aggregate across entities?
+2. **Do you know all the questions now?** Unknown future questions favor SQL: a new query needs a new index, not a new data layout.
+3. **What has to change together, atomically?** Money moving between accounts; stock and orders. That means transactions across records.
+4. **What are the real volumes?** Rows, writes per second, growth per month. A single well-indexed Postgres instance handles thousands of writes per second and tables with billions of rows.
+5. **Who will operate it?** Managed Postgres and MySQL are well understood. Some NoSQL systems need expertise the team doesn't have.
+
+## Options
+
+1. **Relational (Postgres, MySQL)**, with JSON columns for the parts that genuinely vary.
+2. **A document store (MongoDB)** for self-contained documents that are usually read and written whole.
+3. **Key-value or wide-column (DynamoDB, Cassandra)** for very large scale with access patterns known in advance.
+4. **Polyglot:** relational as the system of record, plus a specialized store for one workload: search in Elasticsearch or OpenSearch, a cache in Redis, time series in TimescaleDB or ClickHouse.
+
+## Trade-offs
+
+| | Relational | Document | Key-value / wide-column |
+| :--- | :--- | :--- | :--- |
+| New and ad-hoc queries | Excellent | Good within a collection | Poor: each query is designed in |
+| Relationships and joins | Built in | Limited (`$lookup`); usually denormalize | None; denormalize |
+| Transactions | Multi-row ACID | Multi-document, with limits | Limited, often one item |
+| Schema changes | Routine migrations | Flexible, but code must handle old shapes | Flexible per item |
+| Scaling writes horizontally | Harder: partitioning, sharding | Built-in sharding | Built in, close to linear |
+| How well teams know it | Very well | Well | Varies; managed services help |
+| Typical fit | Most business applications | Content, catalogs, per-user documents | Very high volume with predictable access |
+
+The "flexible schema" advantage is partly an illusion. The schema moves out of the database and into application code, where every reader has to cope with every shape the data has ever had.
+
+## Decision
+
+**Default to Postgres (or MySQL).** Use `jsonb` columns for attributes that vary, and keep relationships and money in tables. Revisit when you have a **specific, measured** access pattern that a relational database serves poorly:
+
+- sustained writes beyond what a well-tuned primary handles, with data that partitions cleanly by key;
+- key lookups at a scale where a managed key-value store is simpler to run;
+- documents that are always read and written whole and never queried across.
+
+Even then, prefer adding a specialized store next to the relational system of record over replacing it.
+
+## Implementation
+
+Flexible attributes without leaving SQL: a product catalog where each category has different attributes.
+
+```sql
+CREATE TABLE products (
+  id          bigserial PRIMARY KEY,
+  sku         text      NOT NULL UNIQUE,
+  name        text      NOT NULL,
+  price_cents integer   NOT NULL CHECK (price_cents >= 0),
+  category    text      NOT NULL,
+  attributes  jsonb     NOT NULL DEFAULT '{}'   -- e.g. {"screen_inches": 6.1, "color": "black"}
+);
+
+-- Index the JSON you actually query.
+CREATE INDEX products_attributes_idx ON products USING gin (attributes jsonb_path_ops);
+
+-- Query it like a document, join it like a table.
+SELECT p.sku, p.name
+FROM products p
+WHERE p.category = 'phones'
+  AND p.attributes @> '{"color": "black"}'
+ORDER BY p.price_cents
+LIMIT 20;
+```
+
+Relationships, constraints and transactions stay where they're cheap, and the part that varies stays flexible.
+
+## Verification
+
+- **The top queries are fast** on realistic data volumes: run `EXPLAIN ANALYZE` against production-sized data.
+- **The growth projection fits:** rows and writes per second at 12 and 24 months stay within what one instance (plus read replicas) can handle, with room to spare.
+- **New questions are cheap:** the last few feature requests needed an index or a query, not a data migration.
+- **If you chose NoSQL:** every access pattern is served by a key or index designed for it, and you've written down which future queries the design will make hard.
+
+## Why
+
+Relational databases optimize for not knowing your questions in advance: normalized data, joins and indexes let you ask new things of old data. Most NoSQL stores optimize for knowing your questions and your scale in advance: data is laid out for specific access patterns, which is what makes scaling out easy. Early in a product the questions change constantly and the scale is modest, which is exactly the situation relational databases handle best.
+
+## When Not To Use
+
+Relational-by-default is the wrong call when:
+
+- **Write volume is genuinely extreme** and the data partitions cleanly, such as telemetry or event ingestion at hundreds of thousands of writes per second.
+- **The workload is specialized:** full-text search, graph traversal, time-series analytics or caching. Use the specialized store for that workload, next to the system of record.
+- **The team already runs a NoSQL system well** and the access patterns fit it.
+
+## Common Mistakes
+
+- **Choosing NoSQL for "scale" that is years away**, and paying for the missing joins and transactions from day one.
+- **Treating MongoDB like a relational database**, with references everywhere and `$lookup` in hot paths.
+- **Putting everything in `jsonb`**, which rebuilds a document store inside Postgres and throws away its constraints.
+- **Modeling DynamoDB like tables** instead of from access patterns, then finding that a new query needs a full scan.
+- **Skipping migrations for "schemaless" data**, so old document shapes live forever.

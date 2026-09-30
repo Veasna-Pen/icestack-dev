@@ -1,0 +1,140 @@
+---
+title: "REST vs gRPC"
+question: "តើពេលណាទើប gRPC មានតម្លៃគ្រប់គ្រាន់ធៀបនឹងភាពស្មុគស្មាញរបស់វាលើ REST?"
+summary: "ប្រើ gRPC សម្រាប់ការប្រាស្រ័យទាក់ទងរវាង internal microservices ដែលមានទំហំ traffic ខ្ពស់ ដែលទាមទារការសន្សំសំចៃ CPU, latency ទាប និង schema contracts តឹងរ៉ឹង។ ជ្រើសរើស REST/JSON សម្រាប់ public APIs, web browsers និងស្ថាបត្យកម្មធម្មតា។"
+tags: [api-design, rest, grpc, protobuf, networking, microservices]
+related: [tradeoffs/monolith-vs-microservices, tradeoffs/sync-vs-async, patterns/circuit-breaker]
+order: 4
+updated: "2026-09-12"
+contributors: [veasna]
+translation: draft
+---
+
+## Context
+
+ក្រុមវិស្វករមួយកំពុងពង្រីកប្រព័ន្ធ microservices ឬសេវាកម្ម distributed។ នៅពេលដែលចំនួននៃការហៅគ្នារវាងសេវាកម្មខាងក្នុង (RPC calls) កើនឡើងដល់រាប់លានដងក្នុងមួយថ្ងៃ ការពិភាក្សាបានកើតឡើង៖ តើសេវាកម្មខាងក្នុងថ្មីៗគួរប្រាស្រ័យទាក់ទងគ្នាដោយប្រើ HTTP/1.1 JSON REST APIs ធម្មតា ឬគួរតែប្តូរទៅប្រើ gRPC ជាមួយ Protocol Buffers (Protobuf) លើ HTTP/2?
+
+ក្រុមការងារជាច្រើនតែងតែប្រញាប់ប្រញាល់ជ្រើសរើស gRPC ដោយរំពឹងថានឹងទទួលបានល្បឿនលឿនជាងមុន ១០ ដងភ្លាមៗ ប៉ុន្តែបែរជាត្រូវជួបប្រទះការលំបាកជាមួយភាពមិនស៊ីគ្នានៃ web browser, ភាពលំបាកក្នុងការ debug, ការកំណត់ proxy routing និង Protobuf build pipelines ទៅវិញ។
+
+## Symptoms
+
+សញ្ញាដែលបង្ហាញថា JSON/REST រវាងសេវាកម្មខាងក្នុងកំពុងក្លាយជាបញ្ហារាំងស្ទះ (bottleneck)៖
+
+- **ការស៊ី CPU ខ្ពស់ទៅលើ serialization៖** ការវាស់វែងលើ backend services បង្ហាញថា ២០–៣៥% នៃ CPU time ត្រូវបានចំណាយទៅលើការ parse និង stringify JSON។
+- **ការប្រែប្រួល Contract (Contract drift)៖** ក្រុមការងារបញ្ចេញកូដថ្មីដែលធ្វើឱ្យខូចសេវាកម្មដទៃ ដោយសារ JSON schema គ្មានឯកសារច្បាស់លាស់ ហួសសម័យ ឬមិនបាន validate ត្រឹមត្រូវ។
+- **ការចំណាយលើ Network Bandwidth៖** ទិន្នន័យ JSON ដែលមានទំហំធំ និងវែង (មានឈ្មោះ key ដដែលៗរាប់មិនអស់) ស៊ី bandwidth ក្នុង VPC ឬ cross-AZ យ៉ាងច្រើន។
+- **បញ្ហា Multiplexing Bottlenecks៖** ចំនួន request ដ៏ច្រើនលើ HTTP/1.1 ធ្វើឱ្យអស់ TCP connection pools និងជួបប្រទះបញ្ហា head-of-line blocking។
+
+អ្វីដែល **មិនមែន** ជាហេតុផលត្រូវប្តូរទៅ gRPC៖ ប្រសិនបើ API របស់អ្នកមាន traffic តិចជាង ១០០ requests ក្នុងមួយវិនាទី ឬ API នោះត្រូវបានហៅប្រើប្រាស់ផ្ទាល់ពី Web Browser ជាចម្បង។
+
+## Diagnose
+
+មុននឹងសម្រេចចិត្តជ្រើសរើស gRPC សូមវាស់វែងប្រព័ន្ធបច្ចុប្បន្នរបស់អ្នកជាមុន៖
+
+1. **វាស់ស្ទង់ CPU time ក្នុងការ parse JSON៖** ដំណើរការ CPU profilers (`pprof` ក្នុង Go, Node.js clinic, ឬ cProfile ក្នុង Python)។ ប្រសិនបើការ parse JSON ស៊ី CPU តិចជាង 5% នោះ gRPC នឹងមិនអាចជួយកាត់បន្ថយការចំណាយ server បានច្រើនគួរឱ្យកត់សម្គាល់នោះទេ។
+2. **រាប់ចំនួន Incident ដែលបណ្តាលមកពីការបែក Contract៖** តើមាន bug ប៉ុន្មានក្នុងត្រីមាសនេះដែលបណ្តាលមកពីការបាត់ fields, ប្រភេទ data type ខុសគ្នា (ឧ. string vs number), ឬសរសេរខុសអក្ខរាវិរុទ្ធលើ key ក្នុង JSON endpoints ខាងក្នុង?
+3. **វាយតម្លៃលើប្រភេទ Client៖** តើអ្នកហៅគឺជា internal microservices (Go, Java, Node.js) ឬជា web browsers, mobile apps និង third-party developers?
+4. **វាយតម្លៃលើហេដ្ឋារចនាសម្ព័ន្ធ (Infrastructure)៖** តើ load balancers, ingress controllers និង API gateways របស់អ្នកគាំទ្រ HTTP/2 និង gRPC trailers ពេញលេញដែរឬទេ?
+
+## Options
+
+1. **REST ជាមួយ JSON លើ HTTP/1.1៖** ជាជម្រើសស្តង់ដារសកល។ អានយល់ស្រួលដោយមនុស្ស, គាំទ្រដោយគ្រប់ឧបករណ៍ browser និង programming languages ទាំងអស់។
+2. **REST ជាមួយ OpenAPI (Swagger) code generation៖** នៅតែប្រើ HTTP/JSON ដដែល ប៉ុន្តែពង្រឹងការ validate contract និងបង្កើត client SDKs ដោយស្វ័យប្រវត្តិតាមរយៈ OpenAPI specification។
+3. **gRPC លើ HTTP/2 ជាមួយ Protocol Buffers៖** ជា binary protocol ដែលមាន types តឹងរ៉ឹងបំផុត, schema contract ច្បាស់លាស់, multiplexed connections និង bidirectional streaming ពីកំណើត។
+4. **REST លើ HTTP/2 ជាមួយ JSON៖** ដំឡើង transport ទៅកាន់ HTTP/2 multiplexing ដោយនៅរក្សាទម្រង់ JSON payload ដដែល។
+
+## Trade-offs
+
+| លក្ខណៈ | REST / JSON | REST + OpenAPI | gRPC / Protobuf |
+| :--- | :--- | :--- | :--- |
+| **ទំហំ Payload** | ធំ (អក្សរ key វែងៗ) | ធំ | **តូចជាង ៣ ទៅ ១០ ដង** (compact binary) |
+| **ប្រសិទ្ធភាព CPU** | ស៊ី CPU ច្រើនក្នុងការ parse | ស៊ី CPU ច្រើនក្នុងការ parse | **ស៊ី CPU តិចបំផុត** |
+| **សុវត្ថិភាព Contract** | មិនតឹងរ៉ឹង / តាមការស្ម័គ្រចិត្ត | មានការ validate | **តឹងរ៉ឹងពីកំណើត** (ឯកសារ `.proto`) |
+| **ការគាំទ្រលើ Browser** | **ទូទៅទាំងអស់** | **ទូទៅទាំងអស់** | ត្រូវការពឹងផ្អែកលើ gRPC-Web proxy |
+| **ភាពងាយស្រួលក្នុងការ Debug** | **ងាយបំផុត** (`curl`, Postman) | ងាយបំផុត | ត្រូវការឧបករណ៍ជំនាញ (`grpcurl`) |
+| **Streaming** | មានកម្រិត (SSE ឬ WebSockets) | មានកម្រិត | **Bidirectional Streaming ពីកំណើត** |
+| **ឧបករណ៍ប្រតិបត្តិការ (Tooling)** | មានគ្រប់ទីកន្លែង | មានគ្រប់ទីកន្លែង | ត្រូវការ HTTP/2 load balancing (Envoy) |
+
+## Decision
+
+- **ប្រើប្រាស់ REST ជាមួយ JSON សម្រាប់៖**
+  - Public-facing APIs និងការតភ្ជាប់ជាមួយ third-party developers។
+  - Frontend web clients (browsers ប្រាស្រ័យទាក់ទងបានល្អបំផុតជាមួយ HTTP និង JSON)។
+  - ក្រុមហ៊ុនទើបបង្កើតថ្មី (startups) និងក្រុមតូចៗដែលល្បឿនក្នុងការអភិវឌ្ឍ និងភាពងាយស្រួលក្នុងការ debug មានតម្លៃសំខាន់ជាងការសន្សំ microsecond។
+- **ជ្រើសរើស gRPC សម្រាប់៖**
+  - ការប្រាស្រ័យទាក់ទងរវាង internal microservices ដែលមាន request រាប់ម៉ឺនដងក្នុងមួយវិនាទី។
+  - ស្ថាបត្យកម្មដែលប្រើច្រើនភាសា (polyglot ដូចជា Go, Java, Python, C++) ដែល Protobuf code generation ជួយធានា compile-time type safety ឆ្លងភាសាបានយ៉ាងល្អ។
+  - ប្រព័ន្ធ Real-time bidirectional streaming (ដូចជា telemetry, chat pipelines, sensor feeds)។
+  - Mobile applications ដែលដំណើរការក្នុងស្ថានភាពបណ្តាញទូរស័ព្ទមានកម្រិត bandwidth ខ្លាំង។
+
+## Implementation
+
+### ការកំណត់ Protobuf contract (`orders.proto`)៖
+
+```protobuf
+syntax = "proto3";
+
+package orders.v1;
+
+option go_package = "github.com/example/orders/v1;ordersv1";
+
+service OrderService {
+  rpc CreateOrder (CreateOrderRequest) returns (OrderResponse);
+  rpc StreamOrderUpdates (OrderUpdatesRequest) returns (stream OrderStatusUpdate);
+}
+
+message CreateOrderRequest {
+  string customer_id = 1;
+  repeated OrderItem items = 2;
+  int64 total_cents = 3;
+}
+
+message OrderItem {
+  string product_id = 1;
+  int32 quantity = 2;
+  int64 price_cents = 3;
+}
+
+message OrderResponse {
+  string order_id = 1;
+  string status = 2;
+  int64 created_at = 3;
+}
+
+message OrderUpdatesRequest {
+  string order_id = 1;
+}
+
+message OrderStatusUpdate {
+  string order_id = 1;
+  string status = 2;
+  string message = 3;
+}
+```
+
+### ការប្រៀបធៀបជាមួយ REST Endpoint៖
+
+នៅក្នុង REST ការផ្ទៀងផ្ទាត់តម្លៃទំនិញ, nullability, ការបាត់ fields និងការបម្លែង type ទាមទារការសរសេរ validation logic (ដូចជា Zod ឬ Joi) ពេល runtime។ ផ្ទុយទៅវិញ ជាមួយ gRPC រាល់ serialization, deserialization និង type checking ត្រូវបានបង្កើតដោយស្វ័យប្រវត្តិតាំងពីពេល build time ដោយមិនបាច់សរសេរ boilerplate code បន្ថែមឡើយ។
+
+## Verification
+
+1. **វាស់វែងទំហំ Payload៖** ប្រៀបធៀបចំនួន bytes លើ network សម្រាប់ batch request ទំនិញ ៥០០ មុខ។ gRPC binary Protobuf ជាធម្មតាកាត់បន្ថយទំហំ payload បាន **៦០% ទៅ ៨០%** បើធៀបនឹង JSON ធម្មតា។
+2. **ការកាត់បន្ថយ CPU និង Latency៖** នៅក្រោមបន្ទុក ៥,០០០ requests ក្នុងមួយវិនាទី សង្កេតមើល CPU utilization។ CPU ដែលចំណាយលើ serialization នឹងធ្លាក់ចុះយ៉ាងខ្លាំង ហើយ p99 latency ក៏ធ្លាក់ចុះដោយសារ HTTP/2 multiplexing ជួយលុបបំបាត់ការបង្កើត TCP handshake ញឹកញាប់។
+3. **ផ្ទៀងផ្ទាត់ Load Balancer៖** ត្រូវប្រាកដថា load balancer របស់អ្នក (ដូចជា AWS ALB ឬ Envoy) ត្រូវបានកំណត់រចនាសម្ព័ន្ធសម្រាប់ gRPC/HTTP/2 ដើម្បីចែករំលែក request ស្មើៗគ្នាទៅកាន់ pods នីមួយៗ មិនមែនបញ្ជូនគ្រប់ request ទៅកាន់ pod តែមួយតាមរយៈ single long-lived TCP connection នោះឡើយ។
+
+## Why
+
+JSON គឺជាអត្ថបទដែលមនុស្សអាចអានបាន។ ដើម្បីផ្ញើ JSON កុំព្យូទ័រត្រូវបម្លែងលេខ binary ឱ្យទៅជាអក្សរ ASCII, ដាក់សញ្ញាសម្រង់លើ key, escape តួអក្សរពិសេស និងបញ្ជូនឈ្មោះ field ដដែលៗរាល់ពេលផ្ញើ។ កុំព្យូទ័រទទួលត្រូវចំណាយពេល tokenize អត្ថបទនោះ ហើយបម្លែងពី string ត្រឡប់មកជា integer ឬ float វិញ។
+
+Protocol Buffers បម្លែងលេខផ្ទាល់ទៅជា binary varints យ៉ាងតូច និងជំនួសឈ្មោះ fields ដោយលេខ tags (ឧទាហរណ៍ tag `1` សម្រាប់ `customer_id`)។ លទ្ធផល byte stream គឺតូចជាងឆ្ងាយ, decode លឿនជាងរាប់សិបដង និងធានា contract សុវត្ថិភាពតាំងពីមុនពេលកូដចាប់ផ្តើមដំណើរការ។
+
+## When Not To Use
+
+- **Web Frontends ដោយគ្មាន Proxy៖** Web browser ធម្មតាមិនអាចបង្កើត HTTP/2 gRPC requests តាមចិត្តបានទេ ដោយសារកង្វះលទ្ធភាពគ្រប់គ្រងលើ low-level HTTP/2 framing; អ្នកត្រូវតែដំឡើង និងថែទាំ gRPC-Web proxy (ដូចជា Envoy) បន្ថែម។
+- **Public Developer APIs៖** អ្នកអភិវឌ្ឍន៍ខាងក្រៅរំពឹងថានឹងអាច inspect request បានយ៉ាងងាយស្រួលដោយប្រើ browser developer tools, `curl` និង Postman។ ការបង្ខំឱ្យពួកគេទាញយក Protobuf file និងប្រើ gRPC client បង្កើតជាឧបសគ្គយ៉ាងធំ។
+
+## Common Mistakes
+
+- **ប្រើប្រាស់ L4 Load Balancing ជាមួយ gRPC៖** L4 (TCP) load balancers ចែករំលែកតាម connection មិនមែនតាម request ទេ។ ដោយសារ gRPC ប្រើប្រាស់ multiplex លើ long-lived HTTP/2 TCP connection តែមួយ L4 load balancer នឹងបញ្ជូន ១០០% នៃ request ទាំងអស់ទៅកាន់ pod ទីមួយដែលបានភ្ជាប់ ដែលធ្វើឱ្យ pods ផ្សេងទៀតនៅទំនេរ។ ត្រូវតែប្រើ **L7 load balancer** ជានិច្ច (ដូចជា Envoy ឬ AWS ALB ដែលកំណត់សម្រាប់ gRPC)។
+- **ការបំបែក Protobuf Compatibility៖** ការកែប្រែលេខ integer tag នៅក្នុង file `.proto` នឹងធ្វើឱ្យខូច binary compatibility ទាំងស្រុង។ ត្រូវបន្ថែម field ថ្មីជាមួយលេខ tag ថ្មីជានិច្ច ហើយកុំកែប្រែលេខ tag ចាស់ឡើយ។
+- **ការសរសេរឡើងវិញទាំងអស់ក្នុងពេលតែមួយ៖** កុំប្រញាប់ប្តូរគ្រប់ REST endpoints ទាំងអស់ទៅជា gRPC ព្រមគ្នាក្នុងពេលតែមួយ។ ចូរចាប់ផ្តើមសាកល្បងលើសេវាកម្មខាងក្នុងណាដែលមានទំហំ traffic ខ្ពស់ជាងគេជាមុនសិន។

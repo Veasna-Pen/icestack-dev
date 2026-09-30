@@ -1,0 +1,183 @@
+---
+title: "Why is my database deadlocking?"
+summary: "Deadlocks happen when concurrent transactions lock the same rows in different orders. Enforce a deterministic lock order across your application code and retry transient serialization errors."
+tags: [database, postgres, deadlocks, concurrency, transactions]
+related: [problems/database-is-slow, problems/running-out-of-connections, patterns/retry]
+order: 6
+updated: "2026-09-12"
+contributors: [veasna]
+---
+
+## Context
+
+A payment and order processing API on PostgreSQL 16. Customers transfer funds between wallets or purchase items during high-concurrency flash sales. During peak periods, dozens of transactions run concurrently, updating account balances and stock inventories.
+
+The code was tested with single-threaded unit tests and staging load tests that ran sequential requests. In production, when two users transact with each other at the exact same millisecond, transactions begin failing with deadlock errors.
+
+## Symptoms
+
+- Database logs report:
+  ```text
+  ERROR: deadlock detected
+  DETAIL: Process 18421 waits for ShareLock on transaction 91823; blocked by process 18429.
+  Process 18429 waits for ShareLock on transaction 91821; blocked by process 18421.
+  HINT: See server log for query details.
+  CONTEXT: while updating tuple (14, 2) in relation "wallets"
+  ```
+- Application endpoints return intermittent 500 errors to users: `Transaction (Process ID 18421) was deadlocked on lock resources with another process and has been chosen as the deadlock victim.`
+- Deadlocks spike during high traffic events, even though overall database CPU and memory are well below 50%.
+
+<Callout type="warning" title="A deadlock is an application bug, not a database failure">
+Postgres did not fail when it threw a deadlock error; its deadlock detector saved your database from freezing forever. Deadlocks are caused by concurrent transactions acquiring locks in conflicting orders.
+</Callout>
+
+## Diagnose
+
+**1. Inspect the deadlock rate:**
+
+```sql
+SELECT
+  datname,
+  deadlocks,
+  conflicts
+FROM pg_stat_database
+WHERE datname = current_database();
+```
+
+**2. Read the deadlock graph from the PostgreSQL server log:**
+
+PostgreSQL logs detailed information when `log_lock_waits = on` and `deadlock_timeout` (default 1 second) expires:
+
+```text
+Process 18421: UPDATE wallets SET balance = balance - 50 WHERE id = 'user_A';
+-- Next statement attempted by 18421:
+UPDATE wallets SET balance = balance + 50 WHERE id = 'user_B';
+
+Process 18429: UPDATE wallets SET balance = balance - 30 WHERE id = 'user_B';
+-- Next statement attempted by 18429:
+UPDATE wallets SET balance = balance + 30 WHERE id = 'user_A';
+```
+
+The circular dependency is clear:
+- Transaction 1 holds a lock on `user_A` and requests `user_B`.
+- Transaction 2 holds a lock on `user_B` and requests `user_A`.
+- Neither can proceed. After 1 second, Postgres aborts one to unblock the other.
+
+## Options
+
+1. **Random exponential retries in the client.** Catch error code `40P01` (deadlock detected) and retry the entire transaction after a random sleep.
+2. **Deterministic lock ordering.** Always sort the IDs of records to be locked in ascending order before acquiring locks.
+3. **Pessimistic row locking (`SELECT FOR UPDATE`).** Explicitly acquire locks upfront in sorted order before doing business logic.
+4. **Optimistic concurrency control.** Use a `version` or `updated_at` column (`UPDATE ... WHERE id = $1 AND version = $2`) instead of holding row locks across calculations.
+5. **Serialize transactions via a queue.** Route all operations on the same entity through a single-partition queue (e.g., Kafka / BullMQ).
+
+## Trade-offs
+
+| Option | Implementation Effort | Throughput Impact | Deadlock Prevention Guarantee |
+| :--- | :--- | :--- | :--- |
+| **Client Retry** | Low | Low | Does not prevent deadlocks; only masks errors with added latency. |
+| **Deterministic Ordering** | Medium | Zero overhead | **100% mathematical guarantee** against order-induced deadlocks. |
+| **Optimistic Concurrency** | Medium | High when contention is low | Completely eliminates locks; fails fast on conflict. Poor for high contention. |
+| **Partitioned Queue** | High (new infra) | Constrained per entity | Eliminates concurrency entirely; adds async latency. |
+
+## Decision
+
+1. **Sort before locking:** Whenever a transaction modifies more than one row of the same table (such as a multi-item checkout or transfer between two accounts), **always sort the IDs in ascending order** before issuing `UPDATE` or `SELECT FOR UPDATE`.
+2. **Combine with client-side retry:** Even with sorted locks, foreign key checks or index updates can occasionally cause transient serialization failures (`40001` or `40P01`). Implement an automatic 3-attempt exponential retry wrapper for transactions.
+
+## Implementation
+
+### 1. Enforce deterministic lock ordering in code
+
+When transferring balance between two accounts, sort the account IDs so every transaction in the entire system acquires locks in the identical order:
+
+```typescript
+async function transferFunds(fromId: string, toId: string, amount: number) {
+  // Always lock smaller ID first, regardless of sender/receiver
+  const [firstId, secondId] = [fromId, toId].sort();
+
+  return await withTransactionRetry(async (client) => {
+    await client.query('BEGIN');
+
+    // 1. Lock both rows in deterministic ascending order
+    await client.query(
+      `SELECT id, balance FROM wallets WHERE id IN ($1, $2) ORDER BY id FOR UPDATE`,
+      [firstId, secondId]
+    );
+
+    // 2. Perform business checks and updates
+    await client.query(
+      `UPDATE wallets SET balance = balance - $1 WHERE id = $2`,
+      [amount, fromId]
+    );
+    await client.query(
+      `UPDATE wallets SET balance = balance + $1 WHERE id = $2`,
+      [amount, toId]
+    );
+
+    await client.query('COMMIT');
+  });
+}
+```
+
+### 2. Automatic transaction retry helper
+
+Catch deadlock error code `40P01` and serialization failure code `40001`:
+
+```typescript
+import { PoolClient } from 'pg';
+
+export async function withTransactionRetry<T>(
+  operation: (client: PoolClient) => Promise<T>,
+  maxRetries = 3
+): Promise<T> {
+  const client = await pool.connect();
+  try {
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        return await operation(client);
+      } catch (err: any) {
+        await client.query('ROLLBACK').catch(() => {});
+        const isDeadlock = err?.code === '40P01' || err?.code === '40001';
+        if (!isDeadlock || attempt === maxRetries) {
+          throw err;
+        }
+        // Jittered backoff before retrying
+        const delay = Math.random() * (100 * 2 ** (attempt - 1));
+        await new Promise((r) => setTimeout(r, delay));
+      }
+    }
+    throw new Error('Transaction retry exhausted');
+  } finally {
+    client.release();
+  }
+}
+```
+
+## Verification
+
+1. **Deadlock metric:** Monitor `pg_stat_database.deadlocks`. The rate should drop to zero after sorting lock acquisitions.
+2. **Concurrency stress test:** Run a concurrent test executing 100 simultaneous cross-transfers between user A and user B:
+   - With unordered locks: ~40% of transactions abort with deadlocks.
+   - With deterministic ordering: 100% succeed with 0 deadlocks.
+
+## Why
+
+A deadlock requires four conditions (Coffman conditions) to occur simultaneously:
+1. Mutual Exclusion (exclusive locks on rows)
+2. Hold and Wait (holding row A while requesting row B)
+3. No Preemption (Postgres cannot force-release a lock held by a running transaction)
+4. **Circular Wait** (Transaction 1 waits for Transaction 2, which waits for Transaction 1)
+
+By enforcing a global total ordering on resource acquisition (e.g. always lock row $X$ before row $Y$ if $X < Y$), a circular wait becomes **mathematically impossible**.
+
+## When Not To Use
+
+- **Single-row updates:** If transactions only ever touch one row at a time, lock-ordering deadlocks cannot happen.
+- **Bulk data imports:** For massive bulk loads, sorting millions of rows in application memory might be slow; use staging tables with `INSERT ... ON CONFLICT` instead.
+
+## Common Mistakes
+
+- **Relying solely on retries.** Retrying without fixing lock order wastes database CPU and causes high p99 latency spikes.
+- **Hidden locks in foreign keys.** Inserting into a child table locks the referenced row in the parent table with `FOR KEY SHARE`. If parent rows are updated concurrently, unexpected deadlocks occur.
+- **Unindexed foreign key columns.** Without an index on a foreign key column, updates or deletes to the referenced table can lock the entire child table.

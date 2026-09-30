@@ -1,0 +1,145 @@
+---
+title: "Rate limiting"
+question: "តើធ្វើដូចម្តេចដើម្បីការពារ API ពី traffic ច្រើនពេក?"
+summary: "កំណត់ដែនតាមអត្តសញ្ញាណដែលសំខាន់ (អ្នកប្រើ, API key, IP) ដោយប្រើ algorithm ដែលអនុញ្ញាតឱ្យមាន bursts ខ្លីៗ ហើយអនុវត្តនៅកន្លែងដែល requests ទាំងអស់ឆ្លងកាត់។ ឆ្លើយតប 429 ជាមួយ Retry-After ដើម្បីឱ្យ clients ដែលមានឥរិយាបថល្អបន្ថយល្បឿន ជំនួសឱ្យការ retry កាន់តែខ្លាំង។"
+tags: [rate-limiting, api, security, redis, reliability]
+related: [patterns/retry, patterns/caching, problems/should-i-use-redis]
+order: 4
+updated: "2026-09-11"
+translation: draft
+---
+
+## Context
+
+Public API ឬ API សម្រាប់ដៃគូ, form ចូលប្រើ (login), endpoint ដែលផ្ញើលេខកូដ OTP តាម SMS ឬ search ដែលចំណាយខ្លាំង។ បើគ្មានដែនកំណត់ទេ client មួយដែលមានឥរិយាបថខុស (bug, scraper, script សាកល្បងលួច credentials ឬ retry loop) អាចស៊ីអស់សមត្ថភាពដែលសម្រាប់មនុស្សគ្រប់គ្នា ឬបង្កើនការចំណាយតាមការហៅនីមួយៗសម្រាប់ SMS, AI ឬ APIs ភាគីទីបី។
+
+Rate limiting កំណត់ចំនួន requests ដែលអត្តសញ្ញាណមួយអាចធ្វើបានក្នុងរយៈពេលមួយ។ វាការពារសមត្ថភាព លុយ និងសុវត្ថិភាព។ វាមិនមែនជាការជំនួសការធ្វើឱ្យប្រព័ន្ធខ្លួនឯងមានប្រសិទ្ធភាពនោះទេ។
+
+## Symptoms
+
+- Client ឬ IP address មួយកាន់កាប់ចំណែកធំនៃ traffic។
+- ការ login បរាជ័យកើនឡើងជាដុំៗ ឬ OTP requests ច្រើនសម្រាប់លេខទូរស័ព្ទតែមួយ។
+- Retry loop របស់ដៃគូមួយ ប្រែក្លាយ incident ខ្លីមួយទៅជាការផ្ទុកលើសចំណុះ។
+- វិក្កយបត្រដែលមិនបានរំពឹងទុក ពី provider ដែលគិតថ្លៃតាមការហៅ (SMS, email, LLM API)។
+
+## Diagnose
+
+1. **តើអ្នកកំពុងការពារអ្វី?** សមត្ថភាព (CPU, database), លុយ (ការចំណាយតាមការហៅ) ឬសុវត្ថិភាព (brute force)? នីមួយៗចង្អុលទៅរកដែនកំណត់ និង key ខុសៗគ្នា។
+2. **តើឯកតាគឺជានរណា?** អ្នកប្រើដែលបាន authenticate, API key, tenant, IP address ឬលេខទូរស័ព្ទ។ IP addresses ត្រូវបានចែករំលែកដោយការិយាល័យ និងក្រុមហ៊ុនទូរស័ព្ទចល័តដែលប្រើ CGNAT ដូច្នេះដែនកំណត់តាម IP តែម្យ៉ាង ប៉ះពាល់អ្នកប្រើដែលគ្មានកំហុស។
+3. **តើអ្វីជាកម្រិតធម្មតា?** មើលអត្រា request ភាគរយទី 99 តាមអត្តសញ្ញាណនីមួយៗក្នុងរយៈពេលមួយសប្តាហ៍ ហើយកំណត់ដែនឱ្យខ្ពស់ជាងកម្រិតកំពូលធម្មតា មិនមែនត្រឹមមធ្យមភាគទេ។
+4. **តើវាអាចអនុវត្តតែម្តងនៅកន្លែងណា?** API gateway, reverse proxy ឬ middleware ដែល requests ទាំងអស់ឆ្លងកាត់។ Counters ក្នុង memory ដាច់ដោយឡែកនៅលើ server នីមួយៗ គុណដែនកំណត់នឹងចំនួន servers។
+5. **តើ client ដែលត្រូវបានកំណត់ គួរធ្វើអ្វី?** Clients ត្រូវការសញ្ញាច្បាស់លាស់ (status 429, `Retry-After`, quota ដែលនៅសល់) ដើម្បីដឹងថាពេលណាត្រូវបន្ថយល្បឿន។
+
+## Options
+
+1. **Fixed window counter៖** រាប់ requests តាម key ក្នុងមួយនាទី។ ជម្រើសសាមញ្ញបំផុត ប៉ុន្តែវាអនុញ្ញាតឱ្យមាន burst ទ្វេដងឆ្លងកាត់ព្រំដែនរបស់ window។
+2. **Sliding window៖** ធ្វើឱ្យព្រំដែនរលូន ដោយប្រើចំនួនពី window មុន ឬ log នៃ timestamps។
+3. **Token bucket៖** tokens បំពេញឡើងវិញក្នុងអត្រាថេរ រហូតដល់ទំហំ burst មួយ ហើយ request នីមួយៗចំណាយ token មួយ។ អនុញ្ញាតឱ្យមាន bursts ខ្លីៗ ខណៈពេលអនុវត្តមធ្យមភាគ។
+4. **Concurrency limit៖** កំណត់ចំនួន requests ដែលកំពុងដំណើរការ ជំនួសឱ្យ requests ក្នុងមួយវិនាទី។ ល្អសម្រាប់ endpoints ដែលយឺត និងចំណាយខ្លាំង។
+5. **កន្លែងអនុវត្ត៖** នៅ edge (Nginx `limit_req`, API gateway, CDN ឬ WAF) នៅក្នុង application ជាមួយ shared store ដូចជា Redis ឬទាំងពីរ។
+
+## Trade-offs
+
+| ជម្រើស | Bursts | ភាពត្រឹមត្រូវ | ការចំណាយ | កំណត់សម្គាល់ |
+| :--- | :--- | :--- | :--- | :--- |
+| Fixed window | ខ្សោយនៅគែម window | ប្រហាក់ប្រហែល | ទាបបំផុត៖ counter មួយ | ល្អសម្រាប់ការការពារការរំលោភបំពានកម្រិតធំ |
+| Sliding window | ល្អ | ល្អ | Counters ពីរ ឬ log មួយ | លំនាំដើមល្អនៅក្នុង Redis |
+| Token bucket | កំណត់បាន | ល្អ | State បន្តិចតាម key | សមបំផុតសម្រាប់ APIs ដែល clients មាន bursts |
+| Concurrency limit | មិនពាក់ព័ន្ធ | ពិតប្រាកដ | Counter មួយតាម key | ការពារ endpoints យឺត និង dependencies របស់វា |
+| នៅ edge | អាស្រ័យលើឧបករណ៍ | តាម node លុះត្រាតែចែករំលែក | គ្មានកូដ application | បញ្ឈប់ traffic មុនពេលវាចំណាយលុយអ្នក |
+| Application + Redis | Algorithm ណាក៏បាន | សកល | Redis round trip មួយក្នុងមួយ request | ស្គាល់អ្នកប្រើ plans និង tenants |
+
+## Decision
+
+- ប្រើ **ពីរស្រទាប់**៖ ដែនកំណត់តាម IP កម្រិតធំនៅ edge ដើម្បីស្រូបយកការហូរចូលខ្លាំងៗដោយថោក និង **sliding window ឬ token bucket តាមអត្តសញ្ញាណ** នៅក្នុង application ដែលផ្អែកលើ shared store សម្រាប់ភាពយុត្តិធម៌ និង pricing plans។
+- ប្រើ **អត្តសញ្ញាណជាក់លាក់បំផុត** ដែលមានជា key៖ API key ឬ user ID ជាមុន ហើយ IP address ជាជម្រើសបម្រុង។
+- ដាក់ **ដែនកំណត់តឹងជាងលើ endpoints ដែលរសើប** (login, OTP, password reset) ដែល key តាមគណនី ឬលេខទូរស័ព្ទ ក៏ដូចជាតាម IP។
+- ប្រសិនបើ store របស់ limiter គាំង **fail open** សម្រាប់ traffic ទូទៅ ហើយ **fail closed** សម្រាប់ endpoints សំខាន់ផ្នែកសុវត្ថិភាព ដូចជា OTP។
+- ជានិច្ចកាល ត្រូវឆ្លើយតបដោយ **429 និង `Retry-After`**។
+
+## Implementation
+
+Sliding-window limit ក្នុង Node.js ជាមួយ Redis។ ការពិនិត្យ និងការបង្កើនដំណើរការក្នុង Lua script តែមួយ ដូច្នេះ requests ដែលកើតឡើងព្រមគ្នាមិនអាចរអិលឆ្លងកាត់បានទាំងពីរឡើយ៖
+
+```ts
+const SLIDING_WINDOW = `
+local current_key  = KEYS[1]
+local previous_key = KEYS[2]
+local limit        = tonumber(ARGV[1])
+local window       = tonumber(ARGV[2])
+local elapsed      = tonumber(ARGV[3])
+
+local current  = tonumber(redis.call('GET', current_key) or '0')
+local previous = tonumber(redis.call('GET', previous_key) or '0')
+local weighted = previous * ((window - elapsed) / window) + current
+
+if weighted >= limit then return 0 end
+redis.call('INCR', current_key)
+redis.call('EXPIRE', current_key, window * 2)
+return 1
+`;
+
+export async function allow(identity: string, limit: number, windowSeconds: number): Promise<boolean> {
+  const now = Math.floor(Date.now() / 1000);
+  const windowStart = now - (now % windowSeconds);
+  const keys = [`rl:${identity}:${windowStart}`, `rl:${identity}:${windowStart - windowSeconds}`];
+  const allowed = await redis.eval(SLIDING_WINDOW, 2, ...keys, limit, windowSeconds, now - windowStart);
+  return allowed === 1;
+}
+
+// Express middleware: 100 requests a minute per API key, or per IP address for anonymous calls.
+app.use(async (req, res, next) => {
+  const identity = req.header('X-Api-Key') ?? req.ip;
+  let ok = true;
+  try {
+    ok = await allow(identity, 100, 60);
+  } catch {
+    ok = true; // fail open for general traffic if Redis is unavailable
+  }
+  if (ok) return next();
+  res.set('Retry-After', '60').status(429).json({ error: 'Too many requests' });
+});
+```
+
+ដែនកំណត់កម្រិតធំនៅក្នុង Nginx ស្រូបយកការហូរចូលខ្លាំងៗ មុនពេលវាទៅដល់ application៖
+
+```nginx
+limit_req_zone $binary_remote_addr zone=per_ip:10m rate=20r/s;
+
+server {
+  location /api/ {
+    limit_req zone=per_ip burst=40 nodelay;
+    limit_req_status 429;
+    proxy_pass http://app;
+  }
+}
+```
+
+ប្រសិនបើ application ស្ថិតនៅពីក្រោយ proxy ឬ load balancer សូមប្រាកដថា `req.ip` គឺជាអាសយដ្ឋានរបស់ client (ក្នុង Express កំណត់ `trust proxy`)។ បើមិនដូច្នោះទេ អ្នកប្រើទាំងអស់នឹងចែករំលែកដែនកំណត់តែមួយ។
+
+## Verification
+
+- **Load-test អត្តសញ្ញាណមួយ** ឱ្យលើសដែនកំណត់របស់វា៖ វាទទួលបាន responses 429 ជាមួយ `Retry-After` ហើយអត្តសញ្ញាណផ្សេងទៀតមិនរងផលប៉ះពាល់។
+- **ពិនិត្យ bursts** ធៀបនឹងអ្វីដែល clients ស្របច្បាប់ត្រូវការ ដូចជា dashboard ដែលផ្ញើ 20 requests នៅពេល load។
+- **រាប់ 429s តាមអត្តសញ្ញាណ** ហើយដាក់ alert លើការផ្លាស់ប្តូរភ្លាមៗ។ អតិថិជនពិតដែលប៉ះដែនកំណត់ គឺជាហេតុផលឱ្យដំឡើងដែនកំណត់របស់ពួកគេ មិនមែនមិនអើពើទេ។
+- **បញ្ឈប់ Redis នៅក្នុង staging** ហើយបញ្ជាក់ថា traffic ទូទៅនៅតែហូរ (fail open) ខណៈដែល OTP requests ត្រូវបានបដិសេធ (fail closed)។
+
+## Why
+
+សមត្ថភាពដែលចែករំលែកគ្នា ត្រូវការច្បាប់យុត្តិធម៌ មិនដូច្នោះទេ client ដែលរំខានបំផុតសម្រេចបទពិសោធន៍សម្រាប់មនុស្សគ្រប់គ្នា។ Rate limit ប្រែក្លាយតម្រូវការគ្មានដែនកំណត់ ទៅជាតម្រូវការដែលមានដែនកំណត់ ហើយ 429 ច្បាស់លាស់ប្រែក្លាយការផ្ទុកលើសចំណុះ ទៅជាសញ្ញាដែល clients អាចឆ្លើយតបបាន។ ការ key ដែនកំណត់តាមអត្តសញ្ញាណ ឆ្លុះបញ្ចាំងពីអ្នកដែលអ្នកពិតជាបម្រើ; ការអនុវត្តវានៅកន្លែងចែករំលែកតែមួយ មានន័យថាលេខដែលអ្នកកំណត់ គឺជាលេខដែលអ្នកទទួលបាន។
+
+## When Not To Use
+
+- **ដើម្បីជួសជុល endpoint ដែលគ្មានប្រសិទ្ធភាព។** ប្រសិនបើ traffic ធម្មតាធ្វើឱ្យវាផ្ទុកលើសចំណុះ ធ្វើឱ្យវាថោកជាងមុន ឬ cache វា។
+- **ដែនកំណត់តាម IP តែម្យ៉ាងលើ APIs ដែលមាន authentication** ដែលដាក់ទោសអ្នកប្រើនៅពីក្រោយអាសយដ្ឋានរួមគ្នា ខណៈអ្នកវាយប្រហារប្តូរអាសយដ្ឋានរបស់ពួកគេ។
+- **ការហៅពី service ទៅ service ខាងក្នុង** ដែល backpressure, queues ឬ concurrency limits សមជាង។
+- **ដែនកំណត់តឹងដែល clients មិនត្រូវបានប្រាប់** ដែលប្រែក្លាយ rate limiting ទៅជា failures ដែលគួរឱ្យងឿងឆ្ងល់។
+
+## Common Mistakes
+
+- **Counters ក្នុង memory តាម server នីមួយៗ** នៅពីក្រោយ load balancer ដូច្នេះដែនកំណត់ពិតគឺដែនកំណត់ដែលបានកំណត់ គុណនឹងចំនួន servers។
+- **ប្រើអាសយដ្ឋានរបស់ proxy** ជា IP របស់ client ដូច្នេះមនុស្សគ្រប់គ្នាចែករំលែក bucket តែមួយ។
+- **ការពិនិត្យ និងការបង្កើនដែលមិន atomic** អនុញ្ញាតឱ្យ requests ដែលកើតឡើងព្រមគ្នាលើសដែនកំណត់។
+- **ឆ្លើយតប 500 ឬ 503 ជំនួសឱ្យ 429** ដែលធ្វើឱ្យ clients ដែលមានឥរិយាបថល្អ retry កាន់តែខ្លាំង។
+- **គ្មាន `Retry-After`** ដូច្នេះ clients retry ភ្លាមៗ។
+- **កំណត់ការ login តាម IP address តែម្យ៉ាង** ដែលមិនអាចចាប់ credential stuffing ដែលរាលដាលពីអាសយដ្ឋានច្រើន។ កំណត់តាមគណនីផងដែរ។

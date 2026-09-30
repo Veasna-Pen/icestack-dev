@@ -1,0 +1,165 @@
+---
+title: "Cache-Aside vs Write-Through"
+question: "តើកម្មវិធីគួរធ្វើសមកាលកម្ម Caching យ៉ាងដូចម្តេច៖ Lazy Cache-Aside ឬ Eager Write-Through?"
+summary: "Cache-Aside (Lazy Loading) បញ្ចូលទិន្នន័យទៅក្នុង Cache លុះត្រាតែមានការអានខកខាន (Read Miss) ដែលស័ក្តិសមបំផុតសម្រាប់ប្រព័ន្ធដែលផ្តោតលើការអាន។ រីឯ Write-Through និង Write-Behind សរសេរចូល Cache ព្រមគ្នាលើរាល់ការ Update ដែលធានាថាទិន្នន័យក្នុង Cache ថ្មីជានិច្ច តែត្រូវប្តូរមកវិញនូវ Write Latency យឺតជាងមុន ឬហានិភ័យបាត់បង់ទិន្នន័យពេល Server គាំង។"
+tags: [caching, performance, redis, architecture, database]
+related: [patterns/caching, problems/cache-stampede, problems/database-is-slow]
+order: 12
+updated: "2026-09-12"
+contributors: [veasna]
+translation: draft
+---
+
+## Context
+
+Caching គឺជាឧបករណ៍ដ៏មានឥទ្ធិពលបំផុតក្នុងការកាត់បន្ថយបន្ទុក CPU របស់ Database និងជួយឱ្យ API ឆ្លើយតបលឿនកម្រិតមិល្លីវិនាទី។ ទោះជាយ៉ាងណា ការរក្សាភាពស៊ីសង្វាក់គ្នារវាង Cache (Redis) និង Database ពិតប្រាកដ (PostgreSQL) គឺជាបញ្ហាប្រឈមដ៏ល្បីល្បាញបំផុតមួយក្នុងវិស័យកុំព្យូទ័រ។
+
+អ្នកអភិវឌ្ឍន៍ត្រូវធ្វើការសម្រេចចិត្តថាតើ Cache គួរតែត្រូវបានបំពេញ និងធ្វើបច្ចុប្បន្នភាពតាមរបៀបណា៖
+1. **Cache-Aside (Lazy Loading)៖** Application គ្រប់គ្រងដំណើរការទាំងអស់។ ពេលអាន កម្មវិធីឆែក Cache ជាមុន។ បើមាន (Hit) ប្រគល់ទិន្នន័យភ្លាម។ បើអត់មាន (Miss) ទៅទាញពី Database រួចសរសេរចូល Cache ជាមួយ TTL ហើយទើបប្រគល់ទៅ User។ ពេលសរសេរ កម្មវិធី Update ចូល Database រួចលុប (Delete) Key ក្នុង Cache ចោល។
+2. **Write-Through៖** Application ចាត់ទុក Cache ជាកន្លែងផ្ទុកទិន្នន័យចម្បង។ ពេលមានការសរសេរ ប្រព័ន្ធនឹងកត់ត្រាចូលទាំងក្នុង Cache និង Database ព្រមគ្នាក្នុងប្រតិបត្តិការតែមួយ។
+3. **Write-Behind (Write-Back)៖** Application សរសេរចូលតែក្នុង Cache មួយគត់ហើយឆ្លើយតបទៅ User ភ្លាមៗ។ បន្ទាប់មក Cache នឹងប្រមូលទិន្នន័យសរសេរទាំងនោះជា Batch រួចរុញចូល Database បែប Asynchronous នៅខាងក្រោយ។
+
+## Symptoms
+
+- **រោគសញ្ញាបរាជ័យនៃ Cache-Aside៖** ការ Miss Cache អំឡុងពេលមាន Traffic ខ្ពស់ បង្កើតជាបាតុភូត Thundering Herd (Cache Stampede) ដែលពន្លិច Database ឱ្យគាំង; អ្នកប្រើប្រាស់ឃើញទិន្នន័យចាស់ ព្រោះកូដសរសេរកន្លែងខ្លះភ្លេចលុប Cache Key ចោល។
+- **រោគសញ្ញាបរាជ័យនៃ Write-Through៖** រយៈពេលនៃការសរសេរ (Write Latency) កើនឡើងទ្វេដង ព្រោះការ Insert ឬ Update ត្រូវរង់ចាំឱ្យជោគជ័យទាំងលើ Redis និង PostgreSQL; RAM របស់ Cache ពេញដោយទិន្នន័យដែលគ្មាននរណាអានសោះ។
+- **រោគសញ្ញាបរាជ័យនៃ Write-Behind៖** Redis គាំងស្លាប់ ឬដាច់ភ្លើងមុនពេលវាបាន Save ទិន្នន័យចូល Database បណ្តាលឱ្យបាត់បង់ទិន្នន័យអតិថិជនជារៀងរហូត។
+
+<Callout type="warning" title="ត្រូវលុប (Delete) Key ចោលជានិច្ចពេលសរសេរ ហាមសរសេរជាន់លើតម្លៃចាស់ឡើយ">
+ក្នុងយុទ្ធសាស្ត្រ Cache-Aside ការព្យាយាមកែប្រែតម្លៃ Key ផ្ទាល់ពេលសរសេរ (`SET key new_val`) បង្កជា Race Condition ជាមួយការអានស្របគ្នា។ ត្រូវលុប Key ចោល (`DEL key`) ដើម្បីឱ្យការអានបន្ទាប់ទាញយកទិន្នន័យស្រស់ពី Database ដោយសុវត្ថិភាព។
+</Callout>
+
+## Diagnose
+
+1. **គណនា Cache Hit Ratio៖** ដំណើរការ `INFO stats` ក្នុង Redis។ តើសមាមាត្រ `keyspace_hits / (keyspace_hits + keyspace_misses)` លើសពី ៩០% ដែរឬទេ?
+2. **វាស់វែងសមាមាត្រ Read/Write៖** តើប្រព័ន្ធរបស់អ្នកមានការអាន ១០០ ដងក្នុងមួយការសរសេរ (ស័ក្តិសមនឹង Cache-Aside) ឬមានការសរសេរ ១០ ដងក្នុងមួយការអាន (មិនសមនឹង Write-Through)?
+3. **វាយតម្លៃកម្រិតទទួលយកការបាត់បង់ទិន្នន័យ៖** តើអាជីវកម្មរបស់អ្នកអាចទទួលយកការបាត់បង់ទិន្នន័យ ៥ វិនាទីចុងក្រោយបានទេបើ Server គាំង? (បើមិនអាចដាច់ខាត មិនត្រូវប្រើ Write-Behind ឡើយ)។
+4. **ពិនិត្យសម្ពាធ Memory ក្នុង Cache៖** តើ Redis កំពុងបណ្តេញ Key ចេញដោយសារតែ RAM ពេញព្រោះតែការ Warm ទិន្នន័យដែលគេមិនដែលអានមែនទេ?
+
+## Options
+
+1. **Cache-Aside ជាមួយ TTL & Invalidation (លំនាំដើម)៖** ការអានបញ្ចូល Cache តាមតម្រូវការជាក់ស្តែង; ការសរសេរ Update លើ Database រួច `DEL` Key ក្នុង Cache។ (ធន់, សន្សំសំចៃ RAM, ដំណើរការធម្មតាទោះបីជា Redis ដាច់)។
+2. **Write-Through៖** សរសេរចូល Cache និង DB ព្រមគ្នាបែប Synchronous។ (ធានាថាគ្មានទិន្នន័យចាស់ តែ Write យឺតជាងមុន)។
+3. **Write-Behind / Write-Back៖** សរសេរចូល Cache ភ្លាមៗ រួចបញ្ជូនចូល DB បែប Asynchronous។ (Write លឿនបំផុតក្រោម 1 ms តែប្រឈមនឹងការបាត់បង់ទិន្នន័យបើគាំង)។
+4. **Refresh-Ahead៖** Cache ដំណើរការទាញយកទិន្នន័យថ្មីពី Database ដោយស្វ័យប្រវត្តិក្តៅៗ មុនពេល TTL ផុតកំណត់។
+
+## Trade-offs
+
+| យុទ្ធសាស្ត្រ | ល្បឿនអាន (Read) | ល្បឿនសរសេរ (Write) | ភាពស៊ីសង្វាក់ទិន្នន័យ | ភាពគង់វង្សពេល Crash | ប្រសិទ្ធភាព RAM Cache |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **Cache-Aside** | លឿន (< 1 ms ពេល Hit) | ធម្មតា (សរសេរតែ DB) | Eventual (តាម TTL ឬ DEL) | **គង់វង្ស ១០០% (DB ជាគោល)** | **ល្អបំផុត (ផ្ទុកតែទិន្នន័យដែលគេអាន)** |
+| **Write-Through** | **លឿនបំផុត (Warm ជានិច្ច)** | យឺតជាង (សរសេរពីរដង) | **ភ្លាមៗ (Immediate)** | **គង់វង្ស ១០០%** | ទាបជាង (ផ្ទុកទាំងទិន្នន័យត្រជាក់) |
+| **Write-Behind** | លឿនបំផុត | **លឿនដូចផ្លេកបន្ទោរ (< 1 ms)** | Eventual (DB ដើរក្រោយ) | **ប្រថុយប្រថាន (អាចបាត់បង់)** | ទាបជាង |
+
+## Decision
+
+- **ជ្រើសរើស Cache-Aside ជាលំនាំដើមសម្រាប់ ៩៥% នៃ Web Applications៖**
+  - ល្អបំផុតសម្រាប់បន្ទុកការងារដែលផ្តោតលើការអាន (បញ្ជីទំនិញ, Profile អ្នកប្រើប្រាស់, អត្ថបទ)។
+  - មានតែទិន្នន័យដែលគេសួររកប៉ុណ្ណោះដែលចូលទៅកាន់ RAM ថ្លៃៗរបស់ Redis។
+  - ប្រសិនបើ Redis គាំង Application នៅតែដំណើរការបានធម្មតាដោយទាញពី Database ផ្ទាល់ (ទោះបីជាយឺតបន្តិច តែមិនដាច់ប្រព័ន្ធឡើយ)។
+- **ជ្រើសរើស Write-Through សម្រាប់ទិន្នន័យដែលត្រូវការភាពត្រឹមត្រូវភ្លាមៗក្រោយពេលសរសេរ៖**
+  - នៅពេលដែល User កែប្រែទិន្នន័យហើយរំពឹងថានឹងឃើញការផ្លាស់ប្តូរនោះភ្លាមៗដោយមិនអាចទទួលយកភាពយឺតបាន (ការកំណត់គណនី, សមតុល្យលុយ)។
+- **ជ្រើសរើស Write-Behind សម្រាប់តែលេខរាប់បណ្តោះអាសន្នដែលមានបរិមាណច្រើនលើសលុប៖**
+  - ការរាប់ចំនួនអ្នកមើលទំព័រ (Page Views), ការតាមដានរយៈពេលមើលវីដេអូ, Sensor IoT ដែលការបាត់បង់លេខរាប់ពីរបីវិនាទីពេល Server គាំង គឺជារឿងដែលអាចទទួលយកបានជាថ្នូរនឹងការទទួលសំណើ ១០០,០០០ writes/sec។
+- **កំណត់ TTL លើ Cache-Aside ជានិច្ច៖** ទោះបីជាអ្នកមានកូដលុប Key ពេលសរសេរក៏ដោយ ក៏ត្រូវកំណត់ TTL សុវត្ថិភាព (ឧ. ១ ម៉ោង ឬ ២៤ ម៉ោង) ជានិច្ច ដើម្បីការពារកុំឱ្យមាន Key ខ្មោចកប់ចោលក្នុង RAM។
+
+## Implementation
+
+### 1. ការបង្កើត Cache-Aside កម្រិត Production ក្នុង TypeScript៖
+
+```typescript
+import { Redis } from 'ioredis';
+
+const redis = new Redis(process.env.REDIS_URL!);
+
+export class UserService {
+  constructor(private readonly db: any) {}
+
+  // READ: ទាញយកទិន្នន័យបែប Lazy Load (Cache-Aside)
+  async getUser(userId: string) {
+    const cacheKey = `users:${userId}`;
+
+    // ១. ពិនិត្យមើល Cache Hit
+    const cached = await redis.get(cacheKey);
+    if (cached) {
+      return JSON.parse(cached);
+    }
+
+    // ២. Cache Miss: ទាញយកចេញពី Database ពិតប្រាកដ
+    const result = await this.db.query('SELECT id, name, email FROM users WHERE id = $1', [userId]);
+    const user = result.rows[0];
+
+    if (user) {
+      // ៣. បញ្ចូលទៅក្នុង Cache ជាមួយ TTL សុវត្ថិភាព (១ ម៉ោង)
+      await redis.set(cacheKey, JSON.stringify(user), 'EX', 3600);
+    }
+
+    return user;
+  }
+
+  // WRITE: Update Database ជាមុន រួចលុប Cache Key ចោល
+  async updateUser(userId: string, data: { name: string; email: string }) {
+    const cacheKey = `users:${userId}`;
+
+    // ១. Update លើប្រភពទិន្នន័យពិត (PostgreSQL)
+    await this.db.query('UPDATE users SET name = $1, email = $2 WHERE id = $3', [data.name, data.email, userId]);
+
+    // ២. Invalidate Cache! ហាមប្រើ SET; ត្រូវប្រើ DEL ជានិច្ចដើម្បីជៀសវាង Race Condition
+    await redis.del(cacheKey);
+  }
+}
+```
+
+### 2. ប្រព័ន្ធ Write-Behind Flusher សម្រាប់លេខរាប់ដែលមាន Throughput ខ្ពស់៖
+
+```typescript
+// បង្កើនលេខរាប់ក្នុង RAM ភ្លាមៗ (< 0.5 ms)
+export async function trackPageView(articleId: string) {
+  await redis.hincrby('buffer:article_views', articleId, 1);
+}
+
+// Background Worker បញ្ជូនទិន្នន័យជា Batch ទៅកាន់ Postgres រៀងរាល់ ១០ វិនាទីម្តង
+export async function flushViewsToDatabase(db: any) {
+  const views = await redis.hgetall('buffer:article_views');
+  if (!views || Object.keys(views).length === 0) return;
+
+  // លុប Key ចេញជាលក្ខណៈ Atomic
+  await redis.del('buffer:article_views');
+
+  // Insert ជា Batch ចូលក្នុង Database ក្នុង Query តែមួយ
+  const entries = Object.entries(views);
+  for (const [articleId, count] of entries) {
+    await db.query(
+      'UPDATE articles SET view_count = view_count + $1 WHERE id = $2',
+      [parseInt(count, 10), articleId]
+    );
+  }
+  console.log(`[Write-Behind] បានបញ្ជូនចំនួនអ្នកមើលអត្ថបទ ${entries.length} ចូល PostgreSQL ដោយជោគជ័យ`);
+}
+```
+
+## Verification
+
+1. **ការវាស់ស្ទង់ Cache Hit Ratio៖** ដំណើរការ Load Test រយៈពេល ៥ នាទី។ ពិនិត្យ `redis-cli info stats` ហើយផ្ទៀងផ្ទាត់ថាសមាមាត្រ `keyspace_hits / (keyspace_hits + keyspace_misses)` មានស្ថិរភាពលើសពី ៩៥%។
+2. **ផ្ទៀងផ្ទាត់ការលុបបំបាត់ទិន្នន័យចាស់៖** អាន User #5 (បញ្ចូលក្នុង Cache)។ Update ឈ្មោះ User #5 តាម API។ អាន User #5 ម្តងទៀតភ្លាមៗ។ ផ្ទៀងផ្ទាត់ថា Response ឆ្លុះបញ្ចាំងឈ្មោះថ្មីក្នុងពេល < 5 ms។
+3. **ការធ្វើតេស្តរស់រានពេល Cache ដាច់៖** បិទ Redis Container អំឡុងពេល Load Test។ ផ្ទៀងផ្ទាត់ថាកម្មវិធីនៅតែអាចឆ្លើយតបសំណើរបស់អ្នកប្រើប្រាស់ចេញពី PostgreSQL ដោយមិនបណ្តាលឱ្យ Server គាំងឡើយ។
+
+## Why
+
+Memory (RAM) លឿនជាង Disk រាប់ពាន់ដង ប៉ុន្តែវាមានតម្លៃថ្លៃជាង Disk ១០ ដងក្នុងមួយ Gigabyte។
+- **Cache-Aside** គឺជាយុទ្ធសាស្ត្រដែលសន្សំសំចៃធនធានបំផុត ព្រោះវាផ្ទុកតែទិន្នន័យណាដែលអ្នកប្រើប្រាស់ពិតជាត្រូវការប៉ុណ្ណោះ។ ទិន្នន័យដែលគ្មានអ្នកអាន នឹងមិនមកស៊ី RAM ឡើយ។
+- **Write-Through** ប្តូរល្បឿននៃការសរសេរ ដើម្បីធានាថា Cache មានទិន្នន័យស្រស់ជានិច្ច។
+- **Write-Behind** ប្តូរភាពគង់វង្សនៃទិន្នន័យ ដើម្បីទទួលបានល្បឿនសរសេរលឿនបំផុត។
+
+ការយល់ដឹងពីការសម្របសម្រួលទាំងនេះ ធានាថាអ្នកមិនរៀបចំប្រព័ន្ធស្មុគស្មាញហួសហេតុ ឬប្រឈមនឹងការបាត់បង់ទិន្នន័យធ្ងន់ធ្ងរឡើយ។
+
+## When Not To Use
+
+- **Write-Behind សម្រាប់ទិន្នន័យហិរញ្ញវត្ថុ៖** ហាមប្រើ Write-Behind លើសមតុល្យគណនីធនាគារ ឬប្រតិបត្តិការទូទាត់ប្រាក់ជាដាច់ខាត ព្រោះការបាត់បង់ទិន្នន័យពេល Server ដាច់ភ្លើងគឺជាមហន្តរាយ។
+- **Caching លើ Endpoint ដែលមិនសូវមាន Traffic៖** ប្រសិនបើ Endpoint មួយត្រូវបានហៅតែម្តងក្នុង ១០ នាទី ការប្រើ Cache គ្រាន់តែបន្ថែមភាពស្មុគស្មាញដោយគ្មានផលចំណេញអ្វីសោះ។
+
+## Common Mistakes
+
+- **Update ជំនួសឱ្យការលុបពេលសរសេរ៖** ការប្រើ `redis.set(key, newVal)` ក្នុង Write Handler បង្កជា Race Condition ដែលធ្វើឱ្យទិន្នន័យចាស់សរសេរជាន់ទិន្នន័យថ្មី។ ត្រូវប្រើ `redis.del(key)` ជានិច្ច។
+- **ភ្លេចកំណត់ TTL លើ Cache-Aside៖** ការពឹងផ្អែកតែលើការលុបដោយដៃមានន័យថា ប្រសិនបើកូដជួប Bug ត្រង់កន្លែងណាមួយ ទិន្នន័យចាស់នឹងកប់ចោលក្នុង Cache ជារៀងរហូត។
+- **Cache Stampede ពេល Key ផុតកំណត់៖** ប្រសិនបើ Key ដែលមានអ្នកចូលមើលច្រើនផុតកំណត់ពេលមាន Traffic ខ្ពស់ សំណើរាប់រយនឹងរត់ទៅបុក Database ព្រមគ្នាដើម្បីគណនាវាឡើងវិញ។ ត្រូវប្រើ Mutex Lock ឬ XFetch Algorithm។

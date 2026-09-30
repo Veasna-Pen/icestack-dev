@@ -1,0 +1,183 @@
+---
+title: "CQRS"
+question: "How do I scale complex read queries without locking or degrading high-volume write transactions?"
+summary: "Separate read operations from write operations into distinct data models and databases. Writes mutate normalized entities optimized for consistency, while reads query denormalized materialized views optimized for speed."
+tags: [architecture, cqrs, event-driven, database, scalability]
+related: [patterns/event-sourcing, patterns/transactional-outbox, tradeoffs/saga-orchestration-vs-choreography]
+order: 12
+updated: "2026-09-12"
+contributors: [veasna]
+---
+
+## Context
+
+In traditional CRUD architectures, a single database schema serves both reads and writes. A normalized relational table structure (3NF) is ideal for writes: it avoids data duplication, ensures foreign key constraints, and enables atomic ACID transactions.
+
+However, complex user interfaces rarely match normalized schemas. A customer dashboard requires joining 8 tables: orders, order items, products, customers, shipping tracking, billing addresses, discounts, and payment statuses. As query volume and data size grow, these multi-table joins lock rows, degrade database CPU, and make both read queries and write transactions slow.
+
+**CQRS (Command Query Responsibility Segregation)** splits the application into two distinct paths:
+1. **Commands (Writes):** State mutations that validate business rules and write to an optimized write model (e.g. PostgreSQL normalized tables).
+2. **Queries (Reads):** Fast read models that query pre-joined, denormalized read stores (e.g. Elasticsearch, MongoDB, or dedicated read-replica SQL tables) projected asynchronously via events.
+
+## Symptoms
+
+- Complex dashboard and analytics queries require 8-way SQL joins, consuming 85% of database CPU and locking transactional tables.
+- Adding database indexes to speed up search queries severely degrades the write throughput of checkout and order ingestion.
+- The read-to-write ratio is heavily skewed (e.g., 1,000 reads for every 1 write), yet read spikes threaten the availability of write transactions.
+- Domain models are cluttered with read-only DTO fields, ORM lazy-loading bugs, and compromise architectures that satisfy neither reads nor writes well.
+
+<Callout type="warning" title="Optimizing one schema for both reads and writes creates architectural gridlock">
+A schema that is fully normalized for writes will suffer slow queries on reads. A schema denormalized for fast reads will suffer update anomalies and locking contention on writes.
+</Callout>
+
+## Diagnose
+
+1. **Measure read/write ratio:** Check database metrics. Are reads accounting for over 90% of total query volume?
+2. **Analyze slow query logs:** Are your slowest queries multi-table `JOIN` operations that aggregate history for read-only UI views?
+3. **Inspect lock contention:** Do long-running `SELECT` queries cause `Lock:transaction` or `Lock:tuple` waits on `UPDATE` transactions?
+4. **Evaluate staleness tolerance:** Can the dashboard or search index tolerate being 500 milliseconds behind real-time writes (eventual consistency)?
+
+## Options
+
+1. **Single database with Read Replicas:** Point read queries to a PostgreSQL read replica using streaming replication. (Simple, but still uses the same normalized relational schema requiring heavy joins).
+2. **CQRS with shared database (Logical separation):** Same database engine, but separate Command handlers and Query handlers. Queries read from pre-computed SQL materialized views or denormalized reporting tables.
+3. **CQRS with polyglot persistence (Full separation):** Writes go to an ACID relational database (PostgreSQL); an outbox/event pipeline asynchronously projects changes into a search-optimized document store (Elasticsearch) or fast key-value store (Redis).
+
+## Trade-offs
+
+| Architecture | Read Performance | Write Scalability | Consistency Model | Engineering Complexity |
+| :--- | :--- | :--- | :--- | :--- |
+| **Traditional CRUD** | Low (heavy joins) | Constrained | Immediate (ACID) | Lowest |
+| **Read Replicas** | Medium | Medium | Near-immediate (ms lag) | Low |
+| **CQRS (Single DB Views)** | High | High | Near-immediate | Medium |
+| **CQRS (Polyglot DBs)** | Maximum (< 10 ms reads) | Maximum | Eventual (50–500 ms) | High |
+
+## Decision
+
+- **Do not use CQRS everywhere:** Default to standard CRUD. Introduce CQRS only for specific bounded contexts with high read-write asymmetry or extreme query complexity (e.g. catalog search, reporting dashboards, audit ledgers).
+- **Start with Logical CQRS first:** Separate your code into distinct Command and Query classes before separating physical databases. Often, a denormalized SQL table updated via triggers or domain events inside the same database solves 90% of performance issues without distributed systems overhead.
+- **Embrace eventual consistency transparently:** For polyglot CQRS (PostgreSQL write -> Elasticsearch read), design UIs that handle replication lag gracefully (e.g., displaying optimistic local UI updates or redirecting to detail views by primary ID).
+- **Pair with the Transactional Outbox:** When projecting to an external read database, always use the Transactional Outbox pattern to guarantee that read models never miss an update.
+
+## Implementation
+
+### 1. Command Side (Write Model): Strict business logic & normalized write
+
+```typescript
+// Command: CreateOrderCommand
+export interface CreateOrderCommand {
+  orderId: string;
+  customerId: string;
+  items: Array<{ productId: string; quantity: number; priceCents: number }>;
+}
+
+export class OrderCommandHandler {
+  constructor(private readonly db: any, private readonly eventBus: any) {}
+
+  async handle(cmd: CreateOrderCommand): Promise<void> {
+    // 1. Validate business invariants
+    if (cmd.items.length === 0) throw new Error('Order must contain at least 1 item');
+
+    // 2. Atomic write to normalized SQL tables
+    await this.db.transaction(async (trx: any) => {
+      const totalCents = cmd.items.reduce((acc, i) => acc + i.priceCents * i.quantity, 0);
+
+      await trx('orders').insert({
+        id: cmd.orderId,
+        customer_id: cmd.customerId,
+        total_cents: totalCents,
+        status: 'PENDING',
+        created_at: new Date(),
+      });
+
+      for (const item of cmd.items) {
+        await trx('order_items').insert({
+          order_id: cmd.orderId,
+          product_id: item.productId,
+          quantity: item.quantity,
+          unit_price_cents: item.priceCents,
+        });
+      }
+
+      // 3. Emit domain event for asynchronous read projection
+      await this.eventBus.publish('OrderCreated', {
+        orderId: cmd.orderId,
+        customerId: cmd.customerId,
+        totalCents,
+        itemsCount: cmd.items.length,
+        createdAt: new Date().toISOString(),
+      });
+    });
+  }
+}
+```
+
+### 2. Projector: Asynchronously building the denormalized read model
+
+```typescript
+// Event handler updating the denormalized dashboard view in MongoDB / Read SQL
+export class OrderDashboardProjector {
+  constructor(private readonly readDb: any) {}
+
+  async onOrderCreated(event: any) {
+    // Upsert directly into a flat, denormalized read document optimized for instant queries
+    await this.readDb.collection('customer_order_summaries').updateOne(
+      { customerId: event.customerId },
+      {
+        $inc: { totalOrdersCount: 1, lifetimeSpendCents: event.totalCents },
+        $set: { lastOrderAt: event.createdAt },
+        $push: {
+          recentOrders: {
+            $each: [{ orderId: event.orderId, totalCents: event.totalCents, itemsCount: event.itemsCount }],
+            $slice: -5, // Keep only latest 5
+          },
+        },
+      },
+      { upsert: true }
+    );
+  }
+}
+```
+
+### 3. Query Side (Read Model): Lightning-fast flat reads without joins
+
+```typescript
+export class CustomerDashboardQueryHandler {
+  constructor(private readonly readDb: any) {}
+
+  async getDashboard(customerId: string) {
+    // 0 joins! Single O(1) primary key fetch
+    const summary = await this.readDb.collection('customer_order_summaries').findOne({ customerId });
+    if (!summary) {
+      return { totalOrdersCount: 0, lifetimeSpendCents: 0, recentOrders: [] };
+    }
+    return summary;
+  }
+}
+```
+
+## Verification
+
+1. **Query latency benchmark:** Compare the original 8-join relational query against the denormalized read query. Verify that read latency drops from > 300 ms to < 5 ms.
+2. **Database write throughput:** Benchmark the normalized write model under 2,000 writes/sec. Verify that removing read indexes from the write table reduces write I/O and lock waits.
+3. **Projection lag monitoring:** Instrument a metric `projection_lag_ms = now() - event.createdAt`. Alert if projection lag exceeds 2,000 ms.
+4. **Data consistency reconciliation:** Run an automated nightly reconciliation script comparing write database aggregates against read model documents to catch any dropped projection events.
+
+## Why
+
+At enterprise scale, read access patterns and write access patterns have completely contradictory needs:
+- Writes need consistency, validation, normalized constraints, and minimal indexes.
+- Reads need aggregation, denormalization, flexible filtering, and pre-computed caches.
+
+Forcing both into a single model creates compromises that drag down performance across the entire system. CQRS decouples these concerns, enabling each side to scale with the optimal storage engine and data structure.
+
+## When Not To Use
+
+- **Simple CRUD applications:** For standard internal tools, blogs, or administrative back-offices where query volume is low, CQRS introduces massive code bloat for zero tangible gain.
+- **Strictly consistent read-your-own-writes requirements:** If a user immediately modifies a record and expects to see that exact update reflected on a shared global list within 0 ms, eventual consistency will cause user confusion unless handled with client-side optimistic UI.
+
+## Common Mistakes
+
+- **Applying CQRS across the entire application:** Treating CQRS as a top-level architectural mandate rather than a pattern applied selectively to specific high-traffic domains.
+- **Synchronous projections:** Updating the read model synchronously inside the write transaction defeats the purpose, re-introducing write lock contention and failure coupling.
+- **No recovery / replay mechanism:** Failing to retain events or outbox rows, leaving teams unable to rebuild the read model if the projection code has a bug.

@@ -1,0 +1,113 @@
+{
+  "stages": {
+    "problem": {
+      "label": "State the problem",
+      "short": "Problem",
+      "question": "What is actually going wrong, for whom, and how do you know?",
+      "output": "One sentence with a number in it: “checkout p95 went from 120 ms to 2.4 s this week.”",
+      "trap": "Starting from a solution (“we need Redis”) instead of a problem."
+    },
+    "context": {
+      "label": "Understand context",
+      "short": "Context",
+      "question": "What are you working inside: scale, team, budget, deadlines, existing systems?",
+      "output": "The facts that would make a different answer right for a different team.",
+      "trap": "Copying what a company a thousand times your size does."
+    },
+    "diagnose": {
+      "label": "Diagnose",
+      "short": "Diagnose",
+      "question": "Where exactly is the time, the error, or the cost coming from?",
+      "output": "Evidence (a query plan, a trace, a profile, a log line), not a hunch.",
+      "trap": "Fixing the symptom you can see instead of the cause you measured."
+    },
+    "alternatives": {
+      "label": "Explore alternatives",
+      "short": "Alternatives",
+      "question": "What are at least three ways to solve this, including doing nothing?",
+      "output": "A short list that includes the boring option.",
+      "trap": "Comparing the option you already like against a straw man."
+    },
+    "tradeoffs": {
+      "label": "Evaluate trade-offs",
+      "short": "Trade-offs",
+      "question": "What does each option cost in complexity, failure modes, money and reversibility?",
+      "output": "A comparison against the constraints you wrote down in step 2.",
+      "trap": "Counting benefits and forgetting the operating cost: on-call, upgrades, new ways to fail."
+    },
+    "decision": {
+      "label": "Make the decision",
+      "short": "Decision",
+      "question": "Which option wins in this context, and what would change your mind?",
+      "output": "A written decision: the choice, the reason, and when to revisit it.",
+      "trap": "Deciding by default, by hype, or by whoever spoke last."
+    },
+    "implement": {
+      "label": "Implement",
+      "short": "Implement",
+      "question": "What is the smallest change that tests the decision?",
+      "output": "Code behind a flag or on a small slice of traffic, with a way back.",
+      "trap": "A big-bang rewrite that cannot be rolled back."
+    },
+    "verify": {
+      "label": "Verify",
+      "short": "Verify",
+      "question": "Did the number from step 1 actually move, and did anything else break?",
+      "output": "Before-and-after measurements, and a rollback plan you did not need.",
+      "trap": "Shipping and assuming it worked."
+    },
+    "learn": {
+      "label": "Learn why",
+      "short": "Understand",
+      "question": "Why did this work, and when would it be the wrong call?",
+      "output": "A note someone else can reuse, which is what every page on this site is.",
+      "trap": "Remembering the fix but not the reasoning, so the next problem starts from zero."
+    }
+  },
+  "sections": {
+    "context": {
+      "heading": "Context",
+      "hint": "The situation where this question comes up: scale, team, stack, constraints."
+    },
+    "symptoms": {
+      "heading": "Symptoms",
+      "hint": "What you observe that makes you ask the question."
+    },
+    "diagnose": {
+      "heading": "Diagnose",
+      "hint": "How to confirm the real cause: commands, queries, metrics."
+    },
+    "options": {
+      "heading": "Options",
+      "hint": "The realistic alternatives, including doing nothing."
+    },
+    "trade-offs": {
+      "heading": "Trade-offs",
+      "hint": "What each option buys and what it costs, compared honestly."
+    },
+    "decision": {
+      "heading": "Decision",
+      "hint": "A default recommendation, and the conditions that change it."
+    },
+    "implementation": {
+      "heading": "Implementation",
+      "hint": "The smallest working version, in real code."
+    },
+    "verification": {
+      "heading": "Verification",
+      "hint": "How to prove it worked, and how to notice when it stops working."
+    },
+    "why": {
+      "heading": "Why",
+      "hint": "The principle underneath, so the lesson transfers to the next problem."
+    },
+    "when-not-to-use": {
+      "heading": "When Not To Use",
+      "hint": "The situations where this answer is wrong."
+    },
+    "common-mistakes": {
+      "heading": "Common Mistakes",
+      "hint": "What people get wrong in practice, from real incidents."
+    }
+  }
+}

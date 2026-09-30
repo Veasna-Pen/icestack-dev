@@ -1,0 +1,23 @@
+---
+title: "Shipping to production safely"
+summary: "Deploy without dropping requests or taking the site down: health checks, graceful shutdown, feature flags and database changes that roll out in steps."
+level: beginner
+order: 5
+outcomes:
+  - "Add health checks that tell a load balancer when your app is ready"
+  - "Shut an app down without failing the requests it is serving"
+  - "Release a feature to a few users first, and turn it off without a deploy"
+  - "Change a database schema without downtime"
+prerequisites:
+  - "You have deployed a web app at least once, to any platform"
+  - "You know roughly what a load balancer and a container are"
+related: [patterns/health-check, patterns/graceful-shutdown, patterns/feature-flags, problems/slow-first-request, patterns/strangler-fig]
+updated: "2026-09-30"
+contributors: [Veasna-Pen]
+---
+
+Many outages don't start with a bug. They start with a deploy: new instances receive traffic before they are ready, old ones are killed in the middle of requests, a feature goes live for everyone at once, or a migration locks a table.
+
+This course covers the four habits that make deploys boring. **Health checks** tell the platform when an instance can take traffic. **Graceful shutdown** lets old instances finish their work before they stop. **Feature flags** separate deploying code from releasing it. **Expand and contract** changes the database in steps that never break the running version.
+
+The examples use Node.js, Docker and Kubernetes, but the same ideas apply on any platform with a load balancer.

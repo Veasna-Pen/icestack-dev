@@ -1,0 +1,243 @@
+---
+title: "Gin (Go)"
+question: "តើត្រូវអនុវត្ត Context Deadlines, pgxpool Connection Tuning, និង Rate Limiting ក្នុង Gin ដោយរបៀបណា?"
+summary: "Context Deadlines, ការកំណត់ pgxpool Connection, Gin Middleware Rate Limiting, Redis Caching, និង Graceful Shutdown ក្នុង Gin Web Framework។"
+tags: [gin, golang, pgx, redis, implementation]
+related: [patterns/retry, patterns/idempotency, patterns/caching, patterns/rate-limiting]
+order: 13
+updated: "2026-09-12"
+contributors: [veasna]
+translation: draft
+---
+
+ការអនុវត្ត Patterns ជាក់ស្តែងសម្រាប់ Gin Framework ជាមួយ Go 1.22+។ ផ្តោតលើការបញ្ជូន Context Deadlines, ការកែសម្រួល pgxpool សម្រាប់ PostgreSQL, Atomic Idempotency Transactions, Middleware Rate Limiting, និង Graceful Shutdown។
+
+## Timeouts first
+
+Gin ផ្តល់ Request Context តាមរយៈ `c.Request.Context()`។ ត្រូវបង្កើត Context ជាមួយ Deadline ជានិច្ចសម្រាប់ការហៅ Network ឬ Database៖
+
+```go
+package main
+
+import (
+	"context"
+	"net/http"
+	"time"
+
+	"github.com/gin-gonic/gin"
+)
+
+func getExchangeRates(c *gin.Context) {
+	// កំណត់ Timeout ២ វិនាទីដែលទាញចេញពី Client Request Context
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 2*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.example.com/rates", nil)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "បរាជ័យក្នុងការបង្កើតសំណើ"})
+		return
+	}
+
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			c.JSON(http.StatusGatewayTimeout, gin.H{"error": "Upstream rates service ហួសម៉ោងកំណត់"})
+			return
+		}
+		c.JSON(http.StatusBadGateway, gin.H{"error": "Upstream connection បរាជ័យ"})
+		return
+	}
+	defer res.Body.Close()
+
+	c.DataFromReader(res.StatusCode, res.ContentLength, res.Header.Get("Content-Type"), res.Body, nil)
+}
+```
+
+## Database connection pool (`pgxpool`)
+
+កំណត់រចនាសម្ព័ន្ធ Connection Pool ជាមួយ Statement Timeout ក្នុង `pgxpool`៖
+
+```go
+package main
+
+import (
+	"context"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+func initDatabasePool(databaseURL string) (*pgxpool.Pool, error) {
+	config, err := pgxpool.ParseConfig(databaseURL)
+	if err != nil {
+		return nil, err
+	}
+
+	config.MaxConns = 25
+	config.MinConns = 5
+	config.MaxConnLifetime = 1 * time.Hour
+	config.MaxConnIdleTime = 15 * time.Minute
+
+	// កំណត់ statement timeout ត្រឹម ៥ វិនាទី
+	config.ConnConfig.RuntimeParams["statement_timeout"] = "5000"
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	return pgxpool.NewWithConfig(ctx, config)
+}
+```
+
+## Idempotency keys ជាមួយ transactions
+
+គ្រប់គ្រង Idempotency Key នៅក្នុង SQL Transaction តែមួយ៖
+
+```go
+func createOrderHandler(pool *pgxpool.Pool) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		key := c.GetHeader("Idempotency-Key")
+		if key == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "តម្រូវឱ្យមាន Idempotency-Key header"})
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+		defer cancel()
+
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "មិនអាចចាប់ផ្តើម Transaction"})
+			return
+		}
+		defer tx.Rollback(ctx)
+
+		var claimedKey string
+		err = tx.QueryRow(ctx,
+			"INSERT INTO idempotency_keys (key) VALUES ($1) ON CONFLICT DO NOTHING RETURNING key",
+			key).Scan(&claimedKey)
+
+		if err != nil {
+			var cachedResponse []byte
+			rowErr := tx.QueryRow(ctx, "SELECT response FROM idempotency_keys WHERE key = $1", key).Scan(&cachedResponse)
+			if rowErr == nil && len(cachedResponse) > 0 {
+				c.Data(http.StatusOK, "application/json", cachedResponse)
+				return
+			}
+			c.JSON(http.StatusConflict, gin.H{"error": "សំណើកំពុងស្ថិតក្នុងដំណើរការ"})
+			return
+		}
+
+		var orderID string
+		err = tx.QueryRow(ctx,
+			"INSERT INTO orders (customer_id, total_cents) VALUES ($1, $2) RETURNING id",
+			"cust_123", 4500).Scan(&orderID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "បរាជ័យក្នុងការបង្កើត Order"})
+			return
+		}
+
+		respData := []byte(`{"order_id":"` + orderID + `","status":"created"}`)
+		_, _ = tx.Exec(ctx, "UPDATE idempotency_keys SET response = $1 WHERE key = $2", respData, key)
+
+		if err := tx.Commit(ctx); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "បរាជ័យក្នុងការ Commit Transaction"})
+			return
+		}
+
+		c.Data(http.StatusCreated, "application/json", respData)
+	}
+}
+```
+
+## Rate limiting middleware
+
+បង្កើត Middleware ដោយប្រើ Token-Bucket Rate Limiter៖
+
+```go
+package main
+
+import (
+	"net/http"
+	"sync"
+
+	"github.com/gin-gonic/gin"
+	"golang.org/x/time/rate"
+)
+
+type IPRateLimiter struct {
+	mu       sync.RWMutex
+	visitors map[string]*rate.Limiter
+}
+
+func (i *IPRateLimiter) GetLimiter(ip string) *rate.Limiter {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
+	limiter, exists := i.visitors[ip]
+	if !exists {
+		limiter = rate.NewLimiter(10, 20) // ១០ សំណើក្នុងមួយវិនាទី, Burst ២០
+		i.visitors[ip] = limiter
+	}
+	return limiter
+}
+
+func RateLimitMiddleware(limiter *IPRateLimiter) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		clientIP := c.ClientIP()
+		if !limiter.GetLimiter(clientIP).Allow() {
+			c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{"error": "សំណើលើសកម្រិតកំណត់"})
+			return
+		}
+		c.Next()
+	}
+}
+```
+
+## Graceful shutdown
+
+រង់ចាំសំណើដែលកំពុងរត់ឱ្យចប់សិន មុនពេលបិទ Server និង Database Connections៖
+
+```go
+package main
+
+import (
+	"context"
+	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/gin-gonic/gin"
+)
+
+func runServer(router *gin.Engine) {
+	srv := &http.Server{
+		Addr:         ":8080",
+		Handler:      router,
+		ReadTimeout:  5 * time.Second,
+		WriteTimeout: 10 * time.Second,
+		IdleTimeout:  120 * time.Second,
+	}
+
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("listen: %s\n", err)
+		}
+	}()
+
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
+	log.Println("កំពុងបិទ Server...")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := srv.Shutdown(ctx); err != nil {
+		log.Fatal("Server បង្ខំឱ្យបិទ:", err)
+	}
+	log.Println("Server បានបិទដោយសុវត្ថិភាព")
+}
+```

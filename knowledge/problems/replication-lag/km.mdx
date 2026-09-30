@@ -1,0 +1,132 @@
+---
+title: "ហេតុអ្វីបានជា users ឃើញទិន្នន័យចាស់?"
+question: "ហេតុអ្វីបានជាអ្នកប្រើប្រាស់មើលឃើញទិន្នន័យចាស់ ភ្លាមៗក្រោយពេលកែប្រែ Profile?"
+summary: "Asynchronous read replicas តែងតែជួបប្រទះបញ្ហា replication lag។ នៅពេលអ្នកប្រើប្រាស់កែប្រែទិន្នន័យលើ Primary រួច redirect ទៅអានពី Read Replica ភ្លាមៗ ពួកគេនឹងអានចំទិន្នន័យចាស់ដែលមិនទាន់ sync។ អនុវត្ត Read-Your-Own-Writes consistency ដោយភ្ជាប់ session របស់អ្នកកែប្រែទៅកាន់ Primary រយៈពេលពីរបីវិនាទី។"
+tags: [database, postgres, replication, consistency, read-replicas]
+related: [problems/database-is-slow, tradeoffs/sql-vs-nosql, patterns/caching]
+order: 12
+updated: "2026-09-12"
+contributors: [veasna]
+translation: draft
+---
+
+## Context
+
+កម្មវិធីមួយធ្វើការ scale ដោយបែងចែក traffic របស់ database៖ រាល់ query សរសេរ (`INSERT`, `UPDATE`, `DELETE`) ត្រូវបញ្ជូនទៅកាន់ PostgreSQL Primary ខណៈ query អាន (`SELECT`) ត្រូវបានចែករំលែកទៅកាន់ Read Replicas មួយ ឬច្រើនដែលដំណើរការបែប asynchronous។
+
+អ្នកប្រើប្រាស់ម្នាក់បានកែប្រែឈ្មោះរបស់គាត់ពី "Alice" ទៅជា "Alicia"។ ការកែប្រែជោគជ័យជាមួយ HTTP 200 ហើយ frontend ក៏ធ្វើការ redirect អ្នកប្រើប្រាស់ទៅកាន់ទំព័រ `/profile` ភ្លាមៗ។ ទំព័រ profile បង្ហាញឡើង ប៉ុន្តែបែរជាបង្ហាញឈ្មោះចាស់ "Alice" ដដែល។ ដល់ពេលអ្នកប្រើប្រាស់ refresh ទំព័រនោះម្តងទៀត ២ វិនាទីក្រោយមក ទើបឈ្មោះថ្មី "Alicia" លេចចេញមក។
+
+## Symptoms
+
+- អ្នកប្រើប្រាស់កែប្រែព័ត៌មាន ឬបង្ហោះ comment ប៉ុន្តែពេល reload ទំព័រ បែរជាបាត់ការកែប្រែនោះ ដែលជំរុញឱ្យពួកគេចុច submit សារឡើងវិញស្ទួនពីរដង។
+- Automated integration tests (ដូចជា Playwright ឬ Cypress) ជួបប្រទះការធ្លាក់ម្តងម្កាល៖ `Expected "Alicia" but received "Alice"`។
+- សំបុត្រជំនួយ (Support tickets) ពោរពេញទៅដោយការរាយការណ៍ថា "ប្រព័ន្ធមិន save ទិន្នន័យ"។
+- បញ្ហានេះកាន់តែធ្ងន់ធ្ងរអំឡុងពេលដែលមាន write traffic ខ្ពស់ ឬពេល database កំពុងធ្វើ maintenance។
+
+<Callout type="warning" title="Asynchronous Replication នាំមកនូវ Eventual Consistency">
+ការចម្លងទិន្នន័យ WAL (Write-Ahead Log) ពី Primary ទៅកាន់ Replica ធ្វើឡើងជាលក្ខណៈ asynchronous ឆ្លងកាត់ network។ នៅពេលមាន write load ធ្ងន់ធ្ងរ ឬមាន transaction ធំៗ replication lag អាចកើនឡើងពី 10 ms រហូតដល់រាប់វិនាទីយ៉ាងងាយស្រួល។
+</Callout>
+
+## Diagnose
+
+1. **វាស់ស្ទង់ Replication Lag ក្នុង PostgreSQL៖**
+   នៅលើ Primary ពិនិត្យមើល standbys ដែលបានភ្ជាប់៖
+   ```sql
+   SELECT
+     client_addr,
+     state,
+     now() - pg_last_xact_replay_timestamp() AS replication_lag
+   FROM pg_stat_replication;
+   ```
+   ឬ query ផ្ទាល់នៅលើ Replica៖
+   ```sql
+   SELECT EXTRACT(EPOCH FROM (now() - pg_last_xact_replay_timestamp())) AS lag_seconds;
+   ```
+2. **តាមដានលំហូរ Request៖** ពិនិត្យមើល database routing middleware របស់អ្នក។ តើ `/api/update-profile` ដំណើរការលើ Primary ហើយ request បន្ទាប់ `/api/get-profile` ដំណើរការលើ Replica ដែរឬទេ? បើ replica lag គឺ 300 ms ហើយការ redirect ស៊ីពេលតែ 50 ms នោះការអានចំទិន្នន័យចាស់គឺជៀសមិនរួចឡើយ។
+
+## Options
+
+1. **Synchronous Replication។** បង្ខំឱ្យ PostgreSQL រង់ចាំ replica ឆ្លើយតបទទួលស្គាល់ការសរសេរជាមុនសិន ទើបអនុញ្ញាតឱ្យ commit។ (កាត់បន្ថយ write throughput យ៉ាងខ្លាំង; បើ replica រអាក់រអួល ការសរសេរទាំងអស់លើ primary នឹងត្រូវជាប់គាំង)។
+2. **អានទិន្នន័យទាំងអស់ពី Primary។** លុបចោល read replica ទាំងស្រុង។ (ធ្វើឱ្យ Primary ត្រូវទ្រាំទ្របន្ទុកអានលើសទម្ងន់)។
+3. **Session Sticky Routing (Read-Your-Own-Writes)។** បន្ទាប់ពី user ម្នាក់បានធ្វើការកែប្រែទិន្នន័យ ត្រូវបញ្ជូនរាល់ request អានបន្តបន្ទាប់ពី *user ជាក់លាក់នោះ* ទៅកាន់ Primary ក្នុងរយៈពេលខ្លីមួយ (ឧទាហរណ៍ ៥–១០ វិនាទី)។
+4. **Optimistic UI Updates។** រក្សាទុកទិន្នន័យថ្មីក្នុង memory របស់ client (React state / React Query cache) ជាបណ្តោះអាសន្ន ជំនួសឱ្យការ fetch ពី server ឡើងវិញភ្លាមៗ។
+
+## Trade-offs
+
+| យុទ្ធសាស្ត្រ | ភាពស៊ីសង្វាក់នៃទិន្នន័យ | Latency នៃការសរសេរ | បន្ទុកលើ Primary DB |
+| :--- | :--- | :--- | :--- |
+| **Synchronous Replication** | ភ្លាមៗ ១០០% | **ខ្ពស់ខ្លាំង** (ត្រូវរង់ចាំ ACK ពី network) | ខ្ពស់ |
+| **អានតែពី Primary** | ភ្លាមៗ ១០០% | ធម្មតា | **លើសទម្ងន់** (គ្មានការជួយសម្រាលពី replica) |
+| **Read-Your-Own-Writes (Sticky)** | **ភ្លាមៗសម្រាប់អ្នកកែប្រែ** | ធម្មតា | **ទាប** (មានតែអ្នកទើបកែប្រែទើបទៅ Primary) |
+| **Optimistic UI តែមួយមុខ** | ល្អសម្រាប់តែ tab មួយ | ធម្មតា | ទាប (មិនដំណើរការបើបើក multi-tab ឬលើទូរស័ព្ទ) |
+
+## Decision
+
+អនុវត្ត **Read-Your-Own-Writes Consistency តាមរយៈ Session Pinning**៖
+
+1. នៅពេលអ្នកប្រើប្រាស់ធ្វើសកម្មភាពកែប្រែទិន្នន័យណាមួយ (`POST`, `PUT`, `PATCH`, `DELETE`) សូមកំណត់ cookie ខ្លីមួយដែលមាន timestamp បច្ចុប្បន្ន៖ `last_write_at = Date.now()`។
+2. នៅរាល់ `GET` request បន្ទាប់មក ពិនិត្យមើល timestamp នោះ៖
+   - ប្រសិនបើ `Date.now() - last_write_at < 5000` (ក្នុងរយៈពេល ៥ វិនាទីចុងក្រោយ) សូមបញ្ជូន query នោះទៅកាន់ **Primary database**។
+   - ក្រៅពីនោះ បញ្ជូនទៅកាន់ **Read Replicas** ធម្មតា។
+3. អ្នកប្រើប្រាស់ដទៃទៀត (៩៩% នៃអ្នកអានដែលមិនបានកែប្រែទិន្នន័យក្នុងរយៈពេល ៥ វិនាទីចុងក្រោយ) នៅតែបន្តអានពី replicas ដដែល ដែលជួយរក្សា read scalability យ៉ាងរឹងមាំ។
+
+## Implementation
+
+### Database Router Middleware សម្រាប់ Read-Your-Own-Writes (Node.js / Express)៖
+
+```typescript
+import { Request, Response, NextFunction } from 'express';
+import { primaryPool, replicaPool } from './db';
+
+const REPLICATION_WINDOW_MS = 5000; // រយៈពេល sticky ៥ វិនាទី
+
+export function databaseRoutingMiddleware(req: Request, res: Response, next: NextFunction) {
+  const method = req.method;
+
+  // 1. រាល់ការសរសេរទាំងអស់ត្រូវទៅកាន់ Primary និងកំណត់ sticky cookie
+  if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(method)) {
+    req.db = primaryPool;
+    res.cookie('last_write_at', Date.now().toString(), {
+      maxAge: REPLICATION_WINDOW_MS,
+      httpOnly: true,
+      sameSite: 'lax',
+    });
+    return next();
+  }
+
+  // 2. សម្រាប់ GET requests ពិនិត្យមើលថាតើ user ទើបតែកែប្រែទិន្នន័យដែរឬទេ
+  const lastWriteAt = parseInt(req.cookies.last_write_at || '0', 10);
+  const isRecentWriter = Date.now() - lastWriteAt < REPLICATION_WINDOW_MS;
+
+  if (isRecentWriter) {
+    // បញ្ជូនទៅ Primary ដើម្បីឱ្យ user ឃើញទិន្នន័យថ្មីរបស់ខ្លួនភ្លាមៗ
+    req.db = primaryPool;
+  } else {
+    // សុវត្ថិភាពក្នុងការបញ្ជូនទៅកាន់ Replica
+    req.db = replicaPool;
+  }
+
+  next();
+}
+```
+
+## Verification
+
+1. **សាកល្បងបង្កើត Replication Lag ក្នុង Staging៖** កំណត់ការពន្យារពេល ២ វិនាទីសិប្បនិម្មិតលើ replica (`recovery_min_apply_delay = '2s'` ក្នុង `postgresql.conf`)។
+2. **ដំណើរការសាកល្បង Write-and-Redirect៖** ធ្វើការកែប្រែទិន្នន័យ profile រួចហៅ endpoint អានទិន្នន័យភ្លាមៗ។ ផ្ទៀងផ្ទាត់ថាលទ្ធផលបង្ហាញទិន្នន័យថ្មីត្រឹមត្រូវ ១០០%។
+3. **ពិនិត្យបន្ទុកលើ Primary៖** ធានាថា traffic អានទូទៅពីអ្នកដទៃនៅតែបន្តទៅកាន់ replicas ដោយគ្មានការកើនឡើង CPU មិនសមហេតុផលលើ Primary ឡើយ។
+
+## Why
+
+នៅក្នុងប្រព័ន្ធ distributed ទ្រឹស្តីបទ CAP Theorem ចែងថា នៅពេលមាន network partitions អ្នកត្រូវតែជ្រើសរើសរវាង Consistency និង Availability។ Read replicas ផ្តល់អាទិភាពលើ Availability និង Read Scalability ជាជាង immediate consistency។
+
+ទោះជាយ៉ាងណា មនុស្សរំពឹងទុកនូវ **Causal Consistency**៖ ប្រសិនបើ *ខ្ញុំ* ជាអ្នកធ្វើឱ្យមានការផ្លាស់ប្តូរ នោះ *ខ្ញុំ* ត្រូវតែមើលឃើញការផ្លាស់ប្តូរនោះភ្លាមៗ។ អ្នកប្រើប្រាស់ផ្សេងទៀតនៅទូទាំងពិភពលោក មិនខ្វល់ចំពោះការពន្យារពេល 300 ms នោះឡើយ។ តាមរយៈការភ្ជាប់តែអ្នកកែប្រែផ្ទាល់ទៅកាន់ Primary យើងបានបំពេញតាមការរំពឹងទុករបស់មនុស្ស ខណៈពេលដែលនៅតែរក្សាបាននូវ scalability នៃ distributed database។
+
+## When Not To Use
+
+- **ទិន្នន័យហិរញ្ញវត្ថុ និងធនាគារសំខាន់ៗ៖** សមតុល្យគណនី, ការផ្ទេរប្រាក់ និងសិទ្ធិសុវត្ថិភាព មិនគួរអានចេញពី asynchronous replica ឡើយ; ត្រូវអានចេញពី Primary ដោយផ្ទាល់ជានិច្ច។
+
+## Common Mistakes
+
+- **ស្មានថា Replication ដំណើរការភ្លាមៗក្នុង Network ក្នុងស្រុក។** ទោះបីជា network ping ត្រឹមតែ 1 ms ក៏ដោយ ការ update ទិន្នន័យធំៗ ឬការ rebuild index នឹងធ្វើឱ្យ replication thread លើ standby ត្រូវកកស្ទះជាមិនខាន។
+- **ការប្រើ Sticky Session អចិន្ត្រៃយ៍។** ការភ្ជាប់ user ទៅកាន់ Primary ពេញមួយ session របស់ពួកគេ នឹងបំផ្លាញគោលបំណងនៃការបង្កើត read replicas ទាំងស្រុង។ ត្រូវរក្សារយៈពេល sticky ឱ្យខ្លី (ត្រឹម ៣ ទៅ ៥ វិនាទី)។

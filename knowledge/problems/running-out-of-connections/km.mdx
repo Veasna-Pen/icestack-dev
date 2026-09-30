@@ -1,0 +1,249 @@
+---
+title: "ហេតុអ្វីបានជា connection របស់ database ខ្ញុំអស់ (exhausted)?"
+summary: "ជាធម្មតាមកពី container នីមួយៗកំណត់ connection pool ធំជ្រុល ឬ transaction ជាប់គាំងយូរធ្វើឱ្យ connection មិនទំនេរ។ សូមកែសម្រួលទំហំ client pool និងដាក់ timeouts មុនពេលបង្កើន max_connections ឬប្រើ PgBouncer។"
+tags: [database, postgres, connections, pgbouncer, performance]
+related: [problems/database-is-slow, patterns/caching, tradeoffs/monolith-vs-microservices]
+order: 5
+updated: "2026-09-12"
+contributors: [veasna]
+translation: draft
+---
+
+## Context
+
+ប្រព័ន្ធ e-commerce API មួយដំណើរការក្នុង container cluster (20 Kubernetes pods ឬ ECS tasks) ដែលភ្ជាប់ទៅកាន់ PostgreSQL 16 primary មួយនៅលើ AWS RDS (`db.m6g.xlarge`, 4 vCPU, 16 GB RAM)។ កម្មវិធីនេះសរសេរដោយ Node.js ដោយប្រើ `pg` pool ស្តង់ដារ (ឬ Knex / Prisma)។
+
+តាមលំនាំដើម Postgres កំណត់ `max_connections` ប្រហែល 100 នៅលើការដំឡើងទូទៅ (ឬប្រហែល 200 នៅលើ cloud RDS ទំហំនេះ) ដោយបម្រុងទុក 3 slots សម្រាប់ superusers។
+
+នៅពេលសេវាកម្មនេះចាប់ផ្តើមដំណើរការដំបូងជាមួយ 3 pods ក្រុមការងារបានកំណត់ pool របស់ pod នីមួយៗឱ្យមាន `max: 20` "ដើម្បីកុំឱ្យ request ត្រូវរង់ចាំ (queue)"។ នៅពេលមាន 3 pods ចំនួន connection អតិបរមាគឺត្រឹម 60 ប៉ុណ្ណោះ ដែលស្ថិតនៅក្រោមកម្រិតកំណត់យ៉ាងស្រួល។ ប៉ុន្តែនៅសប្តាហ៍មុន ក្រុម marketing បានរៀបចំកម្មវិធី flash sale។ ប្រព័ន្ធ Horizontal Pod Autoscaler (HPA) ក៏បានបង្កើនចំនួន pod ពី 3 ទៅ 20 pods ភ្លាមៗ។
+
+ការគណនាដែលពីមុនមើលទៅគ្មានបញ្ហា បានក្លាយជាមហន្តរាយ៖
+
+```text
+20 pods × 20 connections = 400 connections ដែលព្យាយាមភ្ជាប់
+PostgreSQL max_connections = 100
+```
+
+## Symptoms
+
+- Error logs របស់ Postgres ពោរពេញទៅដោយ៖
+  ```text
+  FATAL: remaining connection slots are reserved for non-replication superuser connections
+  FATAL: sorry, too many clients already
+  ```
+- Application logs ជួបប្រទះបញ្ហា connection acquisition timeout យ៉ាងច្រើន៖
+  ```text
+  TimeoutError: ResourceRequest timed out after 30000ms
+  Error: Connection terminated unexpectedly
+  ```
+- API p99 latency កើនឡើងខ្លាំងពី 45 ms ដល់ជាង 30 វិនាទី ដោយសារតែ HTTP handlers ត្រូវរង់ចាំ connection ពី database។
+- Kubernetes liveness probes ត្រូវបរាជ័យ ដោយសារ health check endpoints មិនអាចទាញយក connection បាន។ Pods ក៏ចាប់ផ្តើម restart ខ្លួនឯង ដែលបង្កើតជាបាតុភូត **thundering herd**៖ pods ទាំង 20 ដែល restart ព្រមគ្នា បានសម្រុកបង្កើត TLS handshake និង authentication ទៅកាន់ Postgres រាប់រយ connection ក្នុងពេលតែមួយ ស្របពេលដែល database កំពុងគាំងស្រាប់។
+- ការស្មានដំបូងរបស់ក្រុមការងារ៖ *«Traffic កើនឡើង ដូច្នេះយើងត្រូវដំឡើង max_connections = 500 ឬ upgrade ទំហំ database ឱ្យធំជាងនេះ»*។
+
+<Callout type="warning" title="Connection កាន់តែច្រើន ធ្វើឱ្យ Postgres កាន់តែយឺត មិនមែនលឿនទេ">
+Postgres ប្រើប្រាស់ស្ថាបត្យកម្ម process-based (OS process មួយសម្រាប់ connection មួយ) មិនមែន lightweight threads ទេ។ Connection សកម្ម 400 នឹងធ្វើឱ្យខាតបង់ CPU cache ដោយសារ context switching និងស៊ី memory រាប់រយ megabytes មុនពេលដំណើរការ query ណាមួយទៅទៀត។
+</Callout>
+
+## Diagnose
+
+មុននឹងផ្លាស់ប្តូរ configuration ណាមួយ សូមពិនិត្យមើលថាតើ connection របស់អ្នកកំពុងស្ថិតក្នុងស្ថានភាពណា។
+
+**1. ពិនិត្យមើលការបែងចែកស្ថានភាព connection ក្នុង Postgres។** ដំណើរការ query នេះក្នុង `psql`៖
+
+```sql
+SELECT
+  state,
+  count(*) AS total,
+  round(100.0 * count(*) / sum(count(*)) OVER (), 1) AS pct
+FROM pg_stat_activity
+WHERE backend_type = 'client backend'
+GROUP BY state
+ORDER BY total DESC;
+```
+
+ស្ទើរតែគ្រប់ករណីនៃបញ្ហា connection ពេញ លទ្ធផលនឹងបង្ហាញដូចនេះ៖
+
+```text
+         state          | total |  pct  
+------------------------+-------+-------
+ idle                   |    76 |  78.4
+ idle in transaction    |    16 |  16.5
+ active                 |     5 |   5.1
+```
+
+កត់សម្គាល់ថា មានតែ **5 connections ប៉ុណ្ណោះដែលកំពុងដំណើរការ query ពិតប្រាកដ**។ ចំណែក connection ផ្សេងទៀតគឺកំពុងទំនេរ (idle) ក្នុង pool របស់ client ឬជាប់គាំងក្នុងស្ថានភាព `idle in transaction`។
+
+**2. ស្វែងរក transaction ដែលជាប់គាំងក្នុង `idle in transaction`។** ស្ថានភាពនេះមានន័យថាកម្មវិធីបានបើក transaction (`BEGIN`) ដំណើរការ query រួចហើយកំពុងរង់ចាំអ្វីផ្សេងទៀត (ដូចជា external HTTP API call ឬ loop ក្នុង code) មុនពេលហៅ `COMMIT`៖
+
+```sql
+SELECT
+  pid,
+  usename,
+  application_name,
+  client_addr,
+  now() - xact_start AS xact_duration,
+  now() - state_change AS idle_duration,
+  left(query, 80) AS last_query
+FROM pg_stat_activity
+WHERE state = 'idle in transaction'
+  AND (now() - xact_start) > interval '5 seconds'
+ORDER BY xact_duration DESC;
+```
+
+ប្រសិនបើអ្នកឃើញ rows ដែលមាន `xact_duration` រាប់វិនាទី ឬរាប់នាទី មានន័យថាកូដរបស់កម្មវិធីកំពុងកាន់កាប់ database connection ទុកចោល ខណៈពេលកំពុងធ្វើកិច្ចការដែលមិនពាក់ព័ន្ធនឹង database។
+
+**3. គណនាពិដាន connection សរុបរបស់ cluster។** គណនាចំនួន connection អតិបរមាដែលហេដ្ឋារចនាសម្ព័ន្ធរបស់អ្នកអាចព្យាយាមបង្កើត៖
+
+```text
+Max Possible Connections = (Pod Replicas × pool.max) + Background Workers + Migration Jobs
+```
+
+ប្រសិនបើតួលេខនេះលើសពី `max_connections - superuser_reserved_connections` នោះបញ្ហា connection ពេញនឹងកើតឡើងច្បាស់ណាស់នៅពេលមាន autoscaling។
+
+## Options
+
+1. **ដំឡើង `max_connections` នៅក្នុង PostgreSQL។** ប្តូរ `max_connections` ពី 100 ទៅ 500 ក្នុង `postgresql.conf` ឬ cloud parameter group។
+2. **កែតម្រូវទំហំ client-side connection pool ឱ្យសមស្រប។** បន្ថយ `pool.max` របស់ pod នីមួយៗឱ្យស្របតាមចំនួន worker threads ពិតប្រាកដ។
+3. **កំណត់ defensive timeouts ឱ្យបានច្បាស់លាស់។** បិទ transaction ដែលជាប់គាំង ឬ query ដែលដើរយូរជ្រុលដោយស្វ័យប្រវត្តិនៅលើ database server។
+4. **ដំឡើង PgBouncer ក្នុងទម្រង់ transaction pooling mode។** ដាក់ connection pooler នៅចន្លោះកណ្តាលរវាង application pods និង PostgreSQL។
+5. **ប្រើប្រាស់ AWS RDS Proxy។** សេវាកម្មគ្រប់គ្រង connection pooling ផ្ទាល់របស់ AWS។
+
+## Trade-offs
+
+| Option | កម្លាំងអនុវត្ត | រយៈពេលដាក់ឱ្យប្រើ | ភាពងាយស្រួលក្នុងការត្រឡប់ក្រោយ | ហានិភ័យ និងផលប៉ះពាល់ (Trade-offs) |
+| :--- | :--- | :--- | :--- | :--- |
+| **ដំឡើង `max_connections`** | មិនបាច់ប៉ះកូដ | 5 នាទី | ងាយស្រួល | ស៊ី RAM ច្រើន (~5–10 MB ក្នុងមួយ connection), CPU ជួបបញ្ហា context switching ខ្លាំង, query throughput ធ្លាក់ចុះ។ |
+| **កែសម្រួលទំហំ client pool** | កែប្រែ config | 1 ម៉ោង | ងាយស្រួល | Request អាចរង់ចាំក្នុង memory របស់ client បើដាក់តូចពេក ប៉ុន្តែវាការពារ database និងបង្កើន throughput សរុប។ |
+| **កំណត់ defensive timeouts** | កែប្រែ parameter | 30 នាទី | ងាយស្រួល | កាត់ផ្តាច់ query/transaction ដែលជាប់គាំងភ្លាមៗ ជំនួសឱ្យការកាន់កាប់ connection ចោលរហូត។ |
+| **PgBouncer (Transaction mode)** | បង្កើត service / sidecar ថ្មី | 1–2 ថ្ងៃ | មធ្យម | អាចចែករំលែក connection ពី client រាប់ពាន់ មកកាន់ Postgres backend តែ 20–30។ មិនដំណើរការជាមួយ session state, temp table ឬ prepared statement (បើមិនបាន config)។ |
+| **AWS RDS Proxy** | Cloud config ($$) | 2 ម៉ោង | ងាយស្រួល | Fully managed; បន្ថែមថ្លៃដើមប្រហែល ~15% លើវិក្កយបត្រ RDS, បន្ថែម latency 2–5 ms ក្នុងមួយ query, ប្រើបានតែលើ AWS។ |
+
+## Decision
+
+ប្រើប្រាស់ **យុទ្ធសាស្ត្រពីរជំហាន (Two-tier strategy)**៖
+
+1. **ជំហានទី 1 (ដោះស្រាយភ្លាមៗ ដោយមិនបាច់បន្ថែម infrastructure ថ្មី)៖**
+   - កែសម្រួលទំហំ client pools ឱ្យតូចមកវិញ។ សម្រាប់ Node.js (single-threaded event loop) កំណត់ `pool.max = 3` ទៅ `5` ក្នុងមួយ container។ សម្រាប់ 20 pods នោះ $20 \times 3 = 60$ connections ដែលនៅក្រោម 100 connection limit យ៉ាងមានសុវត្ថិភាព។
+   - កំណត់ `idle_in_transaction_session_timeout = '10s'` និង `statement_timeout = '30s'` នៅលើ Postgres។
+   - កំណត់ client acquisition timeout (`connectionTimeoutMillis: 5000`) ដើម្បីឱ្យ request បរាជ័យឆាប់រហ័ស (fail fast) ជាជាងការរង់ចាំដោយគ្មានកំណត់។
+
+2. **ជំហានទី 2 (នៅពេល scale លើសពី ~30 pods ឬប្រើប្រាស់ serverless / Lambdas)៖**
+   - ដាក់ **PgBouncer ក្នុងទម្រង់ transaction mode** នៅពីមុខ Postgres។
+   - PgBouncer នឹងគ្រប់គ្រង client connections រាប់ពាន់ពី pods ប៉ុន្តែវានឹងភ្ជាប់ទៅកាន់ Postgres លុះត្រាតែមាន transaction កំពុងដំណើរការជាក់ស្តែងប៉ុណ្ណោះ។
+
+## Implementation
+
+### 1. កំណត់ទំហំ client pool ឱ្យសមស្រប (Node.js `pg`)
+
+កុំទុកការកំណត់ pool តាម default របស់ library ឱ្យសោះ។ សូមកំណត់ connection limits និង timeouts ឱ្យបានច្បាស់លាស់៖
+
+```typescript
+import { Pool } from 'pg';
+
+export const pool = new Pool({
+  host: process.env.DB_HOST,
+  database: process.env.DB_NAME,
+  user: process.env.DB_USER,
+  password: process.env.DB_PASSWORD,
+  // Node.js container ធម្មតាកម្រត្រូវការ connection លើសពី 3-5 ក្នុងពេលតែមួយណាស់
+  max: parseInt(process.env.DB_POOL_MAX || '4', 10),
+  // បិទ connection ណាដែលនៅទំនេរលើសពី 30 វិនាទី
+  idleTimeoutMillis: 30000,
+  // បរាជ័យភ្លាមៗបើ pool មិនអាចផ្តល់ connection ក្នុងរយៈពេល 3 វិនាទី
+  connectionTimeoutMillis: 3000,
+});
+
+pool.on('error', (err) => {
+  console.error('Unexpected error on idle database client', err);
+});
+```
+
+<Callout type="info" title="ប្រើប្រាស់ Prisma?">
+Prisma កំណត់ទំហំ connection pool តាមលំនាំដើមស្មើនឹង `num_physical_cpus * 2 + 1`។ នៅក្នុង container ដែលប្រើ CPU ចែករំលែក សូមកំណត់ `connection_limit` ផ្ទាល់នៅក្នុង connection string៖ `postgresql://USER:PASS@HOST/DB?connection_limit=4`។
+</Callout>
+
+### 2. បិទ transaction ដែលជាប់គាំងដោយស្វ័យប្រវត្តិ (Postgres server)
+
+បន្ថែមការការពារទាំងនេះទៅក្នុង `postgresql.conf` (ឬ AWS RDS Parameter Group)៖
+
+```ini
+# បិទ transaction ណាដែលស្ថិតក្នុងស្ថានភាព idle in transaction លើសពី 10 វិនាទី
+idle_in_transaction_session_timeout = 10000
+
+# បញ្ឈប់ query ណាដែលដំណើរការលើសពី 30 វិនាទី
+statement_timeout = 30000
+```
+
+### 3. ការកំណត់រចនាសម្ព័ន្ធ PgBouncer សម្រាប់ horizontal deployments ធំៗ
+
+នៅពេលដំណើរការ pods រាប់សិប ឬ serverless functions សូមដំឡើង PgBouncer ជាមួយ `pool_mode = transaction`៖
+
+```ini
+[databases]
+app_db = host=postgres-primary.internal port=5432 dbname=production
+
+[pgbouncer]
+listen_addr = 0.0.0.0
+listen_port = 6432
+auth_type = scram-sha-256
+auth_file = /etc/pgbouncer/userlist.txt
+
+# Transaction pooling នឹងប្រគល់ server connection ត្រឡប់មក pool វិញភ្លាមៗក្រោយ COMMIT/ROLLBACK
+pool_mode = transaction
+
+# ចំនួន client connection អតិបរមាដែលទទួលពី pods
+max_client_conn = 1000
+
+# ចំនួន connection ពិតប្រាកដដែលរក្សាទុកទៅកាន់ Postgres primary
+default_pool_size = 25
+min_pool_size = 10
+reserve_pool_size = 5
+```
+
+## Verification
+
+1. **ផ្ទៀងផ្ទាត់ស្ថានភាព connection ពេលមាន load៖** ដំណើរការ query លើ `pg_stat_activity` នៅម៉ោងមមាញឹក។ ចំនួន client connections សរុបគួរតែមានស្ថិរភាព (ឧទាហរណ៍ ២៥–៤០) មិនមែនកើនឡើងស្មើចំនួន pod គុណនឹង ២០ នោះទេ។
+2. **សាកល្បងធ្វើ autoscaling លើ pods៖** បង្កើនចំនួន replica ពី 3 ទៅ 30 នៅក្នុង staging៖
+   ```bash
+   kubectl scale deployment api --replicas=30
+   ```
+   ចំនួន connection របស់ Postgres ត្រូវតែនៅក្រោម `max_connections` ហើយគ្មាន error `FATAL: sorry, too many clients already` ណាមួយកើតឡើងក្នុង database logs ឡើយ។
+3. **ពិនិត្យ query throughput៖** វាស់វែង Transactions Per Second (TPS)។ នៅពេល pool តូចជាងមុន និងគ្មានបញ្ហាដណ្តើម CPU context switching ការប្រើប្រាស់ CPU របស់ Postgres នឹងធ្លាក់ចុះ ហើយ query p95 នឹងប្រសើរឡើងវិញ។
+
+## Why
+
+PostgreSQL ត្រូវបានរចនាឡើងក្នុងទសវត្សរ៍ឆ្នាំ 1980 ផ្អែកលើ Unix processes។ រាល់ client connection នីមួយៗបង្កើត backend process ផ្ទាល់ខ្លួនមួយតាមរយៈ `fork()`។ Process នីមួយៗត្រូវការ private memory ផ្ទាល់ខ្លួន តាមដាន transaction snapshots និងដណ្តើមពេលវេលាពី CPU scheduler។
+
+យោងតាមរូបមន្ត queuing theory ដែលប្រើដោយ connection pools (ដូចជា HikariCP)៖
+
+connections = (core_count * 2) + effective_spindle_count
+
+Database server ទំហំ 4 vCPU ជាមួយ SSD storage អាចដំណើរការ query ជាក់ស្តែងបានតែលើ **4 cores ក្នុងពេលតែមួយប៉ុណ្ណោះ**។ ការបើក 400 connections មិនមែនមានន័យថា query ចំនួន 400 អាចដើរព្រមគ្នានោះទេ ប៉ុន្តែវាមានន័យថា query ចំនួន 396 ត្រូវរង់ចាំ ខណៈពេលដែល OS kernel ត្រូវខាតបង់ CPU ទៅលើការផ្លាស់ប្តូរវេន (context switching) រវាង process ទាំង 400។
+
+ការតម្រង់ជួរ (queuing) request នៅក្នុង memory របស់ client ឬនៅខាងក្នុង PgBouncer គឺលឿនជាង និងចំណាយតិចជាងការអនុញ្ញាតឱ្យ client សម្រុកចូលទៅកាន់ Postgres backends ដោយផ្ទាល់រាប់រយដង។
+
+## When Not To Use
+
+ការប្រើប្រាស់ connection pooling ក្នុងទម្រង់ transaction-mode (PgBouncer) មិនអាចប្រើជាមួយមុខងារដែលត្រូវការអាយុកាលពេញលេញនៃ session បានទេ៖
+
+- **Session-level `SET` commands** (ដូចជា `SET timezone = 'UTC'`) ពីព្រោះ query បន្ទាប់អាចនឹងត្រូវបានបញ្ជូនទៅកាន់ Postgres backend ផ្សេង។
+- **`LISTEN` និង `NOTIFY`** នៅក្នុង Postgres (មុខងារនេះត្រូវការ persistent session connection)។
+- **Temporary tables** (`CREATE TEMP TABLE`) ដែលនឹងបាត់បង់នៅពេល transaction បញ្ចប់ ហើយ server connection ត្រូវបានបង្វិលទៅប្រើកន្លែងផ្សេង។
+- **Advisory locks ដែលកាន់កាប់ឆ្លងកាត់ transaction** (`pg_advisory_lock`)។
+
+ប្រសិនបើកម្មវិធីរបស់អ្នកត្រូវការមុខងារទាំងនេះ អ្នកអាចប្រើ PgBouncer ក្នុងទម្រង់ `session` mode ឬរក្សាទុក connection pool ពីរដាច់ដោយឡែកពីគ្នា៖ transaction pool សម្រាប់ CRUD endpoints ទូទៅ (៩៨% នៃ traffic) និង direct session pool សម្រាប់តែ background jobs ជាក់លាក់។
+
+## Common Mistakes
+
+- **ចាត់ទុក database connection ដូចជា HTTP socket។** HTTP connection ទៅកាន់ Nginx ស្ទើរតែមិនអស់ resource ទេ ប៉ុន្តែ PostgreSQL connection មួយស៊ី memory ប្រហែល 5–10 MB និង OS process មួយ។
+- **ធ្វើការហៅ HTTP ឬ external API នៅខាងក្នុង database transaction។**
+  ```javascript
+  // ANTI-PATTERN: Connection ត្រូវជាប់គាំងពេលរង់ចាំ network response ពី Stripe
+  await db.query('BEGIN');
+  await db.query('UPDATE orders SET status = "processing" WHERE id = $1', [id]);
+  await paymentGateway.charge(amount); // អាចស៊ីពេល ២ ទៅ ៥ វិនាទី!
+  await db.query('COMMIT');
+  ```
+  ត្រូវតែបញ្ចប់ external network call ឱ្យរួចរាល់ *មុនពេល* បើក transaction ឬ *បន្ទាប់ពី* commit រួច។
+- **ដំឡើង `max_connections` ដល់ 1,000 ដោយមិនបានគណនា memory។** Connection នីមួយៗអាចទាញយក memory រហូតដល់ `work_mem` សម្រាប់ sorting និង hashing។ Connection 1,000 ជាមួយ `work_mem = 64MB` អាចបណ្តាលឱ្យ OS Out-Of-Memory (OOM) killer បិទ database ភ្លាមៗ។
+- **មិនបានកំណត់ `connectionTimeoutMillis` នៅក្នុងកូដកម្មវិធី។** នៅពេល pool អស់ connection នោះ request នឹងជាប់គាំងរហូតតាមលំនាំដើមក្នុង drivers ជាច្រើន ដែលអាចបណ្តាលឱ្យ Node.js អស់ memory និងគាំងសេវាកម្មទាំងមូល។

@@ -1,0 +1,154 @@
+---
+title: "Flask (Python)"
+question: "How do I manage database pool limits, atomic idempotency, and Redis caching in Flask?"
+summary: "Gunicorn worker limits, Flask-SQLAlchemy connection pooling, Flask-Caching, Flask-Limiter, and atomic idempotency in Flask."
+tags: [flask, python, gunicorn, sqlalchemy, implementation]
+related: [patterns/retry, patterns/idempotency, patterns/caching, patterns/rate-limiting]
+order: 20
+updated: "2026-09-12"
+contributors: [veasna]
+---
+
+Production patterns for Flask 3+ and Python 3.12+ under Gunicorn. Covers worker execution deadlines, Flask-SQLAlchemy connection pool tuning, atomic idempotency records, Redis cache-aside, and client rate limiting.
+
+## Timeouts first
+
+In Flask, ensure your WSGI server (Gunicorn) kills hung workers, and always specify explicit connect and read deadlines on outbound HTTP calls:
+
+```python
+# gunicorn.conf.py
+bind = "0.0.0.0:8000"
+workers = 4
+timeout = 30           # Kill synchronous worker if stalled for 30s
+graceful_timeout = 10  # Wait 10s for active requests before force killing
+```
+
+```python
+import httpx
+from flask import Flask, jsonify
+
+app = Flask(__name__)
+
+@app.route("/rates")
+def get_rates():
+    try:
+        # Strict 2-second timeout on outbound call
+        response = httpx.get("https://api.example.com/rates", timeout=2.0)
+        response.raise_for_status()
+        return jsonify(response.json())
+    except httpx.TimeoutException:
+        return jsonify({"error": "Rates service timed out"}), 504
+    except httpx.HTTPError as exc:
+        return jsonify({"error": f"Upstream error: {str(exc)}"}), 502
+```
+
+## Database connection pool (Flask-SQLAlchemy)
+
+Configure connection limits, timeouts, and connection recycling to avoid stale database connections:
+
+```python
+from flask import Flask
+from flask_sqlalchemy import SQLAlchemy
+
+app = Flask(__name__)
+app.config["SQLALCHEMY_DATABASE_URI"] = "postgresql://user:pass@localhost:5432/flask_db"
+app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {
+    "pool_size": 20,
+    "max_overflow": 10,
+    "pool_timeout": 3,      # Seconds to wait for a free connection
+    "pool_recycle": 1800,   # Recycle connections older than 30 minutes
+    "pool_pre_ping": True,  # Test connection liveness before checking out
+    "connect_args": {
+        "options": "-c statement_timeout=5000ms"
+    }
+}
+
+db = SQLAlchemy(app)
+```
+
+## Idempotency keys
+
+Safely handle financial or checkout requests using atomic transactions:
+
+```python
+from flask import request, jsonify
+from datetime import datetime, timezone
+from .models import db, IdempotencyRecord, Order
+
+@app.route("/orders", methods=["POST"])
+def create_order():
+    key = request.headers.get("Idempotency-Key")
+    if not key:
+        return jsonify({"error": "Idempotency-Key header is required"}), 400
+
+    try:
+        # Check existing record
+        existing = IdempotencyRecord.query.filter_by(key=key).first()
+        if existing:
+            if existing.response_body:
+                return jsonify(existing.response_body), existing.status_code
+            return jsonify({"error": "Request already in progress"}), 409
+
+        # Claim key
+        record = IdempotencyRecord(key=key, created_at=datetime.now(timezone.utc))
+        db.session.add(record)
+        db.session.flush()
+
+        # Create business record
+        payload = request.get_json()
+        order = Order(customer_id=payload["customer_id"], total_cents=payload["total_cents"])
+        db.session.add(order)
+        db.session.flush()
+
+        resp_data = {"order_id": order.id, "status": "created"}
+        record.status_code = 201
+        record.response_body = resp_data
+        db.session.commit()
+
+        return jsonify(resp_data), 201
+    except Exception:
+        db.session.rollback()
+        return jsonify({"error": "Internal server error"}), 500
+```
+
+## Caching with Redis (`Flask-Caching`)
+
+Cache high-traffic query results with automatic Redis serialization:
+
+```python
+from flask_caching import Cache
+
+cache = Cache(app, config={
+    "CACHE_TYPE": "RedisCache",
+    "CACHE_REDIS_URL": "redis://localhost:6379/0",
+    "CACHE_DEFAULT_TIMEOUT": 300
+})
+
+@app.route("/products/<int:product_id>")
+@cache.cached(timeout=60, query_string=True)
+def get_product(product_id):
+    # Expensive database read
+    product = Order.query.get_or_404(product_id)
+    return jsonify({"id": product.id, "name": product.name})
+```
+
+## Rate limiting (`Flask-Limiter`)
+
+Limit incoming requests by remote IP address using Redis storage:
+
+```python
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+
+limiter = Limiter(
+    get_remote_address,
+    app=app,
+    default_limits=["200 per day", "50 per hour"],
+    storage_uri="redis://localhost:6379/1"
+)
+
+@app.route("/auth/login", methods=["POST"])
+@limiter.limit("5 per minute")
+def login():
+    return jsonify({"status": "authenticated"})
+```

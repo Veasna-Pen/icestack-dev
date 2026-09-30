@@ -1,0 +1,168 @@
+---
+title: "NestJS"
+question: "តើត្រូវកំណត់ Timeout Interceptors, Prisma Idempotency, និង Throttler Rate Limiting ក្នុង NestJS ដោយរបៀបណា?"
+summary: "Retries ជាមួយ RxJS, idempotency នៅក្នុង Prisma transaction, response caching, throttling និង BullMQ processors ដោយប្រើផ្នែកដែល NestJS មានស្រាប់។"
+tags: [nestjs, typescript, nodejs, prisma, implementation]
+related: [patterns/retry, patterns/idempotency, patterns/caching, patterns/rate-limiting, implementations/nodejs]
+order: 2
+updated: "2026-09-11"
+translation: draft
+---
+
+ការអនុវត្ត Patterns សម្រាប់ NestJS 11 លើ TypeScript ដោយប្រើ Official Modules៖ RxJS Timeout និង Retry Interceptors, Prisma Transactional Idempotency, @nestjs/cache-manager, Route Throttling, និង BullMQ Background Jobs។
+
+## Timeouts and retries
+
+`HttpService` ផ្តល់ Observables ដូច្នេះ timeouts និង retries គឺជា RxJS operators។ Callback `delay` សម្រេចថាអ្វីត្រូវ retry៖ ការ throw ពីវា មានន័យថាបោះបង់ភ្លាមៗ។
+
+```ts
+import { Injectable } from '@nestjs/common';
+import { HttpService } from '@nestjs/axios';
+import { firstValueFrom, retry, timeout, timer } from 'rxjs';
+
+const TRANSIENT = new Set([408, 429, 500, 502, 503, 504]);
+const isTransient = (err: any) =>
+  err?.name === 'TimeoutError' || err?.code === 'ECONNRESET' || TRANSIENT.has(err?.response?.status);
+
+@Injectable()
+export class RatesClient {
+  constructor(private readonly http: HttpService) {}
+
+  async latest() {
+    const response = await firstValueFrom(
+      this.http.get('https://api.example.com/rates').pipe(
+        timeout(2000),
+        retry({
+          count: 2,
+          delay: (error, retryCount) => {
+            if (!isTransient(error)) throw error;              // don't retry 4xx
+            return timer(Math.random() * 100 * 2 ** retryCount); // full jitter
+          }
+        })
+      )
+    );
+    return response.data;
+  }
+}
+```
+
+## Idempotency keys
+
+កាន់កាប់ key និងបង្កើត order នៅក្នុង Prisma transaction តែមួយ។ Unique constraint លើ key មានន័យថា duplicate ដែលកើតឡើងព្រមគ្នានឹងបរាជ័យជាមួយ `P2002` ហើយ handler ផ្តល់ response ដែលបានរក្សាទុកជំនួសវិញ។ សូមមើល [Idempotency](../../patterns/idempotency)។
+
+```ts
+import { BadRequestException, Body, ConflictException, Controller, Headers, Injectable, Post } from '@nestjs/common';
+import { Prisma } from '@prisma/client';
+
+@Injectable()
+export class OrdersService {
+  constructor(private readonly prisma: PrismaService) {}
+
+  async create(key: string, dto: CreateOrderDto) {
+    try {
+      return await this.prisma.$transaction(async tx => {
+        await tx.idempotencyKey.create({ data: { key } }); // a concurrent duplicate fails here
+        const order = await tx.order.create({ data: dto });
+        await tx.idempotencyKey.update({ where: { key }, data: { response: order } });
+        return order;
+      });
+    } catch (err) {
+      if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
+        const saved = await this.prisma.idempotencyKey.findUnique({ where: { key } });
+        if (saved?.response) return saved.response;
+        throw new ConflictException('The original request is still in progress');
+      }
+      throw err;
+    }
+  }
+}
+
+@Controller('orders')
+export class OrdersController {
+  constructor(private readonly orders: OrdersService) {}
+
+  @Post()
+  create(@Headers('idempotency-key') key: string | undefined, @Body() dto: CreateOrderDto) {
+    if (!key) throw new BadRequestException('Idempotency-Key header is required');
+    return this.orders.create(key, dto);
+  }
+}
+```
+
+## Caching
+
+`CacheInterceptor` cache responses របស់ GET តាម URL។ នៅក្នុង production សូមប្រើ Redis នៅពីក្រោយវា ដើម្បីឱ្យ instances ទាំងអស់ចែករំលែក cache តែមួយ។ ជាមួយ `cache-manager` កំណែ 5 ឡើងទៅ TTLs គិតជា **milliseconds**។
+
+```ts
+@Module({
+  imports: [CacheModule.register({ ttl: 60_000 })] // plug in a Redis store for multiple instances
+})
+export class ProductsModule {}
+
+@Controller('products')
+@UseInterceptors(CacheInterceptor)
+export class ProductsController {
+  constructor(private readonly products: ProductsService) {}
+
+  @Get(':id')
+  @CacheTTL(60_000)
+  findOne(@Param('id') id: string) {
+    return this.products.findOne(id);
+  }
+}
+```
+
+កុំដាក់ `CacheInterceptor` លើ route ដែល response អាស្រ័យលើអ្នកប្រើ លុះត្រាតែ cache key រួមបញ្ចូលអ្នកប្រើ; key លំនាំដើមគឺ URL ដូច្នេះទិន្នន័យរបស់អ្នកប្រើម្នាក់នឹងត្រូវបម្រើទៅអ្នកប្រើបន្ទាប់។ ទំព័រ [Caching](../../patterns/caching) ពន្យល់ពី invalidation និង stampedes។
+
+## Rate limiting
+
+`@nestjs/throttler` អនុវត្តដែនកំណត់លំនាំដើមលើ app ទាំងមូល ហើយអនុញ្ញាតឱ្យ routes ដែលរសើបកំណត់ឱ្យតឹងជាងនេះ៖
+
+```ts
+@Module({
+  imports: [ThrottlerModule.forRoot([{ ttl: 60_000, limit: 100 }])],
+  providers: [{ provide: APP_GUARD, useClass: ThrottlerGuard }]
+})
+export class AppModule {}
+
+@Controller('auth')
+export class AuthController {
+  @Throttle({ default: { limit: 5, ttl: 60_000 } })
+  @Post('login')
+  login(@Body() dto: LoginDto) {
+    // ...
+  }
+}
+```
+
+Storage លំនាំដើមនៅក្នុង memory ដែលមានន័យថាដាច់ដោយឡែកតាម instance នីមួយៗ។ នៅពីក្រោយ load balancer សូមប្រើ throttler storage ដែលផ្អែកលើ Redis ដើម្បីឱ្យដែនកំណត់ត្រូវបានចែករំលែក ហើយប្រាកដថា app ទុកចិត្ត proxy ដើម្បីឱ្យអាសយដ្ឋានរបស់ clients ត្រឹមត្រូវ។ សូមមើល [Rate limiting](../../patterns/rate-limiting)។
+
+## Background jobs
+
+`@nestjs/bullmq` រុំ BullMQ ជា providers។ ដាក់ job ចូល queue នៅពេល order ត្រូវបាន commit រួច ហើយរក្សា processor ឱ្យ idempotent៖
+
+```ts
+@Injectable()
+export class CheckoutService {
+  constructor(@InjectQueue('emails') private readonly emails: Queue) {}
+
+  async afterOrderCommitted(orderId: string) {
+    await this.emails.add('receipt', { orderId }, {
+      jobId: `receipt:${orderId}`,                 // the same order can't be queued twice
+      attempts: 5,
+      backoff: { type: 'exponential', delay: 1000 }
+    });
+  }
+}
+
+@Processor('emails')
+export class EmailsProcessor extends WorkerHost {
+  constructor(private readonly mailer: MailerService) {
+    super();
+  }
+
+  async process(job: Job<{ orderId: string }>) {
+    await this.mailer.sendReceiptOnce(job.data.orderId); // skips orders already marked as sent
+  }
+}
+```

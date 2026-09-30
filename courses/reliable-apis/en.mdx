@@ -1,0 +1,23 @@
+---
+title: "Calling other services safely"
+summary: "Keep your app working when an API, payment provider or internal service it depends on is slow or down: timeouts, retries, idempotency and circuit breakers."
+level: intermediate
+order: 3
+outcomes:
+  - "Set a timeout on every network call, and choose its value"
+  - "Retry failed calls with backoff and jitter, only when it is safe"
+  - "Make a write safe to repeat with an idempotency key"
+  - "Stop calling a failing service with a circuit breaker"
+prerequisites:
+  - "You have built an API that calls another HTTP service"
+  - "You know what an HTTP status code and a database transaction are"
+related: [patterns/retry, patterns/idempotency, patterns/circuit-breaker, problems/rate-limit-cascade, patterns/bulkhead]
+updated: "2026-09-29"
+contributors: [Veasna-Pen]
+---
+
+Sooner or later every service you call will be slow or unavailable: a payment provider, a shipping API, another team's service. What matters is what **your** app does then. Does it wait forever? Charge a customer twice? Pull the rest of your system down with it?
+
+This course builds four habits, each on top of the last. **Timeouts** stop you waiting forever. **Retries** recover from brief failures. **Idempotency** makes those retries safe for writes like payments. **Circuit breakers** stop you making a bad situation worse when a service is truly down.
+
+The examples use TypeScript and HTTP, but every idea works the same in any language and with any protocol.

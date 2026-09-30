@@ -1,0 +1,134 @@
+---
+title: "Partitioning vs Sharding"
+question: "តើនៅពេលណាដែលខ្ញុំគួរធ្វើ Table Partitioning លើម៉ាស៊ីនតែមួយ ហើយនៅពេលណាដែលគួរធ្វើ Sharding ឆ្លងកាត់ Database Servers ជាច្រើន?"
+summary: "Table Partitioning បំបែកតារាងយក្សឱ្យទៅជាដុំតូចៗជាច្រើនលើ Database Engine តែមួយ ដែលជួយឱ្យការ Query និងការលុបទិន្នន័យចាស់ៗលឿនបំផុត ខណៈដែលរក្សាទុក ACID Transactions និង SQL Joins ពេញលេញ។ ចំណែក Database Sharding បែងចែកជួរទិន្នន័យឆ្លងកាត់ Servers ដាច់ដោយឡែកពីគ្នា ដែលផ្តល់នូវលទ្ធភាពពង្រីកកម្រិត Terabytes តែត្រូវប្តូរមកវិញនូវភាពលំបាកខ្លាំងក្នុងការធ្វើ Cross-shard Joins និង Transactions។"
+tags: [database, postgresql, sharding, partitioning, scalability]
+related: [tradeoffs/horizontal-vs-vertical-scaling, problems/database-is-slow, problems/database-disk-full]
+order: 19
+updated: "2026-09-12"
+contributors: [veasna]
+translation: draft
+---
+
+## Context
+
+នៅពេលដែលតារាងទិន្នន័យក្នុង Relational Database រីកធំលើសពី ៥០ លានជួរ (ដូចជា Audit Logs, ប្រវត្តិ Order, IoT Events, ឬសារ Chat) ល្បឿននៃ Query ធម្មតានឹងចាប់ផ្តើមធ្លាក់ចុះ។ B-Tree Indexes ក្លាយជាធំពេករហូតដល់មិនអាចដាក់ចូលក្នុង RAM (`shared_buffers`) អស់, ការ Vacuum តារាងធ្វើឱ្យ Lock ប្រព័ន្ធ, និងការថែទាំ Disk ក្លាយជាសុបិន្តអាក្រក់។
+
+វិស្វករមានយន្តការគ្រឹះពីរក្នុងការបំបែកទិន្នន័យយក្សទាំងនេះ៖
+1. **Table Partitioning (លើម៉ាស៊ីនទោល / បញ្ឈរ)៖** មុខងារដើមរបស់ Database (PostgreSQL Declarative Partitioning, MySQL Partitions)។ តារាង Logical តែមួយ (ឧ. `audit_logs`) ត្រូវបានបំបែកជាតារាងរូបវន្តតូចៗជាច្រើន (`audit_logs_2026_01`, `audit_logs_2026_02`) *នៅលើ Database តែមួយ*។ Query នឹងច្រោះរំលងតារាងដែលមិនត្រូវការពាក់ព័ន្ធដោយស្វ័យប្រវត្តិ (Partition Pruning) ដោយនៅតែរក្សាបាននូវ Foreign Keys, Joins, និង ACID Transactions ពេញលេញ។
+2. **Database Sharding (លើម៉ាស៊ីនច្រើន / ផ្ដេក)៖** ជួរទិន្នន័យត្រូវបានបែងចែកទៅកាន់ *Database Servers រូបវន្តដាច់ដោយឡែកពីគ្នាទាំងស្រុង* ដោយផ្អែកលើ Shard Key (ដូចជា `tenant_id` ឬ `user_id`)។ Shard A ស្ថិតនៅលើ Server ទី ១; Shard B ស្ថិតនៅលើ Server ទី ២។
+
+ក្រុមការងារជាច្រើនតែងតែយល់ច្រឡំថាពួកគេត្រូវការ "Database Sharding" សម្រាប់តារាងធំៗ ហើយក៏ធ្លាក់ចូលក្នុងមហន្តរាយនៃ Cross-shard Joins, Distributed 2PC Commits, និងការផ្លាស់ប្តូរទិន្នន័យស្មុគស្មាញ ទាំងដែលការពិត Declarative Table Partitioning អាចដោះស្រាយបញ្ហាទំហំ និងល្បឿនបានយ៉ាងងាយស្រួល។
+
+## Symptoms
+
+- **រោគសញ្ញាបរាជ័យនៃតារាងដែលមិនបាន Partition៖** ការលុបទិន្នន័យចាស់ៗ (`DELETE FROM logs WHERE created_at < NOW() - INTERVAL '90 days'`) Lock តារាងអស់រយៈពេល ៣ ម៉ោង, បង្កើត Dead Tuples រាប់លាន, និងធ្វើឱ្យ CPU របស់ Autovacuum ស៊ី ១០០%។
+- **រោគសញ្ញាបរាជ័យនៃ Sharding មុនពេលកំណត់៖** Query រដ្ឋបាលសាមញ្ញ (`SELECT COUNT(*) FROM users`) តម្រូវឱ្យសរសេរកូដ Application ស្មុគស្មាញដើម្បី Query ទៅកាន់ Database Servers ចំនួន ១៦ តាម Network រួចយកមកបូកសរុបក្នុង Node.js RAM; Transaction ណាដែលពាក់ព័ន្ធនឹង Tenant ពីរទាមទារការសរសេរ Saga ស្មុគស្មាញ។
+
+<Callout type="warning" title="Table Partitioning ផ្តល់អត្ថប្រយោជន៍ ៩០% ដូច Sharding ដោយគ្មានភាពស្មុគស្មាញនៃ Distributed Systems">
+ការលុបតារាង Partition ចោល (`DROP TABLE logs_2025_01`) គឺជាប្រតិបត្តិការ O(1) លើកម្រិត Filesystem ដែលយកទំហំ Disk មកវិញក្នុងពេលត្រឹមតែ 10 ms ដោយមិនបង្កើត Lock ឬ Dead Tuples ឡើយ។
+</Callout>
+
+## Diagnose
+
+1. **ពិនិត្យចំនួនជួរ និងទំហំ Disk របស់តារាង៖** ដំណើរការ `\dt+` ក្នុង PostgreSQL។ តើតារាងនោះមានទំហំលើសពី 100 GB ឬលើសពី ៥០ លានជួរដែរឬទេ?
+2. **វិភាគទម្រង់នៃការ Query៖** តើ Query របស់អ្នកច្រោះទិន្នន័យតាមចន្លោះកាលបរិច្ឆេទយ៉ាងតឹងរ៉ឹង (`WHERE created_at >= '2026-01-01'`) ឬតាម Tenant ID ជានិច្ច?
+3. **វាយតម្លៃកម្រិត Hardware បច្ចុប្បន្ន៖** តើ Database របស់អ្នកបានឡើងដល់កម្រិតខ្ពស់បំផុតនៃម៉ាស៊ីន Cloud (128 vCPU, 1 TB RAM) ហើយឬនៅ? (បើមិនទាន់ដល់ទេ អ្នកមិនទាន់ត្រូវការ Horizontal Sharding ឡើយ)។
+4. **ពិនិត្យមើលការ Join ឆ្លងកាត់តារាងផ្សេងៗ៖** តើ Query ឧស្សាហ៍ `JOIN` តារាងនោះជាមួយ Users, Products, ឬ Billing ដែរឬទេ? (ការធ្វើ Join ឆ្លង Shard គឺយឺតខ្លាំងបំផុត)។
+
+## Options
+
+1. **Range Partitioning (លើម៉ាស៊ីនតែមួយ)៖** បែងចែកតាមចន្លោះកាលបរិច្ឆេទ (តាមខែ ឬតាមថ្ងៃ)។ ល្អបំផុតសម្រាប់ Time-series, Event Streams, និង Audit Logs។
+2. **List / Hash Partitioning (លើម៉ាស៊ីនតែមួយ)៖** បែងចែកតាមលេខកូដស្ថានភាព ឬ Hash នៃ `tenant_id` លើ Server តែមួយ។
+3. **Application-Level Sharding (ឆ្លងម៉ាស៊ីនច្រើន)៖** កូដ Application ជាអ្នកគ្រប់គ្រង Connection Pools ទៅកាន់ Database ចំនួន ១០ និងបញ្ជូន Query ដោយផ្អែកលើ `hash(tenant_id) % num_shards`។
+4. **Distributed SQL Database (CockroachDB / Citus / Yugabyte)៖** ប្រព័ន្ធ Sharding ដោយស្វ័យប្រវត្តិតាម Raft Consensus។
+
+## Trade-offs
+
+| លក្ខណៈវិនិច្ឆ័យ | Table Partitioning (ម៉ាស៊ីនតែមួយ) | Database Sharding (ម៉ាស៊ីនច្រើន) |
+| :--- | :--- | :--- |
+| **ចំនួនម៉ាស៊ីនរូបវន្ត** | Server តែមួយគត់ | **Server ឯករាជ្យជាច្រើន** |
+| **ការធ្វើ Query Joins** | **គាំទ្រ SQL `JOIN` ធម្មជាតិពេញលេញ** | Cross-shard Joins យឺត ឬមិនអាចធ្វើបាន |
+| **ការធានា ACID លើ Transaction** | **ACID ពេញលេញ ១០០%** | ត្រូវការ Distributed 2PC ឬ Sagas |
+| **ការលុបទិន្នន័យចាស់ៗភ្លាមៗ** | **ភ្លាមៗ (`DROP TABLE partition`)** | ត្រូវលុបលើ Shard នីមួយៗ |
+| **ពិដាននៃលទ្ធភាព Scale** | កម្រិតដោយ Disk/CPU នៃម៉ាស៊ីនទោល | **គ្មានដែនកំណត់ (Infinite Scale)** |
+| **ភាពស្មុគស្មាញនៃកូដ និងប្រតិបត្តិការ** | **ទាប (គ្រប់គ្រងដោយ SQL ផ្ទាល់)** | ខ្ពស់បំផុត (Re-sharding, Routing) |
+
+## Decision
+
+- **ជ្រើសរើស Table Partitioning (ម៉ាស៊ីនតែមួយ) សម្រាប់៖**
+  - ទិន្នន័យ Time-series, Audit Logs, ប្រវត្តិ Order, និង Event Streams ដែលកើនឡើងឥតឈប់ឈរ។
+  - តារាងដែលទិន្នន័យចាស់ជាង ៩០ ថ្ងៃត្រូវតែលុបចោលជាប្រចាំ (ការ Drop Partition ប្រើពេល 0 ms និងមិនបង្កើត Bloat)។
+  - តារាងដែលមាន Traffic ខ្ពស់ ដែលរាល់ Query ស្ទើរតែទាំងអស់សុទ្ធតែមាន Filter កាលបរិច្ឆេទ (`WHERE created_at >= ...`)។
+- **ជ្រើសរើស Database Sharding (ម៉ាស៊ីនច្រើន) លុះត្រាតែ៖**
+  - បរិមាណនៃការសរសេរ (Write IOPS) លើសពីដែនកំណត់រូបវន្តនៃ NVMe SSDs ដែលខ្លាំងបំផុត។
+  - ទំហំទិន្នន័យសកម្មសរុបកើនលើសពី ១០ ទៅ ២០ Terabytes។
+  - ស្ថាបត្យកម្ម Multi-tenant B2B ដែលច្បាប់តម្រូវឱ្យញែកទិន្នន័យរបស់ក្រុមហ៊ុននីមួយៗដាច់ដោយឡែកពីគ្នាតាមម៉ាស៊ីនរូបវន្ត។
+- **ច្បាប់អនុវត្ត៖** ត្រូវប្រើ Table Partitioning, Read Replicas, និងការដំឡើង Hardware ឱ្យអស់លទ្ធភាពជាមុនសិន មុននឹងគិតដល់រឿង Database Sharding។
+
+## Implementation
+
+### ការបង្កើត Declarative Range Partitioning ក្នុង PostgreSQL៖
+
+```sql
+-- ១. បង្កើតតារាងមេ Partitioned Table
+CREATE TABLE audit_logs (
+  id UUID NOT NULL,
+  tenant_id UUID NOT NULL,
+  event_name VARCHAR(100) NOT NULL,
+  payload JSONB,
+  created_at TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (id, created_at) -- Partition Key ត្រូវតែជាផ្នែកមួយនៃ Primary Key
+) PARTITION BY RANGE (created_at);
+
+-- ២. បង្កើតតារាងរូបវន្តតាមខែនីមួយៗ
+CREATE TABLE audit_logs_2026_01 PARTITION OF audit_logs
+  FOR VALUES FROM ('2026-01-01 00:00:00+00') TO ('2026-02-01 00:00:00+00');
+
+CREATE TABLE audit_logs_2026_02 PARTITION OF audit_logs
+  FOR VALUES FROM ('2026-02-01 00:00:00+00') TO ('2026-03-01 00:00:00+00');
+
+CREATE TABLE audit_logs_2026_03 PARTITION OF audit_logs
+  FOR VALUES FROM ('2026-03-01 00:00:00+00') TO ('2026-04-01 00:00:00+00');
+
+-- ៣. កម្មវិធីគ្រាន់តែ Insert ចូលតារាងមេជាធម្មតា!
+-- Postgres នឹងរុញទិន្នន័យចូល Partition ត្រឹមត្រូវលើ Disk ដោយស្វ័យប្រវត្តិ។
+INSERT INTO audit_logs (id, tenant_id, event_name, created_at)
+VALUES (gen_random_uuid(), gen_random_uuid(), 'user.login', '2026-02-15 12:00:00+00');
+
+-- ៤. ការលុបទិន្នន័យចាស់ៗជាលក្ខណៈ O(1) (យកទំហំ 50 GB មកវិញក្នុងពេល 10 ms ដោយមិនបាច់ Vacuum!)
+DROP TABLE audit_logs_2026_01;
+```
+
+### ការបង្កើនល្បឿន Query តាមរយៈ Partition Pruning៖
+
+```sql
+-- Postgres នឹងស្វែងរកតែក្នុងតារាង audit_logs_2026_02 មួយគត់! 
+-- តារាងប្រចាំខែផ្សេងទៀតទាំងអស់ត្រូវបានរំលងចោលទាំងស្រុង។
+EXPLAIN ANALYZE
+SELECT * FROM audit_logs
+WHERE created_at >= '2026-02-01' AND created_at < '2026-02-10';
+```
+
+## Verification
+
+1. **ផ្ទៀងផ្ទាត់ Partition Pruning៖** ដំណើរការ `EXPLAIN ANALYZE` លើ Query ដែលមានលក្ខខណ្ឌកាលបរិច្ឆេទ។ ផ្ទៀងផ្ទាត់ថា Query Plan បង្ហាញ `Subplans Removed` និងអានតែ Partition ពាក់ព័ន្ធតែមួយគត់។
+2. **ការធ្វើតេស្តយកទំហំ Disk មកវិញភ្លាមៗ៖** ផ្ទៀងផ្ទាត់ថាការដំណើរការ `DROP TABLE audit_logs_2026_01` បញ្ចប់ក្នុងពេល **< 20 ms** និងដោះលែងទំហំ Disk ភ្លាមៗដោយគ្មាន Dead Tuples ឡើយ។
+3. **ផ្ទៀងផ្ទាត់ Primary Key Constraint៖** បញ្ជាក់ថា Composite Primary Key `(id, created_at)` ការពារការស្ទួន ID ក្នុងដែន Partition ដោយជោគជ័យ។
+
+## Why
+
+B-Tree Index មានប្រសិទ្ធភាពលុះត្រាតែ Index និងទិន្នន័យដែលកំពុងប្រើប្រាស់ញឹកញាប់អាចដាក់ក្នុង RAM (`shared_buffers`) អស់។ នៅពេលដែលតារាងរីកធំរហូតដល់ Index ធំជាងទំហំ RAM នោះរាល់ Query ទាំងអស់ត្រូវបង្ខំចិត្តអានពី Physical Disk ដែលធ្វើឱ្យល្បឿនធ្លាក់ចុះដាំក្បាល។
+
+Table Partitioning រក្សាទុក Index របស់ Partition នីមួយៗឱ្យនៅតូចល្មមអាចដាក់ក្នុង RAM បាន។ វាផ្តល់នូវអត្ថប្រយោជន៍ល្បឿននៃតារាងតូចៗ ខណៈដែលអនុញ្ញាតឱ្យ Application មើលឃើញវាជាតារាងរួមតែមួយ។
+
+## When Not To Use
+
+- **តារាងតូចៗ (ក្រោម ៥ លានជួរ)៖** Partitioning បន្ថែមបន្ទុកលើ Query Planning។ បើតារាងតូចអាចដាក់ក្នុង RAM បានស្រួល ការប្រើ Partition ធ្វើឱ្យ Query យឺតជាងមុនទៅវិញ។
+- **Query ដែលមិនដែលប្រើ Partition Key៖** ប្រសិនបើអ្នក Partition តាម `created_at` តែ Query របស់អ្នកប្រើតែ `WHERE tenant_id = ?` នោះ PostgreSQL ត្រូវស្វែងរកគ្រប់ Partition ទាំងអស់ ដែលធ្វើឱ្យបាត់បង់អត្ថប្រយោជន៍ទាំងស្រុង។
+
+## Common Mistakes
+
+- **ភ្លេចបង្កើត Script បង្កើត Partition ស្វ័យប្រវត្តិ៖** ប្រសិនបើអ្នកភ្លេចបង្កើតតារាង `audit_logs_2026_04` មុនពេលខែមេសាមកដល់ នោះការ Insert នៅថ្ងៃទី ១ ខែមេសានឹងបោះ Error គាំងប្រព័ន្ធ។ (ត្រូវប្រើ Extension ដូចជា `pg_partman` ដើម្បីបង្កើតដោយស្វ័យប្រវត្តិ)។
+- **ធ្វើ Sharding មុនពេលដល់ដែនកំណត់ Hardware៖** ចំណាយពេល ១ ឆ្នាំសរសេរកូដ Sharding ទាំងដែលការប្រើ Vertical Scaling និង Table Partitioning អាចទ្រទ្រង់ក្រុមហ៊ុនបាន ៥ ឆ្នាំទៀតដោយមិនបាច់ធ្វើអ្វីសោះ។
+- **បង្កើត Partition ច្រើនហួសហេតុ (រាប់ពាន់ Partitions)៖** ការបង្កើត ១០,០០០ Partitions លើតារាងតែមួយ នឹងធ្វើឱ្យអស់ File Descriptors របស់ OS និងធ្វើឱ្យការរៀបចំ Query Plan យឺតខ្លាំង។ គួររក្សាចំនួន Partition ឱ្យនៅក្រោម ១០០ ជានិច្ច។

@@ -1,0 +1,133 @@
+---
+title: "Caching"
+question: "Should I cache this?"
+summary: "Cache when the same expensive answer is read far more often than it changes, and a slightly stale answer is acceptable. Every cache is a copy that can be wrong, so decide how it goes stale before you decide where it lives."
+tags: [caching, performance, redis, http]
+related: [problems/should-i-use-redis, problems/database-is-slow, patterns/rate-limiting]
+order: 1
+updated: "2026-09-11"
+---
+
+## Context
+
+Caching means keeping a copy of a result close to where it is needed, so you don't have to compute or fetch it again. It happens at every layer: the browser, a CDN, a reverse proxy, the application's memory, Redis, and the database's own buffer pool. "Should I cache this?" usually comes up when an endpoint is slow or the database is busy.
+
+## Symptoms
+
+- The same query or API call runs thousands of times with the same inputs and the same result.
+- A page or endpoint is slow because it aggregates data: dashboards, counts, recommendations.
+- An external API is slow, rate-limited, or charges per call.
+- A traffic spike (a sale, a launch) is expected to overload the backend.
+
+## Diagnose
+
+Before caching, measure three things about the data:
+
+1. **Read/write ratio.** How many reads per change? A product page read 10,000 times per update is a great candidate. A shopping cart read twice per change is not.
+2. **Tolerable staleness.** How wrong may a cached answer be, and for how long? Write it down in seconds: "prices: 60 s", "stock at checkout: 0 s".
+3. **Cost of a miss.** How slow or expensive is computing the answer? If a miss costs 3 ms, a cache barely helps.
+
+Also confirm the slowness isn't a missing index or an N+1 query; see [Why is my database slow?](../../problems/database-is-slow). Caching a slow query only hides it until the cache is cold.
+
+## Options
+
+1. **Don't cache: make the source faster** with an index, a better query or a precomputed column.
+2. **HTTP caching:** `Cache-Control` headers, a CDN, `ETag` revalidation. No application code at all for public, identical responses.
+3. **An in-process cache:** an LRU map in each server. The fastest option, but each server holds its own copy.
+4. **A shared cache (Redis, Memcached):** one copy for every server, with TTLs and explicit invalidation.
+5. **Precompute:** materialized views, summary tables, or a job that writes the answer ahead of time.
+
+## Trade-offs
+
+| Option | Speed-up | Staleness control | Invalidation effort | New failure modes |
+| :--- | :--- | :--- | :--- | :--- |
+| Faster source | Real and permanent | Not needed | None | None |
+| HTTP / CDN | Huge for public content | TTL, revalidation | Purge API | Private data served publicly if headers are wrong |
+| In-process | Highest per hit | TTL per server | Hard across servers | Servers disagree; memory pressure |
+| Redis | High | TTL plus explicit deletes | Moderate | Redis outages, stampedes, stale entries |
+| Precompute | High | Refresh schedule | Refresh jobs | Stale until the next refresh; failed jobs |
+
+The cost that repeats across all of them is **invalidation**: knowing when a copy has become wrong. TTL-only invalidation is simple and predictable. Event-based invalidation is fresher, but every write path has to remember to do it.
+
+## Decision
+
+Cache when **reads greatly outnumber writes, a miss is expensive, and staleness has an agreed limit.** In order of preference: fix the source; use HTTP caching for public content; use a short-TTL cache-aside in Redis (or in-process, with a single server) for the rest.
+
+Start with TTL-only invalidation and a TTL equal to the staleness you agreed on. Add explicit invalidation only for data where waiting for the TTL is too slow.
+
+Don't cache data that must be exact at the moment it is used (balances, stock at checkout, permissions right after they change) unless you also check the source at that moment.
+
+## Implementation
+
+Cache-aside with a TTL, jitter, and a single-flight refill, so a popular key expiring doesn't send a stampede to the database. Node.js with `ioredis`:
+
+```ts
+const inflight = new Map<string, Promise<unknown>>();
+
+export async function cached<T>(key: string, ttlSeconds: number, load: () => Promise<T>): Promise<T> {
+  const hit = await redis.get(key).catch(() => null);
+  if (hit !== null) return JSON.parse(hit) as T;
+
+  // Single flight: concurrent misses in this process share one load.
+  const pending = inflight.get(key);
+  if (pending) return pending as Promise<T>;
+
+  const promise = (async () => {
+    try {
+      const value = await load();
+      // Jitter spreads expiry, so keys written together don't expire together.
+      const ttl = Math.round(ttlSeconds * (0.9 + Math.random() * 0.2));
+      await redis.set(key, JSON.stringify(value), 'EX', ttl).catch(() => {});
+      return value;
+    } finally {
+      inflight.delete(key);
+    }
+  })();
+
+  inflight.set(key, promise);
+  return promise;
+}
+
+// Usage
+const product = await cached(`product:v1:${id}`, 60, () => db.product.findUnique({ where: { id } }));
+```
+
+When a write must be visible immediately, delete the key after the database commit instead of writing the new value into it:
+
+```ts
+await db.product.update({ where: { id }, data });
+await redis.del(`product:v1:${id}`);   // the next read refills from the source of truth
+```
+
+For public responses that are the same for everyone, let HTTP do the work:
+
+```text
+Cache-Control: public, max-age=60, stale-while-revalidate=300
+```
+
+## Verification
+
+- **Hit ratio** above about 80% for the keys that matter (`keyspace_hits` against `keyspace_misses`, or per-key metrics in your app).
+- **The source's load dropped** by roughly the hit ratio, and the endpoint's p95 fell.
+- **Staleness stays within the agreed limit:** update a record and measure how long the old value keeps being served.
+- **A cold cache is safe:** flush it in staging under load. The database should survive the refill.
+
+## Why
+
+A cache trades freshness for speed. That trade is only safe when you know its price, which is why agreeing on how stale is acceptable comes before choosing a tool. Most caching bugs aren't about Redis or TTLs; they're about data that was assumed to be fresh and wasn't.
+
+## When Not To Use
+
+- **Write-heavy or rarely re-read data**, where the hit ratio will be low.
+- **Data that must be exact when a decision is made** (money, stock, access control), unless you re-check the source.
+- **Per-user data with little reuse**, where the number of keys explodes and each is read once.
+- **To hide a slow query you could fix.** The cache goes cold on deploys and during incidents, exactly when you need it.
+
+## Common Mistakes
+
+- **Caching before measuring**, so nobody knows whether it helped.
+- **No TTL**, so any invalidation bug lives forever.
+- **Writing the new value into the cache on every update.** Two concurrent writes can land in the wrong order and leave the older value behind. Deleting the key after commit is simpler and, with a TTL, self-correcting.
+- **Stampedes** when a hot key expires. Use jitter, single-flight refills or `stale-while-revalidate`.
+- **Caching errors or empty results for a long time**, so a brief outage outlives itself.
+- **Wrong HTTP headers**, such as `public` on a personalized response, which lets a CDN serve one user's data to another.

@@ -1,0 +1,185 @@
+---
+title: "Bun"
+question: "តើត្រូវបង្កើត Resilient Services ជាមួយ Connection Pooling, Idempotency, និង Timeouts ក្នុង Bun ដោយរបៀបណា?"
+summary: "Bun.serve Deadlines, Native SQLite/PostgreSQL Connection Pooling, Atomic Idempotency, និង In-Memory Single-Flight Caching ក្នុង Bun។"
+tags: [bun, typescript, performance, runtime, implementation]
+related: [patterns/retry, patterns/idempotency, patterns/caching, patterns/rate-limiting]
+order: 17
+updated: "2026-09-12"
+contributors: [veasna]
+translation: draft
+---
+
+ការអនុវត្ត Patterns ជាក់ស្តែងដោយប្រើសមត្ថភាព Native របស់ Bun 1.1+ និង Web Standard APIs។ ផ្តោតលើ Bun.serve Timeouts, ការគ្រប់គ្រង Connection Pool, Atomic Idempotency, និង In-Memory Single-Flight Caching។
+
+## Timeouts first
+
+Bun គាំទ្រស្តង់ដារ `fetch` ដំណើរការដោយ C++ យ៉ាងលឿន។ ត្រូវប្រើប្រាស់ `AbortSignal.timeout` ដើម្បីការពារ Socket Leaks៖
+
+```ts
+Bun.serve({
+  port: 3000,
+  async fetch(req) {
+    const url = new URL(req.url);
+
+    if (url.pathname === "/rates") {
+      try {
+        const res = await fetch("https://api.example.com/rates", {
+          signal: AbortSignal.timeout(2000)
+        });
+
+        if (!res.ok) {
+          return Response.json({ error: `Upstream HTTP ${res.status}` }, { status: 502 });
+        }
+
+        const data = await res.json();
+        return Response.json(data);
+      } catch (err: any) {
+        if (err.name === "TimeoutError") {
+          return Response.json({ error: "អត្រាប្តូរប្រាក់ API ហួសពេលកំណត់ ២ វិនាទី" }, { status: 504 });
+        }
+        return Response.json({ error: "Internal server error" }, { status: 500 });
+      }
+    }
+
+    return new Response("Not Found", { status: 404 });
+  }
+});
+```
+
+## Retry with backoff
+
+Retry កំហុសបណ្តោះអាសន្នជាមួយ Exponential Backoff និង Full Jitter៖
+
+```ts
+const RETRYABLE_STATUSES = new Set([408, 429, 500, 502, 503, 504]);
+
+export async function fetchWithRetry<T>(url: string, attempts = 3, baseMs = 100): Promise<T> {
+  for (let i = 1; i <= attempts; i++) {
+    try {
+      const res = await fetch(url, { signal: AbortSignal.timeout(2000) });
+      if (!RETRYABLE_STATUSES.has(res.status) && res.ok) {
+        return (await res.json()) as T;
+      }
+      if (i === attempts) throw new Error(`HTTP ${res.status}`);
+    } catch (err: any) {
+      if (i === attempts || (err.name !== "TimeoutError" && !err.message.startsWith("HTTP"))) {
+        throw err;
+      }
+    }
+
+    const delay = Math.random() * Math.min(2000, baseMs * 2 ** (i - 1));
+    await Bun.sleep(delay);
+  }
+  throw new Error("បរាជ័យក្រោយការព្យាយាមច្រើនដង");
+}
+```
+
+## Database connection pool (`bun:sqlite` ឬ Postgres)
+
+Bun មាន SQLite ស្រាប់ដែលដំណើរការលឿនជាមួយ WAL Mode៖
+
+```ts
+import { Database } from "bun:sqlite";
+
+export const db = new Database("production.sqlite", { create: true });
+
+// បើកដំណើរការ Write-Ahead Logging (WAL)
+db.exec("PRAGMA journal_mode = WAL;");
+db.exec("PRAGMA busy_timeout = 5000;"); // រង់ចាំ ៥ វិនាទីពេលមាន Lock
+db.exec("PRAGMA synchronous = NORMAL;");
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS idempotency_keys (
+    key TEXT PRIMARY KEY,
+    response TEXT,
+    created_at INTEGER
+  );
+`);
+```
+
+## Idempotency keys
+
+ដំណើរការ Transaction ដើម្បីធានាថាការបង្កើត Order មិនកើតឡើងស្ទួន៖
+
+```ts
+export function createOrderWithIdempotency(key: string, customerId: string, totalCents: number) {
+  const checkStmt = db.prepare("SELECT response FROM idempotency_keys WHERE key = ?");
+  const insertKeyStmt = db.prepare("INSERT INTO idempotency_keys (key, response, created_at) VALUES (?, NULL, ?)");
+  const updateKeyStmt = db.prepare("UPDATE idempotency_keys SET response = ? WHERE key = ?");
+  const insertOrderStmt = db.prepare("INSERT INTO orders (customer_id, total_cents) VALUES (?, ?) RETURNING id");
+
+  const transaction = db.transaction(() => {
+    const existing = checkStmt.get(key) as { response: string | null } | null;
+    if (existing) {
+      if (existing.response) {
+        return { status: 200, data: JSON.parse(existing.response) };
+      }
+      return { status: 409, data: { error: "សំណើកំពុងដំណើរការ" } };
+    }
+
+    insertKeyStmt.run(key, Date.now());
+
+    const order = insertOrderStmt.get(customerId, totalCents) as { id: number };
+    const responsePayload = JSON.stringify({ orderId: order.id, status: "created" });
+
+    updateKeyStmt.run(responsePayload, key);
+    return { status: 201, data: JSON.parse(responsePayload) };
+  });
+
+  return transaction();
+}
+```
+
+## Single-flight in-memory caching
+
+ការពារបញ្ហា Cache Stampede ដោយប្រើ Map នៃ Promises៖
+
+```ts
+const cache = new Map<string, { value: any; expiry: number }>();
+const inFlight = new Map<string, Promise<any>>();
+
+export async function getCachedProduct(productId: string): Promise<any> {
+  const now = Date.now();
+  const cached = cache.get(productId);
+  if (cached && cached.expiry > now) {
+    return cached.value;
+  }
+
+  let pending = inFlight.get(productId);
+  if (!pending) {
+    pending = (async () => {
+      const query = db.prepare("SELECT * FROM products WHERE id = ?");
+      const product = query.get(productId);
+
+      cache.set(productId, { value: product, expiry: now + 60_000 });
+      return product;
+    })().finally(() => {
+      inFlight.delete(productId);
+    });
+
+    inFlight.set(productId, pending);
+  }
+
+  return pending;
+}
+```
+
+## Background workers (`Worker`)
+
+Bun គាំទ្រ Web Workers ដោយផ្ទាល់សម្រាប់ការងារធ្ងន់ៗ៖
+
+```ts
+// worker.ts
+declare var self: Worker;
+
+self.onmessage = (event: MessageEvent) => {
+  const { orderId } = event.data;
+  console.log(`កំពុងបង្កើតវិក្កយបត្រសម្រាប់ Order ${orderId}`);
+  postMessage({ success: true, orderId });
+};
+
+// ក្នុង Main Server:
+const worker = new Worker(new URL("./worker.ts", import.meta.url).href);
+worker.postMessage({ orderId: "ord_123" });
+```

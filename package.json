@@ -1,0 +1,59 @@
+{
+  "name": "icestack-dev",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Open-source knowledge for better engineering decisions, in English and Khmer.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Veasna-Pen/Deployment-Master.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Veasna-Pen/Deployment-Master/issues"
+  },
+  "keywords": [
+    "engineering-decisions",
+    "knowledge-base",
+    "software-architecture",
+    "trade-offs",
+    "khmer",
+    "mdx",
+    "react"
+  ],
+  "type": "module",
+  "engines": {
+    "node": ">=20.19"
+  },
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "format": "prettier . --write",
+    "format:check": "prettier . --check"
+  },
+  "dependencies": {
+    "@mdx-js/react": "^3.1.1",
+    "@mdx-js/rollup": "^3.1.1",
+    "i18next": "^26.4.2",
+    "lucide-react": "^0.555.0",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "react-i18next": "^17.0.14",
+    "react-markdown": "^10.1.0",
+    "react-router-dom": "^7.18.3",
+    "remark-frontmatter": "^5.0.0",
+    "remark-gfm": "^4.0.1",
+    "remark-mdx-frontmatter": "^5.2.0",
+    "shiki": "^4.4.3"
+  },
+  "devDependencies": {
+    "@shikijs/rehype": "^4.4.3",
+    "@types/node": "^22.14.0",
+    "@vitejs/plugin-react": "^5.0.0",
+    "prettier": "3.9.6",
+    "typescript": "~5.8.2",
+    "vite": "^6.2.0",
+    "yaml": "^2.9.1"
+  }
+}

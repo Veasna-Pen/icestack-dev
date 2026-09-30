@@ -1,0 +1,89 @@
+---
+title: "When a popular key expires: cache stampedes"
+summary: "Stop hundreds of requests from hitting the database at the same moment when a hot cache key expires."
+minutes: 12
+related: [problems/cache-stampede, patterns/distributed-lock]
+updated: "2026-09-29"
+contributors: [Veasna-Pen]
+---
+
+## The problem
+
+It is a sale day. The homepage's "featured products" list is cached for 60 seconds and requested **2,000 times a second**. Building it takes a 400 ms query.
+
+Every minute, for a moment, the database CPU jumps to 100% and some requests time out. The cache is working. So what is happening?
+
+## The idea
+
+When the key expires, **every request that arrives before it is rebuilt also misses**. At 2,000 requests a second, the 400 ms rebuild window lets about **800 requests** run the same expensive query at once. This is a **cache stampede** (also called a thundering herd).
+
+Three simple defences, from simplest to strongest:
+
+1. **Add jitter to the TTL.** Instead of exactly 60 seconds, use 60 plus a random 0 to 10. Keys created together then expire at different moments instead of all at once.
+2. **Let one request rebuild.** The first request to miss takes a short **lock**; the others wait briefly or serve the old value. Only one query runs.
+3. **Refresh early.** Rebuild a hot key in the background shortly before it expires, so readers never see a miss.
+
+You rarely need all three. Jitter is almost free; add a lock only for keys that are both hot and slow to rebuild.
+
+## Example
+
+A lock with Redis `SET NX` (set only if the key does not exist):
+
+```ts
+async function getFeatured() {
+  const cached = await redis.get('featured');
+  if (cached) return JSON.parse(cached);
+
+  const gotLock = await redis.set('lock:featured', '1', 'NX', 'EX', 10);
+  if (!gotLock) {
+    await sleep(100); // someone else is rebuilding; try the cache again
+    return getFeatured();
+  }
+
+  const featured = await db.product.findMany({ where: { featured: true } });
+  const ttl = 60 + Math.floor(Math.random() * 10); // jitter
+  await redis.set('featured', JSON.stringify(featured), 'EX', ttl);
+  await redis.del('lock:featured');
+  return featured;
+}
+```
+
+Now, when `featured` expires, **one** request runs the 400 ms query. The others wait about 100 ms and read the fresh value. The CPU spike disappears.
+
+<Warning title="Always give the lock a TTL">
+If the process holding the lock crashes, the lock's own expiry (`EX 10`) releases it. Without it, nobody could rebuild the key again. In real code, also cap the retries so a waiting request cannot loop forever.
+</Warning>
+
+## Try it
+
+1. Find the most-read key in a cache you run (`redis-cli --hotkeys` needs an LFU eviction policy; application logs work too).
+2. Estimate the stampede: requests per second multiplied by rebuild time in seconds.
+3. If the answer is more than a handful, add jitter to that key's TTL.
+4. If it is in the hundreds, add the single-rebuild lock above and load-test it with a tool such as `autocannon` or `k6`.
+
+## Check yourself
+
+**1. A key gets 50 requests a second and takes 20 ms to rebuild. Do you need a lock?**
+
+<Answer>
+Probably not. About 50 × 0.02 = 1 request misses during a rebuild, which the database handles easily. Jitter is enough, if anything.
+</Answer>
+
+**2. You cache 10,000 products, all loaded when the app starts, each with a TTL of exactly 300 seconds. What happens at minute five?**
+
+<Answer>
+They all expire together, and the database gets 10,000 misses at once. Adding random jitter to the TTL spreads those expiries out over time.
+</Answer>
+
+**3. Why does the lock itself need an expiry?**
+
+<Answer>
+If the request holding the lock crashes before deleting it, the lock would stay forever and no request could ever rebuild the key. The expiry releases it automatically.
+</Answer>
+
+## Key takeaways
+
+- A **stampede** is many requests missing the same hot key at once and all hitting the database.
+- Estimate it: **requests per second × rebuild time**.
+- **Jitter** the TTL almost always; **lock** so only one request rebuilds when the key is hot and slow.
+- Give every lock a TTL, and cap how long waiting requests retry.

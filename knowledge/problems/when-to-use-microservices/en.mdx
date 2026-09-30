@@ -1,0 +1,122 @@
+---
+title: "When should I use microservices?"
+question: "When should I NOT use microservices?"
+summary: "When independent teams need to deploy independently, or parts of the system have genuinely different scaling or reliability needs. Not to fix messy code: a modular monolith gives you the boundaries without the network."
+tags: [microservices, monolith, architecture, teams]
+related: [tradeoffs/monolith-vs-microservices, tradeoffs/sync-vs-async, problems/should-i-use-kafka]
+order: 4
+updated: "2026-09-11"
+---
+
+## Context
+
+A product that started as one application (Laravel, Rails, Django, Express or NestJS) and has grown. Deploys are slower, the code is harder to change, and the team has grown from three people to twelve. Someone proposes splitting it into services: users, orders, payments, notifications.
+
+Microservices are independently deployable services that own their data and talk over the network. Their benefits are as much organizational as technical; their costs are mostly operational.
+
+## Symptoms
+
+Problems that often get *blamed* on the monolith:
+
+- A change in one area breaks unrelated features.
+- The test suite takes 40 minutes, so people batch changes and deploys get scary.
+- Teams wait on each other to merge and release.
+- One heavy feature, such as report generation or video processing, slows everything else down.
+- New developers take months to become productive.
+
+Only some of these come from running a single deployable. Most come from missing module boundaries, slow tests and unclear ownership, and they would follow the code into microservices.
+
+## Diagnose
+
+1. **Is the pain about deploying, or about the code?** If modules are tangled, putting a network between them makes the tangle slower and harder to debug. Map the dependencies first: which parts of the code call which, and which tables each part writes to.
+2. **How many teams, and do they need to ship independently?** A single team of six gains little from independent deploys. Four teams blocking each other's releases gain a lot.
+3. **Do some parts need different scaling or reliability?** A CPU-heavy video transcoder next to a latency-sensitive API is a real reason. "Orders might need to scale one day" is not.
+4. **Can you operate it?** Every service needs CI/CD, monitoring, alerting, on-call, logs with correlation IDs, and a plan for when the calls between services fail.
+5. **Where are the data boundaries?** If two "services" need to join each other's tables in most requests, they are one service.
+
+## Options
+
+1. **Keep the monolith and fix the pain directly:** faster tests, feature flags, code ownership, better CI.
+2. **A modular monolith:** one deployable with enforced module boundaries (a folder or package per domain, no reaching into another module's tables, explicit interfaces).
+3. **Extract one service** where there is a concrete reason: different scaling, a separate team, a different technology.
+4. **Full microservices:** split by business capability, each service with its own data and deploy pipeline.
+
+## Trade-offs
+
+| | Monolith | Modular monolith | One extracted service | Microservices |
+| :--- | :--- | :--- | :--- | :--- |
+| Independent deploys | No | No | For that service | Yes |
+| Local development | Simple | Simple | Mostly simple | Hard: many services, fakes |
+| A change across domains | One PR | One PR | Two PRs and a versioned API | Many coordinated PRs |
+| Failure modes | In-process | In-process | Network, partial failure | Network everywhere, cascading failure |
+| Data consistency | Transactions | Transactions | Outbox or sagas at one edge | Sagas and eventual consistency |
+| Operating cost | Low | Low | Medium | High: platform, tracing, on-call per service |
+| Fits | One or two teams | Two to six teams | Any size, for a specific need | Many teams |
+
+The costs that decide it are the ones people underestimate: transactions that now span services, debugging across network hops, and the platform work (deploys, service discovery, tracing) that has to exist before the first service is useful.
+
+## Decision
+
+**Default to a modular monolith.** Enforce boundaries inside one deployable, and extract a service only when a specific module has a concrete reason: a team that needs its own release schedule, a different scaling profile, or an isolation requirement such as a payments component under stricter compliance.
+
+Revisit when teams keep blocking each other's releases despite good module boundaries, or when one module's load or failures repeatedly affect the rest.
+
+## Implementation
+
+Make the boundaries real inside the monolith first. In a Node.js/TypeScript codebase, give each module a single public entry point and forbid deep imports with a lint rule:
+
+```text
+src/
+  modules/
+    orders/
+      index.ts        # the only public surface of the module
+      internal/…
+    billing/
+      index.ts
+      internal/…
+```
+
+```js
+// eslint.config.js: other modules may import 'modules/billing', never its internals
+export default [
+  {
+    rules: {
+      'no-restricted-imports': ['error', {
+        patterns: [{
+          group: ['**/modules/*/internal/**'],
+          message: 'Import the module entry point instead.'
+        }]
+      }]
+    }
+  }
+];
+```
+
+Each module owns its tables. Other modules call its functions, never its tables. If a module later needs to become a service, its public interface becomes the API and its tables move with it, while the rest of the code barely changes.
+
+## Verification
+
+- **The original pain moved:** lead time from merge to production, the number of release conflicts between teams, or incidents caused by unrelated changes.
+- **The boundaries hold:** the lint rule has no suppressions, and no module queries another module's tables (search for each table name outside its owner).
+- **For an extracted service:** it deploys on its own schedule, and when it is down the rest of the system degrades instead of failing.
+
+## Why
+
+Microservices trade complexity inside a process for complexity between processes. That trade pays off when the organization is the bottleneck: many teams, independent release cycles, different operational needs. It rarely pays off for code quality, because boundaries are a property of the design, not of the deployment. You can have clean boundaries in one process and a "distributed monolith" spread across twenty services.
+
+## When Not To Use
+
+- **Small teams**, one or two teams or fewer than about 15 engineers, without a platform team.
+- **New products** whose domain boundaries are still moving. A wrong service boundary is far more expensive to fix than a wrong module boundary.
+- **To fix a messy codebase.** Fix the modules first.
+- **When most requests need data from most services**, which means the boundaries are in the wrong place.
+- **Without the basics:** automated deploys, centralized logs, tracing and on-call.
+
+## Common Mistakes
+
+- **The distributed monolith:** services that must be deployed together and share one database.
+- **Splitting by technical layer** (an API service, a database service) instead of by business capability.
+- **Synchronous call chains**, where one user request calls five services in turn. Availability multiplies down the chain: five services at 99.9% each give about 99.5%. See [Sync vs async](../../tradeoffs/sync-vs-async).
+- **Shared tables between services**, which couples them more tightly than a monolith ever did.
+- **Extracting too early**, before the team has learned which boundaries are stable.
+- **Forgetting the data.** Splitting code is easy; splitting tables with years of foreign keys is the real project.

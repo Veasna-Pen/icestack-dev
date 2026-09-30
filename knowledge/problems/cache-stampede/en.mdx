@@ -1,0 +1,133 @@
+---
+title: "How do I prevent a cache stampede?"
+question: "Why did my database crash when the cache expired?"
+summary: "When a popular cached key expires, thousands of concurrent requests all miss the cache and hit the database simultaneously (thundering herd). Use probabilistic early recomputation (XFetch) or singleflight mutex locks."
+tags: [cache, redis, performance, database, concurrency]
+related: [problems/database-is-slow, problems/should-i-use-redis, patterns/caching]
+order: 9
+updated: "2026-09-12"
+contributors: [veasna]
+---
+
+## Context
+
+A high-traffic e-commerce homepage or media feed serving 5,000 requests per second. The homepage query is expensive: it aggregates featured products, reviews, and promotional banners, taking about 400 ms to compute in PostgreSQL.
+
+To protect the database, the team cached the response in Redis with a 10-minute Time-To-Live (TTL): `SETEX home_feed 600 JSON_DATA`.
+
+For 9 minutes and 59 seconds, everything is fast: Redis serves responses in 1 ms and database CPU hovers around 5%. Then the 10th minute hits.
+
+## Symptoms
+
+- Database CPU spikes from 5% to 100% in under two seconds.
+- PostgreSQL connection count saturates `max_connections` instantly.
+- API p99 latency explodes from 20 ms to 30+ seconds, returning HTTP 504 Gateway Timeouts across the entire site.
+- The incident repeats in an eerie periodic cycle every 10 minutes (matching the cache TTL).
+
+<Callout type="warning" title="Caching an expensive query does not protect the database when it expires">
+If an endpoint handles 2,000 requests per second and the computation takes 500 ms, then within half a second of cache expiration, **1,000 identical heavy queries** hit the database concurrently. This is the classic **cache stampede** (thundering herd).
+</Callout>
+
+## Diagnose
+
+1. **Correlate database spikes with cache TTL:** Plot database CPU against Redis key eviction logs. If DB CPU spikes occur at precise multiples of your TTL (e.g., every 10 minutes), cache expiration is the trigger.
+2. **Inspect query concurrency in Postgres:** Run `SELECT query, count(*) FROM pg_stat_activity GROUP BY query;`. You will see dozens or hundreds of processes executing the exact same SQL query at the exact same moment.
+3. **Measure calculation duration vs arrival rate:**
+```text
+Concurrent DB Queries = Requests per second × Query computation time (seconds)
+```
+   At 2,000 req/sec and 0.5s query time, 1,000 queries slam into PostgreSQL the moment the key disappears.
+
+## Options
+
+1. **Never expire keys (Infinite TTL) + background refresh cron.** Keep keys in Redis forever; a separate worker recalculates the cache every 5 minutes.
+2. **Distributed Mutex Lock (Singleflight).** When a cache miss occurs, acquire a temporary lock in Redis. Only one request computes the query; the other 999 wait or read stale data.
+3. **Probabilistic Early Expiration (XFetch algorithm).** As the key approaches expiration, requests randomly recalculate the value before it actually expires, with increasing probability.
+4. **Soft TTL + Stale-While-Revalidate.** Store an internal timestamp in the cached payload. When soft TTL expires, serve the stale value immediately to users while asynchronously recalculating in the background.
+
+## Trade-offs
+
+| Strategy | Protection Level | Latency Impact | Complexity |
+| :--- | :--- | :--- | :--- |
+| **Simple TTL (Status Quo)** | **Zero (Crashes DB)** | 30s timeouts on expiry | Low |
+| **Background Cron** | High | 0 ms impact | High (managing cron jobs per key) |
+| **Mutex Lock (Singleflight)** | High (Only 1 query hits DB) | Waiting requests wait 400 ms | Low to Medium |
+| **XFetch / Early Recomputation** | **Maximum (Key never expires)** | **0 ms (Users always get cache hit)** | Medium (math algorithm) |
+
+## Decision
+
+Use a **two-tier defense**:
+1. **For in-process requests:** Use the **Singleflight pattern** so that within any single application instance, multiple concurrent requests for the same key share a single in-flight Promise.
+2. **For distributed cache:** Use **Probabilistic Early Expiration (XFetch)**. Instead of a hard cliff where the key vanishes, the application recalculates the key slightly before expiration. The heavier the read traffic, the higher the probability that someone refreshes the key in advance, ensuring it never runs out.
+
+## Implementation
+
+### Probabilistic Early Expiration (XFetch in TypeScript):
+
+```typescript
+interface CacheEntry<T> {
+  value: T;
+  delta: number;   // Time taken to compute the value in ms
+  expiry: number;  // Epoch timestamp when key expires
+}
+
+// beta > 0 (default 1.0). Higher values trigger earlier recomputation
+export async function getWithXFetch<T>(
+  key: string,
+  ttlMs: number,
+  compute: () => Promise<T>,
+  beta = 1.0
+): Promise<T> {
+  const raw = await redis.get(key);
+
+  if (raw) {
+    const entry: CacheEntry<T> = JSON.parse(raw);
+    const now = Date.now();
+    const remainingTime = entry.expiry - now;
+
+    // XFetch formula: -beta * delta * ln(random())
+    const shouldRecompute = -beta * entry.delta * Math.log(Math.random()) > remainingTime;
+
+    if (!shouldRecompute) {
+      return entry.value; // Cache hit: return immediately!
+    }
+    console.log(`XFetch: Proactively refreshing key "${key}" before expiration`);
+  }
+
+  // Compute fresh value
+  const start = Date.now();
+  const value = await compute();
+  const delta = Date.now() - start;
+
+  const newEntry: CacheEntry<T> = {
+    value,
+    delta,
+    expiry: Date.now() + ttlMs,
+  };
+
+  await redis.set(key, JSON.stringify(newEntry), 'PX', ttlMs);
+  return value;
+}
+```
+
+## Verification
+
+1. **Load test across expiration window:** Run a continuous load test of 3,000 req/sec over a 15-minute window (`k6 run --duration 15m script.js`).
+2. **CPU flatness:** Postgres CPU must remain flat (under 10%) throughout the 10th minute transition.
+3. **Cache hit ratio:** Monitoring should show zero cache misses on the homepage endpoint after the initial boot.
+
+## Why
+
+A standard cache TTL creates a deterministic cliff edge. At time $T$, the data exists; at $T + 1$ ms, it does not.
+
+Because random arrivals in high-traffic systems follow a Poisson distribution, hundreds of requests will inevitably arrive in the microsecond interval after the key is deleted. By introducing probabilistic early recomputation ($-\beta \cdot \delta \cdot \ln(U)$), the cliff is transformed into a continuous gentle slope where exactly one caller refreshes the data before the key can ever expire.
+
+## When Not To Use
+
+- **Low-traffic endpoints:** If a key receives 1 request every 5 minutes, a cache stampede is physically impossible. A simple TTL is completely fine.
+- **Cheap queries:** If the database query executes in 2 ms, 50 concurrent executions will not hurt the database.
+
+## Common Mistakes
+
+- **Setting the same TTL on thousands of keys.** If 100,000 product pages all have `TTL = 3600`, they all expire at the exact same second, causing a cluster-wide database blackout. Always add random jitter to TTLs: `ttl = 3600 + Math.random() * 300`.
+- **Using long mutex timeouts.** If the process holding the lock crashes, other requests wait for the lock timeout. Always keep lock TTLs short (e.g. 2–5 seconds).

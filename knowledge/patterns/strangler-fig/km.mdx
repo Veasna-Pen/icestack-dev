@@ -1,0 +1,170 @@
+---
+title: "Strangler Fig"
+question: "តើខ្ញុំអាចផ្លាស់ប្តូរប្រព័ន្ធ Monolith ចាស់ដ៏ស្មុគស្មាញ ទៅជា Microservices ទំនើបដោយសុវត្ថិភាព ដោយមិនចាំបាច់សរសេរឡើងវិញទាំងអស់ពីសូន្យ (Big-Bang Rewrite) យ៉ាងដូចម្តេច?"
+summary: "ជំនួសផ្នែកជាក់លាក់នៃ Monolith ចាស់បន្តិចម្តងៗជាមួយ Services ថ្មីនៅពីក្រោយ Interception Proxy។ យូរៗទៅ Traffic ដែលរត់ទៅកាន់ Monolith ចាស់នឹងរួមតូចទៅៗ រហូតដល់ប្រព័ន្ធចាស់អាចបិទចោលដោយសុវត្ថិភាព ១០០%។"
+tags: [architecture, migration, strangler-fig, legacy, modernization]
+related: [patterns/api-gateway, problems/when-to-use-microservices, patterns/feature-flags]
+order: 18
+updated: "2026-09-12"
+contributors: [veasna]
+translation: draft
+---
+
+## Context
+
+នៅក្នុងធម្មជាតិ គ្រាប់ពូជនៃដើមជ្រៃ (Strangler Fig) ចាប់កំណើតនៅលើមែកឈើនៃដើមឈើធំមួយ។ បន្ទាប់មក វាក៏ទម្លាក់ឫសខ្យល់ចុះមកដីបន្តិចម្តងៗព័ទ្ធជុំវិញដើមឈើចាស់នោះ។ ឆ្លងកាត់រាប់សិបឆ្នាំ ដើមជ្រៃបានលូតលាស់រឹងមាំរហូតអាចទ្រទ្រង់ខ្លួនឯងបាន ខណៈដែលដើមឈើចាស់ខាងក្នុងបានពុកផុយរលាយបាត់ បន្សល់ទុកនូវដើមឈើថ្មីទាំងស្រុងដែលមានប្រហោងក្នុង។
+
+ក្នុងវិស័យ Software លោក Martin Fowler បានបង្កើតពាក្យ **Strangler Fig Pattern** ដើម្បីពិពណ៌នាអំពីការធ្វើ Migration លើប្រព័ន្ធកេរដំណែលចាស់ៗ (Legacy Systems)។ នៅពេលដែលក្រុមហ៊ុនសម្រេចចិត្តធ្វើទំនើបកម្មលើ Monolith អាយុកាល ១០ ឆ្នាំ ថ្នាក់ដឹកនាំផ្នែកវិស្វកម្មតែងតែស្នើគម្រោង "Big Bang Rewrite"៖ ផ្អាកការធ្វើមុខងារថ្មីៗរយៈពេល ១៨ ខែ ហើយសរសេរប្រព័ន្ធទាំងមូលឡើងវិញពីចំណុចសូន្យដោយប្រើភាសា Go ឬ Rust។
+
+គម្រោង Big-Bang Rewrite ស្ទើរតែទាំងអស់តែងតែបរាជ័យ៖ តម្រូវការអាជីវកម្មប្រែប្រួលអំឡុងពេល ១៨ ខែនោះ, ទំហំការងាររីកធំឡើងៗ, បញ្ហា Edge Cases នៃប្រព័ន្ធចាស់ត្រូវបានគេភ្លេចគិត, ហើយការដាក់ឱ្យប្រើប្រាស់ប្រែក្លាយជាមហន្តរាយដែលមិនអាចស្រោចស្រង់បាន។
+
+Strangler Fig Pattern ផ្តល់នូវជម្រើសដ៏មានសុវត្ថិភាពបំផុត៖ ដាក់ Proxy នៅពីមុខ Monolith។ កាត់យកមុខងារតូចមួយដែលមានព្រំដែនច្បាស់លាស់ (ដូចជា User Authentication ឬ Review) បង្កើតវាជា Service ថ្មី បង្វែរ Traffic ទៅកាន់វា ហើយទុកឱ្យមុខងារផ្សេងទៀតរត់លើ Monolith ដដែល។ ធ្វើបែបនេះបន្តិចម្តងៗរហូតដល់ Monolith ចាស់ទទេស្អាត។
+
+## Symptoms
+
+- ក្រុមហ៊ុនព្យាយាម "សរសេរ Monolith ឡើងវិញពីសូន្យ" តែត្រូវពន្យារពេលម្តងហើយម្តងទៀត អស់លុយរាប់លានដុល្លារ ហើយចុងក្រោយត្រូវលុបចោលគម្រោងចោល។
+- ការ Deploy កូដទៅកាន់ Legacy Monolith ចំណាយពេលរាប់ម៉ោង ទាមទារការធ្វើតេស្តដោយដៃរាប់សន្លឹក Excel និងតែងតែបង្កឱ្យមាន Outage ដាច់ប្រព័ន្ធ។
+- បច្ចេកវិទ្យាចាស់ៗ (PHP 5.4, Python 2.7, Java 7, Frameworks ហួសសម័យ) ធ្វើឱ្យពិបាកជ្រើសរើសបុគ្គលិកថ្មីៗមកធ្វើការ។
+- មិនអាចបញ្ចេញមុខងារអាជីវកម្មថ្មីៗបាន ព្រោះ Codebase ចាស់ផុយស្រួយពេក ខ្លាចកែត្រង់នេះបាក់ត្រង់នោះ។
+
+<Callout type="warning" title="Big-Bang Rewrite គឺជាគម្រោងដែលប្រឈមហានិភ័យខ្ពស់បំផុតក្នុងវិស្វកម្ម Software">
+ប្រព័ន្ធដែលដំណើរការក្នុង Production អស់រយៈពេល ១០ ឆ្នាំផ្ទុកទៅដោយកូដជួសជុល Bug និង Edge Cases រាប់ពាន់ដែលគ្មានក្នុងឯកសារ។ ការសរសេរឡើងវិញពីសូន្យនឹងមើលរំលងចំណុចទាំងនោះជាមិនខាន ដែលនាំឱ្យបាត់បង់អតិថិជនភ្លាមៗក្រោយពេល Launch។
+</Callout>
+
+## Diagnose
+
+1. **គូសព្រំដែន Domain ក្នុង Monolith៖** តើអ្នកអាចកំណត់ Bounded Contexts ដាច់ដោយឡែក (ដូចជា Billing, Notifications, Catalog, Orders) ក្នុង Monolithic Database បានដែរឬទេ?
+2. **ពិនិត្យបរិមាណ Traffic តាម Route នីមួយៗ៖** ពិនិត្យ NGINX ឬ Ingress Logs។ តើ URL Path ណាខ្លះដែលមាន Traffic ខ្ពស់បំផុត ហើយ Route ណាដែលមាន Error ច្រើនជាងគេ?
+3. **ពិនិត្យមើលការពាក់ព័ន្ធទិន្នន័យ (Data Coupling)៖** តើ Module ដែលអ្នកចង់កាត់ចេញ មានការ Join តារាង SQL ឆ្លងកាត់ ឬមាន Foreign Key ជាប់ជាមួយតារាងដែលមិនពាក់ព័ន្ធដែរឬទេ?
+4. **វាយតម្លៃឯករាជ្យភាពរបស់ក្រុមការងារ៖** តើក្រុមនីមួយៗកំពុងជាប់គាំងដោយសារតែត្រូវរង់ចាំ Deployment Pipeline រួមគ្នារបស់ Monolith មែនទេ?
+
+## Options
+
+1. **Big Bang Rewrite ពីសូន្យ៖** សរសេរស្ថាបត្យកម្មនិងកូដឡើងវិញទាំងអស់ពីចំណុចសូន្យ រួចប្តូរ DNS នៅពាក់កណ្តាលអធ្រាត្រ។ (ហានិភ័យមហន្តរាយ អត្រាបរាជ័យខ្ពស់បំផុត)។
+2. **Strangler Fig តាម Edge Proxy (Layer 7 Routing)៖** ដាក់ API Gateway (Envoy, NGINX, Cloudflare) នៅពីមុខ Monolith។ បង្វែរ `/api/v1/auth/*` ទៅ Service ថ្មី ខណៈដែល Route ផ្សេងទៀតរត់ទៅកាន់ Monolith ដដែល។
+3. **Database-first Strangler (Change Data Capture / CDC)៖** ចម្លងតារាង Database ទៅកាន់ Database ថ្មីដោយប្រើ Debezium រួចបង្កើត Service ថ្មីដើម្បីអានពី Replica មុនពេលបង្វែរការសរសេរ។
+4. **In-process Strangler (Module Extraction)៖** កែសម្រួលកូដ Spaghetti ក្នុង Monolith ឱ្យទៅជា Internal Module ស្អាតបាតសិន មុនពេលទាញវាចេញមកជា Network Service ខាងក្រៅ។
+
+## Trade-offs
+
+| យុទ្ធសាស្ត្រ | ការរំខានដល់អាជីវកម្ម | ហានិភ័យនៃបរាជ័យធ្ងន់ធ្ងរ | រយៈពេលទទួលបានផលដំបូង | ភាពស្មុគស្មាញប្រតិបត្តិការ |
+| :--- | :--- | :--- | :--- | :--- |
+| **Big Bang Rewrite** | ទាំងស្រុង (ផ្អាកមុខងារថ្មី) | ខ្ពស់បំផុត | ១២ ដល់ ២៤ ខែ | ខ្ពស់ខ្លាំងពេល Cutover |
+| **Strangler Fig Proxy** | សូន្យ (បញ្ចេញជាប្រចាំ) | ទាបបំផុត (ម្តងបន្តិចៗ) | **២ ដល់ ៤ សប្តាហ៍** | មធ្យម (គ្រប់គ្រង Routing) |
+| **Database-first CDC** | ទាប | ទាប | ២ ដល់ ៣ ខែ | ខ្ពស់ (Sync ទិន្នន័យ) |
+
+## Decision
+
+- **កុំយល់ព្រមលើគម្រោង Big Bang Rewrite ជាដាច់ខាត៖** ធ្វើទំនើបកម្មបន្តិចម្តងៗ ឬកុំធ្វើតែម្តង។
+- **ដាក់ Strangler Proxy នៅថ្ងៃដំបូងបំផុត៖** មុននឹងសរសេរកូដ Microservice សូម្បីតែមួយជួរ ត្រូវដាក់ Reverse Proxy (NGINX, Envoy, AWS ALB) នៅពីមុខ Monolith ជាមុនសិន ដោយកំណត់ឱ្យ Traffic 100% រត់កាត់វាទៅកាន់ Monolith។
+- **ជ្រើសរើសផ្នែកដំបូងដែលត្រូវកាត់ចេញឱ្យបានឆ្លាតវៃ៖**
+  - *បេក្ខភាពល្អដំបូងគេ:* មុខងារដែលផ្តោតលើការអាន (Read-heavy) និងមានព្រំដែន API ច្បាស់លាស់ (ដូចជា Search recommendations, ការបង្កើត PDF Invoice, Webhook dispatcher)។
+  - *បេក្ខភាពមិនល្អដំបូងគេ:* ប្រព័ន្ធកត់ត្រាបញ្ជីស្នូលហិរញ្ញវត្ថុដែលមាន Foreign Key ជាប់ ៤០ តារាង។
+- **ប្រើប្រាស់ Shadow Traffic ដើម្បីផ្ទៀងផ្ទាត់៖** នៅពេលកាត់មុខងារសរសេរ (Write) ត្រូវបញ្ជូន Traffic ទៅកាន់ទាំង Monolith និង Service ថ្មីព្រមគ្នា (Shadow Traffic) រួចប្រៀបធៀបលទ្ធផលក្នុង Background។ នៅពេលលទ្ធផលដូចគ្នា ៩៩.៩៩៩% ទើបប្តូរ Route មេទៅកាន់ Service ថ្មី។
+- **លុបកូដចាស់ចោលជាប្រចាំ៖** នៅពេល Endpoint ណាមួយត្រូវបានផ្លាស់ប្តូរជោគជ័យ ១០០% ត្រូវលុបកូដចាស់ និងតារាងចាស់ដែលលែងប្រើចេញពី Monolith ភ្លាម។
+
+## Implementation
+
+### 1. ការកំណត់ Routing លើ Edge Proxy (NGINX)៖
+
+```nginx
+# Strangler Proxy Routing Table
+upstream legacy_monolith {
+    server monolith.internal:8080;
+}
+
+upstream modern_auth_service {
+    server auth-v2.internal:4000;
+}
+
+upstream modern_notification_service {
+    server notifications-v2.internal:5000;
+}
+
+server {
+    listen 443 ssl;
+    server_name api.company.com;
+
+    # ១. ផ្នែកដែលបានកាត់ចេញទី ១: ប្រព័ន្ធ Authentication (Service ថ្មី)
+    location /api/v1/auth/ {
+        proxy_pass http://modern_auth_service;
+        proxy_set_header X-Strangled-By "auth-v2";
+    }
+
+    # ២. ផ្នែកដែលបានកាត់ចេញទី ២: ប្រព័ន្ធ Notifications (Service ថ្មី)
+    location /api/v1/notifications/ {
+        proxy_pass http://modern_notification_service;
+        proxy_set_header X-Strangled-By "notifications-v2";
+    }
+
+    # ៣. លំនាំដើម: រាល់ Route ផ្សេងទៀតទាំងអស់នៅតែរត់ទៅកាន់ Monolith ចាស់
+    location / {
+        proxy_pass http://legacy_monolith;
+        proxy_set_header X-Strangled-By "legacy-monolith";
+    }
+}
+```
+
+### 2. កូដប្រៀបធៀប Shadow Traffic (ផ្ទៀងផ្ទាត់លទ្ធផលមុនពេល Cutover)៖
+
+```typescript
+export async function handleStrangledRequest(req: Request): Promise<Response> {
+  // ១. ហៅទៅកាន់ Monolith ចាស់ជាចម្បង (ប្រគល់លទ្ធផលទៅឱ្យ User ភ្លាម)
+  const legacyResponse = await fetch('http://monolith.internal/orders/calculate', {
+    method: 'POST',
+    body: JSON.stringify(req.body),
+    headers: { 'Content-Type': 'application/json' },
+  });
+  const legacyData = await legacyResponse.clone().json();
+
+  // ២. បញ្ជូនសំណើ Shadow ទៅកាន់ Service ថ្មីក្នុង Background ដោយមិនឱ្យរំខាន User ឡើយ
+  queueMicrotask(async () => {
+    try {
+      const newResponse = await fetch('http://orders-v2.internal/calculate', {
+        method: 'POST',
+        body: JSON.stringify(req.body),
+        headers: { 'Content-Type': 'application/json' },
+        signal: AbortSignal.timeout(2000),
+      });
+      const newData = await newResponse.json();
+
+      // ប្រៀបធៀបលទ្ធផលដើម្បីធានាថាការគណនាទាំងពីរដូចគ្នា ១០០%
+      if (JSON.stringify(legacyData) !== JSON.stringify(newData)) {
+        console.error('[Strangler Drift] លទ្ធផលមិនត្រូវគ្នាទេរវាងប្រព័ន្ធចាស់ និងថ្មី!', {
+          input: req.body,
+          legacy: legacyData,
+          modern: newData,
+        });
+      }
+    } catch (err) {
+      console.warn('[Strangler Shadow] សំណើ Shadow ជួបបញ្ហា:', (err as Error).message);
+    }
+  });
+
+  return legacyResponse;
+}
+```
+
+## Verification
+
+1. **ការធ្វើតេស្ត Proxy Transparency៖** ដាក់ Strangler Proxy នៅពីមុខ Monolith។ ផ្ទៀងផ្ទាត់ថា Automated Test Suite ទាំងអស់ដំណើរការជាប់ដោយគ្មាន Error សូម្បីតែមួយ មុននឹងចាប់ផ្តើមកាត់ Service ណាមួយចេញ។
+2. **ផ្ទៀងផ្ទាត់ភាពត្រឹមត្រូវនៃ Shadow Traffic៖** ដំណើរការ Shadow Traffic លើ ១០០,០០០ Production Requests។ ធានាថា Error rate របស់ Service ថ្មីគឺ ០% ហើយទិន្នន័យខុសគ្នា (Mismatch) គឺ ០.០០%។
+3. **Canary Cutover៖** បង្វែរ ៥% នៃ Live Traffic ទៅកាន់ Service ថ្មីតាមរយៈ Weighted Proxy Routing។ តាមដាន Latency និង Error Rate រយៈពេល ៤៨ ម៉ោងមុននឹងដំឡើងដល់ ១០០%។
+4. **ផ្ទៀងផ្ទាត់ការលុបកូដចាស់៖** ក្រោយពេលបង្វែរ Traffic 100% ទៅកាន់ Auth Service ថ្មី លុប Auth Controller ចេញពី Monolith ហើយផ្ទៀងផ្ទាត់ថាមិនមាន Runtime Error ណាមួយកើតឡើងឡើយ។
+
+## Why
+
+ប្រព័ន្ធចាស់ៗរងគ្រោះដោយសារតែភាពជោគជ័យរបស់ខ្លួនឯង៖ ពួកគេបានបង្កើតប្រាក់ចំណូលដែលជួយឱ្យក្រុមហ៊ុនអាចរីកចម្រើនមកដល់សព្វថ្ងៃ។ ការព្យាយាមជំនួសពួកគេដោយការសរសេរឡើងវិញទាំងអស់ គឺជាការមើលស្រាលលើបទពិសោធន៍អាជីវកម្មដែលបង្កប់ក្នុងកូដចាស់ៗទាំងនោះ។
+
+Strangler Fig Pattern ប្រែក្លាយវិបត្តិដ៏គួរឱ្យភ័យខ្លាច ទៅជាការងារវិស្វកម្មធម្មតាដែលមានសុវត្ថិភាពខ្ពស់។ តាមរយៈការជំនួសប្រព័ន្ធម្តងមួយមុខងារៗខណៈពេលកំពុងដំណើរការក្នុង Production តម្លៃអាជីវកម្មត្រូវបានបង្កើតឡើងរៀងរាល់ Sprint ហានិភ័យធ្លាក់ចុះទាបបំផុត ហើយក្រុមហ៊ុនមិនចាំបាច់ផ្អាកការបញ្ចេញមុខងារថ្មីៗឡើយ។
+
+## When Not To Use
+
+- **កម្មវិធីតូចៗ (ក្រោម ១០,០០០ ជួរកូដ)៖** ប្រសិនបើកម្មវិធីតូចមួយអាចសរសេរឡើងវិញដោយវិស្វករពីរនាក់ក្នុងពេលពីរអាទិត្យ ការរៀបចំ Proxy Routing និង Shadow Traffic គឺលើសពីតម្រូវការ។
+- **ប្រព័ន្ធចាស់ដែលលែងមានអ្នកប្រើប្រាស់៖** ប្រសិនបើប្រព័ន្ធនោះរៀបនឹងត្រូវបិទចោល គ្រាន់តែ Export ទិន្នន័យទុក រួចបិទម៉ាស៊ីនចោលជាការស្រេច។
+
+## Common Mistakes
+
+- **ចាប់ផ្តើមជាមួយសេវាកម្មដែលស្មុគស្មាញជាងគេមុន៖** ព្យាយាមកាត់ប្រព័ន្ធ Billing ស្នូលមុនគេ ដែលធ្វើឱ្យជាប់គាំងលើ Database Dependency អស់រយៈពេលមួយឆ្នាំ។ ត្រូវចាប់ផ្តើមពីមុខងារតូចៗនៅចុងមែកជាមុន។
+- **មិនព្រមលុបកូដចាស់ចោល៖** ទុកឱ្យកូដចាស់បន្តដំណើរការក្នុង Monolith រហូត ដែលនាំឱ្យត្រូវចំណាយកម្លាំងមើលថែទាំងប្រព័ន្ធចាស់ និងប្រព័ន្ធថ្មីព្រមគ្នា។
+- **ការចែករំលែក Database ផ្ទាល់៖** អនុញ្ញាតឱ្យ Service ថ្មីអាននិងសរសេរដោយផ្ទាល់ទៅកាន់តារាង Database របស់ Monolith ចាស់ ដែលបង្កើតជាការចងភ្ជាប់ស្អិតរមួតសារជាថ្មី។

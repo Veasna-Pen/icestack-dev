@@ -1,0 +1,12 @@
+{
+  "search": "Search",
+  "close": "Close",
+  "viewOnGithub": "View on GitHub",
+  "editThisPage": "Edit this page",
+  "proposeTopic": "Propose a topic",
+  "thinkWithAi": "Think it through with AI",
+  "topicCount_one": "{{count}} topic",
+  "topicCount_other": "{{count}} topics",
+  "stepCount_one": "{{count}} step",
+  "stepCount_other": "{{count}} steps"
+}

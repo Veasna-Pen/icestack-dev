@@ -1,0 +1,121 @@
+---
+title: "Sync vs async"
+question: "Should this operation be synchronous or asynchronous?"
+summary: "Keep it synchronous when the caller needs the result to continue, and the call is fast and reliable. Make it asynchronous when the work is slow, can fail on its own, or has more than one consumer. Then you owe the user a status, and the system idempotency."
+tags: [architecture, queues, events, latency, reliability]
+related: [problems/should-i-use-kafka, patterns/idempotency, patterns/retry, tradeoffs/monolith-vs-microservices]
+order: 2
+updated: "2026-09-11"
+---
+
+## Context
+
+Every operation that crosses a boundary (another service, a third-party API, a slow computation) raises the same choice: wait for it inside the request, or record the intent and do the work later. Checkout, sign-up, file uploads, reports, notifications and webhooks all face it.
+
+*Synchronous* here means the caller waits for the result in the same request. *Asynchronous* means the caller gets an acknowledgement now and the work happens in the background, through a queue, a job or an event.
+
+## Symptoms
+
+- Requests time out because they wait on slow side work: generating PDFs, processing images, sending emails.
+- A third-party outage makes your own endpoint fail.
+- p99 latency is dominated by one downstream call.
+- Or the opposite: users see "processing…" for things that should be instant, and support gets "did my payment go through?" tickets.
+
+## Diagnose
+
+For the operation in question:
+
+1. **Does the caller need the result to continue?** A login needs the session now. A welcome email doesn't.
+2. **How long does it take at p99?** Anything regularly over a second or two inside a user's request is a candidate for async.
+3. **What happens when it fails?** If the user must know at once (the card was declined), keep it sync. If it can be retried quietly (send the receipt), make it async.
+4. **How many parties care?** One caller: a direct call is fine. Several independent reactions to the same fact: publish an event.
+5. **Is the dependency reliable?** In a synchronous chain, your availability is at most the product of everyone else's.
+
+## Options
+
+1. **A synchronous call**, with a timeout.
+2. **Hybrid:** do the essential part synchronously and defer the rest.
+3. **An asynchronous job:** enqueue the work, return `202 Accepted` with a status URL, and let the client poll or be notified.
+4. **An asynchronous event:** publish "order placed" and let any number of consumers react independently.
+
+## Trade-offs
+
+| | Synchronous | Hybrid | Async job | Async event |
+| :--- | :--- | :--- | :--- | :--- |
+| Result available | Immediately | The essential part now | Later, by polling or notification | Later, per consumer |
+| User experience | Simple | Simple for the core | Needs a status UI | Needs a status UI |
+| Coupling to the dependency | Tight: its outage is yours | Tight for the core only | Loose | Loosest |
+| Latency | The sum of the chain | The core only | Just the enqueue | Just the publish |
+| Failure handling | The caller handles it now | Split | Retries and a dead-letter queue | Per consumer |
+| Consistency | Immediate | Mixed | Eventual | Eventual |
+| Debugging | One trace | Two paths | Needs job IDs and tracing | Needs correlation across consumers |
+| Needs idempotency | Only if retried | For the deferred part | Yes | Yes |
+
+The central trade: **async buys latency and isolation, and pays with immediacy and simplicity.** You swap "it either worked or it didn't" for "it will work eventually, and here is how to find out".
+
+## Decision
+
+- **Synchronous** when the caller needs the answer to proceed and the call is fast (tens of milliseconds) and reliable: authentication, reads, validation, price calculation.
+- **Hybrid** for most business flows: do what the user must see now (create the order, authorize the payment) synchronously, and defer the rest (receipts, analytics, search indexing, fulfillment).
+- **An async job** for slow work with one consumer: reports, exports, media processing. Return `202` and a status resource.
+- **An async event** when several independent parts of the system react to the same fact.
+
+Revisit if async work regularly finishes later than users expect, or if a synchronous dependency's outages keep turning into yours.
+
+## Implementation
+
+The hybrid pattern in an Express handler. Creating the order and authorizing payment are synchronous; everything else goes through an outbox, so it is queued if and only if the order commits:
+
+```ts
+app.post('/orders', async (req, res) => {
+  // Synchronous: the user needs to know these succeeded.
+  const order = await db.transaction(async tx => {
+    const created = await tx.orders.insert(req.body);
+    await tx.outbox.insert({ topic: 'order.placed', key: created.id, payload: { orderId: created.id } });
+    return created;
+  });
+  await payments.authorize(order, { idempotencyKey: `auth:${order.id}`, timeoutMs: 3000 });
+
+  // Receipts, analytics and fulfillment run later, from the outbox.
+  res.status(201).json(order);
+});
+```
+
+For long-running work, acknowledge the request and give the client a way to check on it:
+
+```ts
+app.post('/reports', async (req, res) => {
+  const job = await jobs.enqueue('generate-report', { userId: req.user.id, range: req.body.range });
+  res.status(202).location(`/reports/jobs/${job.id}`).json({ id: job.id, status: 'queued' });
+});
+
+app.get('/reports/jobs/:id', async (req, res) => {
+  const job = await jobs.get(req.params.id);
+  res.json({ id: job.id, status: job.status, resultUrl: job.resultUrl ?? null });
+});
+```
+
+## Verification
+
+- **Latency:** request p95 and p99 no longer include the deferred work.
+- **Isolation:** take the email provider down in staging. Orders still succeed, and the receipts go out once it recovers.
+- **Completion:** measure the time from request to async completion at p95, and alert on the age of the oldest queued item, not just the queue length.
+- **Correctness:** replay jobs and events. Consumers are idempotent, so nothing happens twice.
+
+## Why
+
+A synchronous call borrows the other system's availability and latency for the length of the request. That's fine when the other system is fast, reliable and essential. Going asynchronous stops the borrowing: the request only depends on writing the intent down. What you give up is certainty in the moment, which is why asynchronous designs need status, retries and idempotency before anyone can trust them.
+
+## When Not To Use
+
+- **Async for things users expect instantly**, like a search result or a login. It adds complexity and makes the product feel broken.
+- **Synchronous chains across many services**, where every hop multiplies the chance of failure and adds latency.
+- **Async without a way to see status or failures**, which turns errors into silence.
+
+## Common Mistakes
+
+- **Fire-and-forget without an outbox:** publishing after the commit in the same process, so a crash in between loses the message.
+- **Moving work to the background but keeping the user waiting**, by polling for the result inside the same request.
+- **No dead-letter queue**, so poison messages retry forever or quietly disappear.
+- **Synchronous calls without timeouts**, so one slow dependency holds threads and connections until the whole service stalls.
+- **Assuming order:** async consumers can see events out of order. Design for it, or key messages by entity.

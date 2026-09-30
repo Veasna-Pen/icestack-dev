@@ -1,0 +1,160 @@
+---
+title: "API Gateway & BFF"
+question: "How do I route, authenticate, and aggregate dozens of microservices for web, mobile, and third-party clients?"
+summary: "Place a single entry point reverse proxy in front of microservices to centralize SSL termination, authentication, rate limiting, request routing, and response aggregation (BFF pattern)."
+tags: [architecture, microservices, api-gateway, bff, routing]
+related: [problems/when-to-use-microservices, patterns/rate-limiting, tradeoffs/rest-vs-grpc]
+order: 11
+updated: "2026-09-12"
+contributors: [veasna]
+---
+
+## Context
+
+When an application is split into dozens of backend microservices (orders, catalog, reviews, payments, shipping), client applications (React web apps, iOS/Android native apps, partner webhooks) need to interact with them.
+
+If clients connect directly to individual microservices, major problems emerge: clients must know internal IP addresses and ports, mobile apps must make 15 separate network round-trips to render a single product screen, every individual microservice must duplicate authentication and CORS logic, and internal API refactorings break public mobile clients.
+
+An **API Gateway** acts as the single public entry point that encapsulates internal microservice architecture. A specialized variation, the **Backend-for-Frontend (BFF)**, tailors endpoints specifically for different client form factors (e.g. mobile vs desktop).
+
+## Symptoms
+
+- A single mobile screen requires sending 10 to 20 separate HTTP requests across cell towers, causing slow page loads and rapid battery drain.
+- Every microservice reimplements its own authentication verification, JWT parsing, rate limiting, and CORS headers.
+- Changing an internal microservice's URL or splitting a database table requires updating and releasing the iOS and Android mobile apps.
+- Internal service ports and endpoints are exposed directly to the public internet, multiplying the attack surface.
+
+<Callout type="warning" title="Direct client-to-microservice communication creates distributed monoliths">
+Without a gateway, any change to internal service boundaries breaks external clients and ties frontend release cycles directly to backend architecture.
+</Callout>
+
+## Diagnose
+
+1. **Count client round-trips:** Open the network tab on your mobile app or web homepage. How many distinct backend API calls are fired to render the initial view?
+2. **Audit cross-cutting concerns:** Are security policies, TLS certificates, rate limits, and authentication middlewares duplicated across 10 different codebases?
+3. **Inspect protocol compatibility:** Do internal services want to use binary gRPC or thrift, but frontend clients only speak JSON/REST over HTTP?
+4. **Review CORS configuration:** Are your microservices struggling with inconsistent CORS origin headers and duplicate preflight `OPTIONS` requests?
+
+## Options
+
+1. **Direct client-to-microservice:** Clients talk directly to microservices via public DNS records. (Brittle, insecure, high mobile network latency).
+2. **Centralized API Gateway (NGINX, Kong, Envoy, Traefik):** A high-performance reverse proxy that handles TLS termination, central routing, rate limiting, and JWT authentication at Layer 7.
+3. **Backend-for-Frontend (BFF) pattern:** Dedicated lightweight Node.js/Go gateways for each client platform: one BFF for the mobile app (returning aggregated, compact JSON) and one BFF for the web app.
+4. **GraphQL Gateway (Apollo Federation):** A unified GraphQL schema gateway that compiles subgraphs from underlying microservices into a single queryable endpoint.
+
+## Trade-offs
+
+| Strategy | Client Latency | Security Surface | Protocol Flexibility | Operational Complexity |
+| :--- | :--- | :--- | :--- | :--- |
+| **Direct Microservices** | High (15 round trips) | Weak (many public endpoints) | Low (REST only) | Low (no gateway) |
+| **Centralized Gateway** | Medium (routing only) | High (single firewall) | High (gRPC transcoding) | Moderate |
+| **Backend-for-Frontend (BFF)** | Lowest (1 aggregated call) | High | Highest (custom shapes) | Moderate to High |
+| **GraphQL Federation** | Lowest | High | Flexible | High |
+
+## Decision
+
+- **Use an API Gateway as the sole entry point:** No internal microservice should have a public IP address or ingress route. Only the gateway faces the public internet.
+- **Offload cross-cutting concerns to the Gateway:** Centralize SSL/TLS termination, JWT signature validation, global rate limiting, and CORS handling at the edge.
+- **Adopt the BFF pattern for complex client interfaces:** When mobile or web interfaces require aggregating data from 5+ services, create a lightweight BFF service that fetches internal services over high-speed VPC networks and returns a single, minimal JSON payload to the client.
+- **Do not put heavy business logic in the Gateway:** Gateways should route, authenticate, and aggregate. Avoid embedding complex domain rules or database writes directly inside gateway plugins.
+
+## Implementation
+
+### 1. BFF Aggregation Endpoint in TypeScript:
+
+```typescript
+import express from 'express';
+
+export const bffRouter = express.Router();
+
+// Single mobile endpoint aggregating Product, Inventory, and Reviews
+bffRouter.get('/mobile/product/:id', async (req, res) => {
+  const { id } = req.params;
+  const authHeader = req.headers.authorization;
+
+  try {
+    // Fetch all 3 internal microservices concurrently over internal private network
+    const [productRes, inventoryRes, reviewsRes] = await Promise.all([
+      fetch(`http://product-service.internal/products/${id}`, { headers: { authorization: authHeader! } }),
+      fetch(`http://inventory-service.internal/stock/${id}`),
+      fetch(`http://review-service.internal/reviews/summary?productId=${id}`),
+    ]);
+
+    if (!productRes.ok) return res.status(productRes.status).json({ error: 'Product not found' });
+
+    const product = await productRes.json();
+    const inventory = inventoryRes.ok ? await inventoryRes.json() : { inStock: false, availableQty: 0 };
+    const reviews = reviewsRes.ok ? await reviewsRes.json() : { averageRating: 0, totalCount: 0 };
+
+    // Return a streamlined, mobile-optimized payload (reducing bandwidth by 70%)
+    return res.json({
+      id: product.id,
+      title: product.name,
+      priceFormatted: `$${(product.priceCents / 100).toFixed(2)}`,
+      inStock: inventory.availableQty > 0,
+      rating: reviews.averageRating,
+      reviewCount: reviews.totalCount,
+      thumbnailUrl: product.images[0]?.url || null,
+    });
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to aggregate product view', details: (err as Error).message });
+  }
+});
+```
+
+### 2. Reverse Proxy Routing Configuration in Envoy / NGINX:
+
+```nginx
+# NGINX Edge Gateway Configuration
+server {
+    listen 443 ssl http2;
+    server_name api.mycompany.com;
+
+    ssl_certificate /etc/ssl/certs/api.crt;
+    ssl_certificate_key /etc/ssl/private/api.key;
+
+    # Centralized Rate Limiting
+    limit_req zone=global_ip burst=20 nodelay;
+
+    # Global CORS Handling
+    add_header 'Access-Control-Allow-Origin' 'https://www.mycompany.com' always;
+    add_header 'Access-Control-Allow-Methods' 'GET, POST, PUT, DELETE, OPTIONS' always;
+
+    # Route to BFF
+    location /mobile/ {
+        proxy_pass http://mobile-bff-service.internal:3000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+    }
+
+    # Route to Orders Service
+    location /v1/orders/ {
+        proxy_pass http://order-service.internal:8080/;
+        proxy_set_header X-Request-ID $request_id;
+    }
+}
+```
+
+## Verification
+
+1. **Client round-trip reduction:** Measure the time required to render the mobile home view. Confirm that total network time decreases by 60–80% compared to multiple direct requests.
+2. **Security perimeter check:** Run a port scan (nmap) on internal service nodes. Verify that only ports 80/443 on the API Gateway are exposed publicly.
+3. **CORS preflight verification:** Send an `OPTIONS` request to `/v1/orders/`. Verify that the gateway returns standard `Access-Control-Allow-*` headers in < 5 ms without forwarding the preflight call to the backend microservice.
+4. **Fail-fast rate limiting:** Send 100 requests in 1 second. Confirm that the gateway returns `429 Too Many Requests` at the edge before backend microservices consume CPU.
+
+## Why
+
+A distributed microservice architecture solves team scaling and deployment independence on the backend, but it introduces massive communication friction for frontend clients.
+
+The API Gateway and BFF patterns reconcile this tension. They provide the backend engineering team with the freedom to refactor and split microservices without breaking public clients, while providing frontend clients with fast, secure, and tailored APIs.
+
+## When Not To Use
+
+- **Monolithic applications:** If you run a single Ruby on Rails, Django, or Laravel monolith, an API gateway is unnecessary extra hops and latency.
+- **Low-latency internal cluster communication:** Service-to-service communication within the same private network should communicate directly or via a service mesh, rather than looping back through the public API gateway.
+
+## Common Mistakes
+
+- **"Smart Gateway, Dumb Services" anti-pattern:** Writing heavy business logic, database queries, or domain validation inside the gateway. The gateway should remain a reverse proxy and aggregator.
+- **Single massive BFF for all platforms:** Building one giant BFF that tries to serve IoT, mobile, web, and partner APIs recreates a monolithic bottleneck. Keep BFFs scoped to specific client teams.
+- **Ignoring timeouts on aggregated calls:** In a BFF that calls 4 internal services, if one internal call hangs for 30 seconds without a timeout, the entire aggregated response hangs. Always use `Promise.all` with strict timeouts and graceful defaults.

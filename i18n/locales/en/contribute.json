@@ -1,0 +1,99 @@
+{
+  "heading": "Share what you learned the hard way",
+  "lead": "IceStack shouldn't depend on one person writing everything. If you've debugged it, operated it or regretted it in production, your experience belongs here.",
+  "whatYouCan": "What you can contribute",
+  "types": {
+    "realProblems": {
+      "label": "Real problems",
+      "detail": "The question you had to answer at work."
+    },
+    "approaches": {
+      "label": "Different approaches",
+      "detail": "The option a page didn't consider."
+    },
+    "tradeoffs": {
+      "label": "Trade-offs",
+      "detail": "What it cost you that nobody mentioned."
+    },
+    "lessons": {
+      "label": "Production lessons",
+      "detail": "What happened at 3 a.m., anonymized."
+    },
+    "examples": {
+      "label": "Implementation examples",
+      "detail": "The same pattern, in your stack."
+    },
+    "mistakes": {
+      "label": "Common mistakes",
+      "detail": "The trap you fell into, so others don’t."
+    }
+  },
+  "howItWorks": "How it works",
+  "steps": {
+    "pick": {
+      "title": "Pick or propose a topic",
+      "body": "Check the open issues, or open one with the “New topic” form so nobody writes the same page twice."
+    },
+    "copy": {
+      "title": "Copy the template",
+      "body": "One folder per topic. Add km.mdx for Khmer now or later; the site shows English until it exists."
+    },
+    "write": {
+      "title": "Write it in plain Markdown",
+      "body": "Use the template headings. Real numbers, real commands, and an honest “When Not To Use”."
+    },
+    "preview": {
+      "title": "Preview, then open a pull request",
+      "body": "The page appears in navigation, search and the reasoning path automatically. A maintainer reviews it like code."
+    }
+  },
+  "collections": "Collections:",
+  "template": {
+    "title": "The template",
+    "body": "Every page uses the same headings in the same order, so readers always know where to look and contributors never start from a blank page. Write the headings in English in both languages; the site shows them in Khmer to Khmer readers.",
+    "note": "Patterns and trade-offs use the same headings and may skip ones that don't apply. Implementation pages are free-form.",
+    "open": "Open TEMPLATE.md on GitHub",
+    "lessonNote": "Writing a course lesson instead? Lessons use their own six-step template: the problem, the idea, an example, try it, check yourself, key takeaways.",
+    "openLesson": "Open the lesson template"
+  },
+  "goodPage": "What makes a good page",
+  "guidelines": {
+    "specific": {
+      "title": "Be specific",
+      "body": "Versions, numbers and the command you actually ran. “It’s faster” is not a finding; “p95 fell from 900 ms to 140 ms” is."
+    },
+    "boring": {
+      "title": "Include the boring option",
+      "body": "Every Options section lists the simplest thing that could work, and doing nothing."
+    },
+    "whenNot": {
+      "title": "Say when not to",
+      "body": "A recommendation without limits is marketing. “When Not To Use” is not optional."
+    },
+    "safely": {
+      "title": "Share production lessons safely",
+      "body": "Real incidents make the best pages. Remove company names, customer data and secrets first."
+    },
+    "noPitches": {
+      "title": "No vendor pitches",
+      "body": "Name a product when it matters to the decision, not to promote it."
+    },
+    "smallCode": {
+      "title": "Keep the code small",
+      "body": "Implementation shows the smallest version that works. Link out for the full project."
+    }
+  },
+  "translate": {
+    "title": "Khmer translations",
+    "body": "Translating a page is one of the most useful contributions. Keep the English technical terms (cache, retry, idempotency, index) and explain them in Khmer; readers will meet those words at work.",
+    "draftNote": "Mark a translation that has not been reviewed with <code>translation: draft</code> in the frontmatter. The page shows a notice and stays on this list until a reviewer removes it.",
+    "queueTitle": "Needs a Khmer review",
+    "allReviewed": "Every page has a reviewed Khmer translation. Thank you!",
+    "draft": "Draft",
+    "notTranslated": "Not translated"
+  },
+  "preview": {
+    "title": "Preview locally",
+    "body": "Open http://localhost:3000. New pages appear in navigation and search as soon as you save the file."
+  }
+}

@@ -1,0 +1,156 @@
+---
+title: "Serverless vs Containers"
+question: "When should I build on AWS Lambda / Cloudflare Workers versus long-running Docker containers on Kubernetes / ECS?"
+summary: "Serverless offers pay-per-request billing, instant zero-to-thousands autoscaling, and zero server maintenance, ideal for bursty, event-driven workloads. Containers provide predictable pricing, zero cold starts, in-memory state caching, and full runtime control for steady-state APIs."
+tags: [devops, cloud, serverless, containers, architecture, kubernetes]
+related: [tradeoffs/monolith-vs-microservices, problems/slow-first-request, patterns/sidecar]
+order: 11
+updated: "2026-09-12"
+contributors: [veasna]
+---
+
+## Context
+
+When launching a new backend or modernizing an existing system, engineering teams face a fundamental infrastructure choice:
+1. **Serverless Functions (Function-as-a-Service / FaaS):** Code packaged as isolated functions (AWS Lambda, Google Cloud Functions, Cloudflare Workers). The cloud provider dynamically allocates ephemeral execution environments on demand, scales from 0 to 10,000 instances automatically, and charges strictly per millisecond of execution.
+2. **Containerized Services (Docker / Kubernetes / ECS):** Applications packaged as standard Docker containers running continuously on managed virtual machines or Kubernetes clusters. Instances stay warm, maintain persistent connections, and cost a fixed hourly price regardless of traffic.
+
+Teams often start on serverless hoping to "never manage servers", only to be hit with cold start latency spikes, database connection exhaustion, and ballooning cloud bills at scale. Conversely, teams that deploy Kubernetes too early suffer months of operational complexity before writing any product features.
+
+## Symptoms
+
+- **Serverless Failure Mode:** Periodic 2–5 second p99 latency spikes (cold starts) when new lambda instances initialize; database crashes because 500 lambda instances open 500 direct PostgreSQL connections simultaneously; cloud bill spikes unexpectedly when processing continuous streaming workloads.
+- **Container Failure Mode:** 3 dedicated Kubernetes nodes run 24/7 at 3% CPU utilization for an internal tool used 2 hours a day, wasting thousands of dollars; developers spend 40% of their sprint debugging Helm charts and ingress controllers instead of delivering features.
+
+<Callout type="warning" title="Serverless is cheaper at low or bursty traffic; containers are cheaper at steady high traffic">
+Because serverless charges a premium per execution millisecond, a continuous high-throughput service (e.g. 5,000 req/sec around the clock) will cost significantly more on AWS Lambda than on a pair of reserved container instances.
+</Callout>
+
+## Diagnose
+
+1. **Analyze traffic patterns:** Is your traffic bursty and unpredictable (e.g., webhook listeners, batch cron processing, seasonal sales), or is it steady and continuous (e.g., enterprise B2B SaaS during business hours)?
+2. **Measure cold start tolerance:** Can your users tolerate a 1.5-second delay on the first request after an idle period?
+3. **Audit database connection model:** Does your database support serverless connection pooling (e.g., PgBouncer, AWS RDS Proxy, Prisma Accelerate), or will 1,000 ephemeral instances overwhelm DB connection limits?
+4. **Evaluate team operational capacity:** Does your team have dedicated DevOps/SRE engineers to maintain Kubernetes clusters, or are you a small product-focused team?
+
+## Options
+
+1. **Pure Serverless (AWS Lambda + API Gateway):** Zero infrastructure management, scale-to-zero, pay-per-request pricing.
+2. **Edge Serverless (Cloudflare Workers / Vercel Edge):** V8 isolate runtime with sub-5ms cold starts globally distributed across 300 edge locations.
+3. **Managed Containers (AWS ECS Fargate / Google Cloud Run):** Containerized flexibility with serverless operational ergonomics (no Kubernetes cluster management, automatic container provisioning).
+4. **Self-Managed Containers (Kubernetes / EKS):** Full control over networking, service mesh, sidecars, and daemonsets. (Best for complex enterprise ecosystems).
+
+## Trade-offs
+
+| Dimension | Serverless (AWS Lambda) | Containers (Docker / K8s) | Edge Serverless (Cloudflare) |
+| :--- | :--- | :--- | :--- |
+| **Cold Starts** | 500 ms – 3,000 ms | **0 ms (always warm)** | **< 5 ms (V8 Isolate)** |
+| **Pricing Model** | Pay per 1ms execution | Fixed hourly instance cost | Pay per request count |
+| **Scalability** | **Instant (0 to 1,000s in secs)** | Slower (pod autoscaling takes mins) | **Instant global scale** |
+| **Max Execution Duration** | 15 minutes hard limit | **Unlimited** | 30–60 seconds |
+| **Database Connection Pooling** | Difficult (requires proxy) | **Native (in-process pool)** | Requires HTTP/Websocket DB |
+| **In-Memory Caching** | Ephemeral (wiped on shutdown) | **Persistent (shared in RAM)** | Ephemeral |
+| **Operational Burden** | Lowest (no patching) | High (OS, Docker, K8s) | Lowest |
+
+## Decision
+
+- **Use Serverless (FaaS) for:**
+  - Event-driven tasks: S3 file upload processing, image resizing, asynchronous webhook receivers, queue consumers.
+  - Periodic scheduled cron jobs (e.g. daily reports, cleanup scripts).
+  - New MVPs and early-stage products where traffic is near zero most of the day and paying for idle EC2 instances is wasteful.
+  - Edge computing: Dynamic routing, auth token validation, A/B testing at the CDN layer (Cloudflare Workers).
+- **Use Containers (ECS / Kubernetes / Cloud Run) for:**
+  - Core user-facing REST/GraphQL APIs with steady traffic where p99 latency must remain under 50 ms with zero cold starts.
+  - Long-running background processes (video encoding, WebSocket streaming, continuous Kafka consumers) exceeding 15 minutes.
+  - Applications relying on persistent in-memory caches, local file storage, or heavy shared connection pools.
+- **Hybrid Pragmatism:** Use containers for your main API, and use Serverless for asynchronous background event processing.
+
+## Implementation
+
+### 1. Serverless AWS Lambda Handler in TypeScript:
+
+```typescript
+import { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
+
+// Connection reuse across warm invocations
+let cachedDbConnection: any = null;
+
+export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayProxyResult> {
+  // Cold start penalty occurs only on the first invocation
+  if (!cachedDbConnection) {
+    console.log('[Cold Start] Initializing database client connection...');
+    cachedDbConnection = await initializeDatabaseClient();
+  }
+
+  try {
+    const body = event.body ? JSON.parse(event.body) : {};
+    const result = await processOrder(body, cachedDbConnection);
+
+    return {
+      statusCode: 200,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ success: true, data: result }),
+    };
+  } catch (err) {
+    return {
+      statusCode: 500,
+      body: JSON.stringify({ error: (err as Error).message }),
+    };
+  }
+}
+```
+
+### 2. Containerized Service with Express & In-Process Connection Pool:
+
+```typescript
+import express from 'express';
+import { Pool } from 'pg';
+
+const app = express();
+app.use(express.json());
+
+// Persistent connection pool remains active for the multi-week life of the container
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  max: 20, // 20 persistent, warmed connections
+  idleTimeoutMillis: 30000,
+});
+
+app.post('/orders', async (req, res) => {
+  // 0ms cold start latency! Warm connections ready immediately
+  const client = await pool.connect();
+  try {
+    const { rows } = await client.query('INSERT INTO orders (data) VALUES ($1) RETURNING id', [req.body]);
+    return res.status(200).json({ success: true, orderId: rows[0].id });
+  } finally {
+    client.release();
+  }
+});
+
+app.listen(8080, () => console.log('Containerized service listening on port 8080'));
+```
+
+## Verification
+
+1. **Cold start latency audit:** Send a request to a cold lambda function that has been idle for 30 minutes. Measure total latency breakdown (DNS, TLS, container boot, DB init, and execution).
+2. **Cost crossover calculation:** Calculate the monthly cost of 50 million requests:
+   - Lambda: $\approx \$100 - \$250$ depending on memory.
+   - 2x `t4g.medium` ECS container instances: $\approx \$50$ fixed per month.
+3. **Database connection count under load:** Run a load spike test of 2,000 concurrent users. Verify that containers maintain a stable connection pool count (e.g. 40 total connections) while serverless functions without RDS Proxy spike connections to 1,000+, risking DB exhaustion.
+
+## Why
+
+The serverless versus container trade-off is fundamentally an economic and operational choice:
+- **Serverless trades raw compute unit cost for operational automation:** You pay a premium per CPU cycle, but eliminate server patching, capacity planning, and paying for idle infrastructure.
+- **Containers trade operational investment for cost efficiency and control:** You take on the burden of container lifecycle management and scaling rules, but gain persistent state, zero cold starts, and predictable compute costs at scale.
+
+## When Not To Use
+
+- **Serverless for heavy in-memory state:** If your application requires a 4 GB in-memory cache or a persistent WebSocket connection map, serverless ephemeral execution environments are completely unsuitable.
+- **Kubernetes for a simple CRUD app with a 2-person team:** Deploying Kubernetes for an early-stage startup adds massive operational overhead before achieving product-market fit. Use PaaS (Heroku, Render, Railway) or Serverless instead.
+
+## Common Mistakes
+
+- **Connecting to relational databases directly from thousands of Lambda instances:** Opening a new TCP connection and TLS handshake on every function invocation will crash PostgreSQL. Always place PgBouncer or AWS RDS Proxy between Lambda and the database.
+- **Ignoring Lambda package size:** Bundling heavy libraries (Puppeteer, Chromium, heavy ML models) expands cold start initialization time from 300 ms to over 5 seconds.
+- **Choosing Kubernetes just for resume padding:** Building a Kubernetes cluster when AWS ECS Fargate or Google Cloud Run provides 95% of the benefits with 5% of the maintenance.

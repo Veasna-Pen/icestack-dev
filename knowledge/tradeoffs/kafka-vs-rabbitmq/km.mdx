@@ -1,0 +1,159 @@
+---
+title: "Kafka vs RabbitMQ"
+question: "តើនៅពេលណាដែលខ្ញុំគួរជ្រើសរើស Distributed Event Log (Kafka) ហើយនៅពេលណាដែលគួរប្រើប្រាស់ Smart Message Broker (RabbitMQ)?"
+summary: "RabbitMQ គឺជា Smart Broker ជាមួយ Dumb Consumers ដែលពូកែខាងការកំណត់ Route ស្មុគស្មាញ, Priority Queues, និងការបែងចែកការងារបណ្តោះអាសន្ន។ ចំណែក Kafka គឺជា Dumb Broker ជាមួយ Smart Consumers ដែលពូកែខាង High-Throughput Event Streaming, ការចាក់ទិន្នន័យចាស់ៗឡើងវិញ (Message Replay), និងការធានាលំដាប់ទិន្នន័យក្នុង Partition។"
+tags: [messaging, kafka, rabbitmq, event-driven, architecture]
+related: [problems/should-i-use-kafka, patterns/dead-letter-queue, problems/unbounded-queue-backpressure]
+order: 14
+updated: "2026-09-12"
+contributors: [veasna]
+translation: draft
+---
+
+## Context
+
+នៅពេលផ្លាស់ប្តូរពី Monolith បែប Synchronous ទៅកាន់ស្ថាបត្យកម្ម Asynchronous Event-Driven ក្រុមវិស្វករត្រូវជ្រើសរើសឆ្អឹងខ្នងសម្រាប់ប្រព័ន្ធផ្ញើសារ (Messaging Backbone)។ បច្ចេកវិទ្យា Open-Source ល្បីៗទាំងពីរតំណាងឱ្យទស្សនវិជ្ជាពីរផ្ទុយគ្នាស្រឡះ៖
+
+1. **RabbitMQ (Message Queue)៖** បង្កើតឡើងផ្អែកលើស្តង់ដារ AMQP។ RabbitMQ គឺជា "Smart Broker ជាមួយ Dumb Consumers"។ Broker តាមដានការបញ្ជូនសារនីមួយៗ, ដឹងថា Message ណាត្រូវបាន Ack, លុបសារចោលភ្លាមៗពេលដែលគេដំណើរការរួច, និងមានប្រព័ន្ធ Routing Keys, Topic Exchanges, និង Dead-Lettering ដ៏ឆ្លាតវៃ។
+2. **Apache Kafka (Distributed Event Streaming)៖** បង្កើតឡើងជាទម្រង់ Append-only Distributed Commit Log។ Kafka គឺជា "Dumb Broker ជាមួយ Smart Consumers"។ សារត្រូវបានសរសេរបន្តកន្ទុយគ្នាក្នុង Partition ដែលមិនអាចកែប្រែបាន ហើយរក្សាទុកនៅលើ Disk រាប់ថ្ងៃ ឬរាប់ខែមិនថាមានគេអានឬនៅឡើយ។ Consumer ជាអ្នកតាមដានទីតាំងអានរបស់ខ្លួន (Offset) និងអាចរត់អានសារចាស់ៗឡើងវិញ (Replay) តាមតម្រូវការ។
+
+ក្រុមការងារជាច្រើនតែងតែជ្រើសរើស Kafka សម្រាប់ការងារធម្មតាៗ (ដូចជាការផ្ញើ Email) តែចុងក្រោយត្រូវជួបការលំបាកជាមួយ Partition Rebalancing, Cluster Overhead, ការមិនអាច Ack សារម្តងមួយៗបាន, និងភាពស្មុគស្មាញនៃ Client Library។
+
+## Symptoms
+
+- **ការប្រើប្រាស់ Kafka ខុស៖** ក្រុមការងារចង់ Retry ការងារដែលបរាជ័យម្តងមួយៗ ឬចង់ឱ្យការងាររបស់ VIP User រត់មុនគេ ប៉ុន្តែស្រាប់តែដឹងថា Kafka មិនអាច Ack សារខុសលំដាប់លំដោយ ឬប្តូរផ្លូវសារបានឡើយបើគ្មានការបង្កើត Topic ថ្មី។
+- **ការប្រើប្រាស់ RabbitMQ ខុស៖** ក្រុមការងាររុញទិន្នន័យ Sensor Telemetry ចំនួន ៥០០,០០០ សារក្នុងមួយវិនាទីចូល RabbitMQ; RAM របស់ Broker ពេញ, ប្រព័ន្ធចាប់ផ្តើម Block Connection, និងល្បឿនធ្លាក់ចុះ ព្រោះ RabbitMQ ត្រូវកត់ត្រាស្ថានភាពសារទាំងអស់ក្នុង RAM។
+- **ការបាត់បង់ឱកាស Replay ព្រឹត្តិការណ៍៖** រកឃើញ Bug លើកូដ Analytics; បើប្រើ RabbitMQ សារចាស់ៗទាំងអស់ត្រូវបានលុបបាត់អស់ហើយ; តែបើប្រើ Kafka គេគ្រាន់តែ Reset Offset របស់ Consumer ថយក្រោយ ដើម្បីដំណើរការទិន្នន័យ ៣០ ថ្ងៃកន្លងមកឡើងវិញបានភ្លាមៗ។
+
+<Callout type="warning" title="RabbitMQ លុបសារចោលពេល Ack; Kafka រក្សាទុកលើ Disk រាប់ថ្ងៃ">
+ក្នុង RabbitMQ សារកើតឡើងដើម្បីឱ្យគេដំណើរការរួចលុបចោល។ ក្នុង Kafka សារគឺជាកំណត់ត្រាប្រវត្តិសាស្ត្រដែលមិនអាចលុបបានក្នុងសៀវភៅបញ្ជី ដែលអាចឱ្យ Consumer Groups ឯករាជ្យជាច្រើនអានឡើងវិញបានគ្រប់ពេល។
+</Callout>
+
+## Diagnose
+
+1. **វាស់វែងតម្រូវការ Throughput៖** តើអ្នកដំណើរការ ៥,០០០ សារ/វិនាទី (ចំណុចខ្លាំងរបស់ RabbitMQ) ឬ ៥០០,០០០ សារ/វិនាទី (ចំណុចខ្លាំងរបស់ Kafka)?
+2. **វាយតម្លៃតម្រូវការ Replay សារចាស់ៗឡើងវិញ៖** តើសេវាកម្មខាងក្រោមត្រូវការទាញយកព្រឹត្តិការណ៍ពីម្សិលមិញមកដំណើរការឡើងវិញ ដើម្បី Train AI Model ឬ Rebuild Database ថ្មីដែរឬទេ?
+3. **ពិនិត្យភាពស្មុគស្មាញនៃ Routing៖** តើអ្នកត្រូវការ Wildcard Routing, Fan-outs, Headers Exchange, និងការដោះស្រាយសារខូចតាម Dead-Lettering មែនទេ?
+4. **វាយតម្លៃធនធានក្រុមការងារ៖** តើក្រុមរបស់អ្នកមានលទ្ធភាពមើលថែ Partition, Kafka Broker, និង Offset Commits ឬត្រូវការ Broker ស្រាលមួយដែលមាន Web Dashboard ងាយស្រួលគ្រប់គ្រង?
+
+## Options
+
+1. **RabbitMQ (AMQP)៖** Ephemeral Queues, Exchange Routing ស្មុគស្មាញ, Ack សារម្តងមួយៗ, Priority Queues, មាន Web UI ស្រាប់។
+2. **Apache Kafka៖** Persistent Partitioned Log, ល្បឿន Disk I/O លឿនបំផុត, Stream Processing (Kafka Streams), Replay ទិន្នន័យចាស់ៗបាន។
+3. **Redis Streams / PubSub៖** ជម្រើសស្រាលសម្រាប់ Throughput មធ្យម (< ៥០,០០០ msg/sec) ប្រសិនបើក្នុងប្រព័ន្ធមាន Redis ស្រាប់។
+4. **Cloud Managed Queues (AWS SQS / EventBridge)៖** ជម្រើស Serverless ដែលមិនបាច់មើលថែ Infrastructure ផ្ទាល់ខ្លួនឡើយ។
+
+## Trade-offs
+
+| លក្ខណៈវិនិច្ឆ័យ | RabbitMQ | Apache Kafka |
+| :--- | :--- | :--- |
+| **គំរូស្ថាបត្យកម្ម** | Smart Broker / Message Queue | Dumb Broker / Distributed Commit Log |
+| **Throughput អតិបរមា** | ~២០,០០០ ដល់ ៥០,០០០ msg/sec ក្នុង ១ Node | **១,០០០,០០០+ msg/sec ក្នុង ១ Cluster** |
+| **ការរក្សាទុកសារ** | លុបចោលភ្លាមៗក្រោយពេល ACK | **រក្សាទុកលើ Disk (រាប់ថ្ងៃ/រាប់សប្តាហ៍)** |
+| **ការ Replay សារឡើងវិញ** | មិនគាំទ្រ (សាររលាយបាត់) | **មានស្រាប់ (គ្រាន់តែរំកិល Offset ថយក្រោយ)** |
+| **ការកំណត់ Routing សារ** | **បត់បែនបំផុត (Exchanges, Bindings)** | សាមញ្ញ (មានតែ Topics និង Partitions) |
+| **ការធានាលំដាប់ទិន្នន័យ** | FIFO ក្នុង Queue តែមួយ | ធានាលំដាប់ **ក្នុង Partition តែមួយប៉ុណ្ណោះ** |
+| **ការ ACK សារម្តងមួយៗ** | **មានស្រាប់ (`ack`, `nack`, `reject`)** | គិតជាដុំៗតាមរយៈ Offset Commits |
+| **ភាពស្មុគស្មាញប្រតិបត្តិការ** | ទាបទៅមធ្យម (Erlang, Web UI) | ខ្ពស់ (JVM, Partitions, Rebalancing) |
+
+## Decision
+
+- **ជ្រើសរើស RabbitMQ សម្រាប់៖**
+  - Background Job Queue ប្រពៃណី (ការបង្កើត PDF, ការផ្ញើ Email, ការបម្លែងវីដេអូ, ការទទួល Payment Webhooks)។
+  - ប្រព័ន្ធដែលត្រូវការ Routing ស្មុគស្មាញ (បញ្ជូនសារទៅកាន់ Queue ផ្សេងៗគ្នាដោយផ្អែកលើ Wildcard Routing Keys)។
+  - ការងារដែលទាមទារការ Ack សារម្តងមួយៗ, Retry Queue តាមពេលវេលា, និង Dead Letter Exchange។
+  - ការងារដែលទាមទារការកំណត់អាទិភាព (Priority Queue ដើម្បីឱ្យ VIP User រត់មុនគេ)។
+- **ជ្រើសរើស Apache Kafka សម្រាប់៖**
+  - ប្រព័ន្ធកត់ត្រា Clickstream, ទិន្នន័យ IoT Telemetry, និង Metrics ប្រព័ន្ធដែលមានទំហំធំសម្បើម។
+  - ស្ថាបត្យកម្ម Event Sourcing និង CQRS ដែល Event Log គឺជាប្រភពទិន្នន័យពិតប្រាកដ។
+  - Real-time Stream Processing (ការ Join Stream ពីរបញ្ចូលគ្នា, Aggregation តាមបង្អួចពេលវេលា)។
+  - ការផ្សាយទិន្នន័យទៅកាន់សេវាកម្មជាច្រើន (Multi-consumer Broadcast) ដែលប្រព័ន្ធខាងក្នុងចំនួន ១០ ផ្សេងគ្នា (Analytics, Fraud, Search Indexer) អានទិន្នន័យដដែលតាមល្បឿនរៀងៗខ្លួន។
+
+## Implementation
+
+### 1. RabbitMQ Consumer: ការ ACK សារម្តងមួយៗ និង Selective Rejection ក្នុង TypeScript៖
+
+```typescript
+import amqp from 'amqplib';
+
+export async function startRabbitWorker() {
+  const conn = await amqp.connect(process.env.RABBITMQ_URL!);
+  const channel = await conn.createChannel();
+  await channel.prefetch(10);
+
+  channel.consume('email_tasks', async (msg) => {
+    if (!msg) return;
+
+    try {
+      const task = JSON.parse(msg.content.toString());
+      await sendEmail(task);
+
+      // ទទួលស្គាល់សារម្តងមួយៗ - RabbitMQ នឹងលុបវាចេញពី RAM ភ្លាម
+      channel.ack(msg);
+    } catch (err) {
+      console.error('[RabbitMQ] ការផ្ញើ Email បរាជ័យ:', err);
+      // ច្រានចោលសារខូច: បញ្ជូនទៅកាន់ Dead Letter Exchange ដោយមិនដាក់ចូលជួរវិញ
+      channel.nack(msg, false, false);
+    }
+  });
+}
+```
+
+### 2. Kafka Consumer: ការអានជាដុំៗតាម Offset និងការ Replay ទិន្នន័យឡើងវិញ៖
+
+```typescript
+import { Kafka } from 'kafkajs';
+
+const kafka = new Kafka({ clientId: 'analytics-worker', brokers: ['kafka:9092'] });
+const consumer = kafka.consumer({ groupId: 'analytics-group' });
+
+export async function startKafkaStreaming() {
+  await consumer.connect();
+  await consumer.subscribe({ topic: 'user-clicks', fromBeginning: false });
+
+  // ដំណើរការ Stream Processing កម្រិត Throughput ខ្ពស់
+  await consumer.run({
+    eachBatch: async ({ batch, resolveOffset, heartbeat }) => {
+      for (const message of batch.messages) {
+        if (!message.value) continue;
+        const clickEvent = JSON.parse(message.value.toString());
+        await processAnalytics(clickEvent);
+
+        // កត់ត្រា Offset ដែលបានអានរួច
+        resolveOffset(message.offset);
+        await heartbeat();
+      }
+    },
+  });
+}
+
+// រំកិល Offset ថយក្រោយដើម្បី Replay ទិន្នន័យ ២៤ ម៉ោងមុនឡើងវិញ!
+export async function replayEvents(topic: string, timestamp: number) {
+  console.log(`កំពុងរំកិល Consumer Offset សម្រាប់ Topic ${topic} ទៅកាន់ម៉ោង ${new Date(timestamp).toISOString()}`);
+}
+```
+
+## Verification
+
+1. **ការធ្វើតេស្តបន្ទុក Throughput៖** បញ្ជូន ១០០,០០០ សារទៅកាន់ប្រព័ន្ធទាំងពីរ។ Kafka សម្រេចបានយ៉ាងរហ័សដោយស៊ី CPU តិចបំផុតតាមរយៈ Sequential Disk I/O ខណៈដែល RabbitMQ ត្រូវស៊ី CPU ច្រើនជាងដើម្បីកត់ត្រាស្ថានភាពសារក្នុង RAM។
+2. **ផ្ទៀងផ្ទាត់ការ Replay៖** ក្នុង Kafka បិទ Consumer រួចរំកិល Offset ថយក្រោយ ៥,០០០ សារ ហើយបើកឡើងវិញ។ ផ្ទៀងផ្ទាត់ថាសារទាំង ៥,០០០ ត្រូវបានអាន និងដំណើរការឡើងវិញទាំងអស់ដោយជោគជ័យ។
+3. **ការធ្វើតេស្តបត់បែននៃ Routing៖** ក្នុង RabbitMQ បង្កើត Topic Exchange ជាមួយ Routing Keys `orders.us.*` និង `orders.eu.*`។ ផ្ទៀងផ្ទាត់ថាសារត្រូវបង្វែរចូល Queue ត្រូវគ្នាយ៉ាងត្រឹមត្រូវដោយមិនបាច់សរសេរកូដចម្រាញ់ក្នុង Application ឡើយ។
+
+## Why
+
+ភាពខុសគ្នារវាង RabbitMQ និង Kafka កើតចេញពីទស្សនៈគ្រឹះនៃទិន្នន័យ៖
+- **RabbitMQ ចាត់ទុកសារជាការងារបណ្តោះអាសន្ន (Transient Commands)៖** ការងារដែលត្រូវធ្វើឱ្យចប់។ ពេលធ្វើចប់ហើយ សារនោះត្រូវលុបចោល។
+- **Kafka ចាត់ទុកសារជាប្រវត្តិសាស្ត្រពិត (Historical Facts)៖** កំណត់ត្រាព្រឹត្តិការណ៍ដែលបានកើតឡើងក្នុងអតីតកាលដែលមិនអាចកែប្រែបាន។ អ្វីដែលបានកើតឡើងមិនអាចបាត់បង់ឡើយ វាត្រូវតែកត់ត្រាទុកដើម្បីឱ្យអ្នកណាក៏ដោយអាចអាន និងវិភាគឡើងវិញបាន។
+
+ការជ្រើសរើសឧបករណ៍ត្រឹមត្រូវ ជួយឱ្យប្រព័ន្ធរបស់អ្នកស៊ីសង្វាក់គ្នាជាមួយវដ្តជីវិតពិតនៃទិន្នន័យរបស់អ្នក។
+
+## When Not To Use
+
+- **Kafka សម្រាប់ Queue ផ្ញើ Email ធម្មតា៖** អ្នកនឹងត្រូវចំណាយពេលរាប់សប្តាហ៍ដើម្បីដោះស្រាយបញ្ហា Consumer Rebalancing និង Partition Keys ខណៈដែល RabbitMQ ឬ AWS SQS ប្រើពេលតែ ១០ នាទីក្នុងការរៀបចំ។
+- **RabbitMQ សម្រាប់ការរក្សាទុកទិន្នន័យ Stream ធំៗ៖** ការរក្សាទុកសាររាប់លានក្នុង RabbitMQ រយៈពេល ៣០ ថ្ងៃ នឹងធ្វើឱ្យអស់ RAM និងគាំង Erlang VM ជាមិនខាន។
+
+## Common Mistakes
+
+- **ប្រើ Kafka Partitions ដូចជា Queue នីមួយៗ៖** Kafka ពង្រីកសមត្ថភាពតាម Partition; អ្នកមិនអាចបង្កើត Partition ថ្មីរាល់ពេលមាន Tenant ថ្មី ឬការងារថ្មីបានឡើយ។
+- **ទុកឱ្យ Queue កកស្ទះក្នុង RabbitMQ ដោយគ្មានការទប់ស្កាត់ Backpressure៖** ការបណ្តោយឱ្យសាររាប់លានកកស្ទះក្នុង RabbitMQ Queue ដោយគ្មាន Worker ទាញយក នឹងលេបត្របាក់ RAM របស់ Broker ទាំងអស់។
+- **Commit Kafka Offset មុនពេលដំណើរការកូដចប់៖** ការហៅ `resolveOffset()` មុនពេលទិន្នន័យត្រូវបាន Save ចូល Database នឹងបណ្តាលឱ្យបាត់បង់សារដោយស្ងាត់ៗ ប្រសិនបើ Worker គាំងស្លាប់ពាក់កណ្តាលទី។

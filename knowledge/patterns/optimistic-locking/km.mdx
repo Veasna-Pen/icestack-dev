@@ -1,0 +1,172 @@
+---
+title: "Optimistic Locking"
+question: "តើខ្ញុំអាចការពារកុំឱ្យការ Update ស្របគ្នាសរសេរជាន់កម្ទេចទិន្នន័យគ្នាទៅវិញទៅមក (Lost Updates) ដោយមិនចាំបាច់ Lock ជួរទិន្នន័យ Database យ៉ាងដូចម្តេច?"
+summary: "អនុញ្ញាតឱ្យការអានទិន្នន័យស្របគ្នាដំណើរការដោយសេរីដោយគ្មានការ Lock។ នៅពេលកត់ត្រាសរសេរ (Write) ត្រូវផ្ទៀងផ្ទាត់ថាតើ Version ឬ Timestamp របស់ Record នោះមិនទាន់ត្រូវបានផ្លាស់ប្តូរតាំងពីពេលអានមក (UPDATE ... WHERE id = ? AND version = ?)។ ប្រសិនបើមានការប្រែប្រួល ត្រូវបញ្ឈប់ និង Retry។"
+tags: [database, concurrency, optimistic-locking, postgresql, transactions]
+related: [problems/database-deadlocks, patterns/idempotency, patterns/distributed-lock]
+order: 16
+updated: "2026-09-12"
+contributors: [veasna]
+translation: draft
+---
+
+## Context
+
+នៅក្នុងកម្មវិធី Web កម្មសិទ្ធិបញ្ហាដ៏ល្បីហៅថា **Lost Update Problem** កើតឡើងនៅពេលដែលអ្នកប្រើប្រាស់ពីរនាក់បើកមើលទិន្នន័យដដែល កែសម្រួលវា និងរក្សាទុកត្រឡប់ទៅវិញព្រមគ្នា៖
+1. Alice អានអត្ថបទ #10 (ចំណងជើង៖ "សេចក្តីព្រាង A")។
+2. Bob អានអត្ថបទ #10 (ចំណងជើង៖ "សេចក្តីព្រាង A")។
+3. Alice កែចំណងជើងទៅជា "សេចក្តីព្រាង B" រួចចុច Save។
+4. Bob កែចំណងជើងទៅជា "សេចក្តីព្រាង C" រួចចុច Save តាមក្រោយ។
+
+ការ Save របស់ Bob នឹងសរសេរជាន់កម្ទេចការកែប្រែរបស់ Alice ចោលទាំងស្រុងដោយគ្មានការព្រមានអ្វីទាំងអស់។ ការប្រឹងប្រែងរបស់ Alice ត្រូវបានបាត់បង់ជារៀងរហូត។
+
+មានវិធីសាស្ត្រចម្បងពីរក្នុងការដោះស្រាយបញ្ហានេះ៖
+- **Pessimistic Locking (`SELECT FOR UPDATE`)៖** ចាក់សោជួរទិន្នន័យភ្លាមៗនៅពេល Alice បើកវា ដែលបង្ខំឱ្យ Bob ត្រូវរង់ចាំ ឬជួប Error។ (អាក្រក់បំផុតសម្រាប់ Web Apps ព្រោះមនុស្សត្រូវការពេលគិតរាប់នាទី ដែលធ្វើឱ្យបើក Transaction ចោលយូរ និងអស់ Connection Pool របស់ Database)។
+- **Optimistic Locking៖** សន្មតថាការប៉ះទង្គិចគ្នាកម្រនឹងកើតឡើងណាស់។ ការអានមិនដែលចាក់សោឡើយ។ Record នីមួយៗមានជួរឈរ `version` ដែលកើនឡើងជានិច្ច។ នៅពេល Save កម្មវិធីនឹង Update លុះត្រាតែ Version ក្នុង Database នៅតែត្រូវគ្នានឹង Version ដែល Alice បានអាន (`WHERE id = 10 AND version = 1`)។
+
+## Symptoms
+
+- អ្នកប្រើប្រាស់ត្អូញត្អែរថាទិន្នន័យដែលពួកគេបានកែប្រែស្រាប់តែបាត់បង់ ឬត្រូវបានសរសេរជាន់លើដោយមិត្តរួមការងារម្នាក់ទៀតដែលកំពុងកែ Record ដដែល។
+- ក្នុងប្រព័ន្ធ E-commerce អតិថិជនពីរនាក់អាចទិញកៅអីយន្តហោះចុងក្រោយ ឬទំនិញចុងក្រោយក្នុងស្តុកបានព្រមគ្នា ព្រោះការពិនិត្យស្តុកធ្វើឡើងមុនពេល Commit។
+- ការប្រើប្រាស់ `SELECT ... FOR UPDATE` បណ្តាលឱ្យមាន Lock Contention ធ្ងន់ធ្ងរ, API ឆ្លើយតបយឺត, និងជួបបញ្ហា `deadlock detected` ញឹកញាប់។
+- Database Connection Pools អស់ពីស្តុក ព្រោះ Transaction បើកចំហររង់ចាំការផ្ទៀងផ្ទាត់ខាងក្រៅ ឬរង់ចាំមនុស្សចុច Confirm។
+
+<Callout type="warning" title="Pessimistic Lock មិនអាចបើកចោលរង់ចាំពេលវេលាគិតរបស់មនុស្សបានឡើយ">
+ហាមបើក Database Transaction ជាមួយ `SELECT ... FOR UPDATE` ខណៈពេលដែលរង់ចាំអ្នកប្រើប្រាស់បំពេញ Form ឬចុចប៊ូតុង "Submit" ជាដាច់ខាត។ Transaction មិនត្រូវរង់ចាំមនុស្ស ឬ Network Clients ឡើយ។
+</Callout>
+
+## Diagnose
+
+1. **ពិនិត្យមើលកូដ Update Queries៖** តើពាក្យបញ្ជាសរសេររបស់កម្មវិធីអ្នកជាការសរសេរជាន់លើដោយងងឹតងងល់ (`UPDATE products SET stock = stock - 1 WHERE id = ?`) ឬមានការផ្ទៀងផ្ទាត់ស្ថានភាពច្បាស់លាស់?
+2. **ពិនិត្យមើល Table Schema៖** តើតារាងរបស់អ្នកមានជួរឈរ `version INT DEFAULT 1` ឬ `updated_at TIMESTAMP` សម្រាប់ប្រើក្នុងលក្ខខណ្ឌ Update ដែរឬទេ?
+3. **ពិនិត្យមើល Lock Waiting Metrics៖** ពិនិត្យ `pg_stat_activity` រកមើល Transaction ដែលស្ថិតក្នុងស្ថានភាព `idle in transaction` ឬរង់ចាំ Row-level Exclusive Locks។
+4. **វាយតម្លៃប្រេកង់នៃការប៉ះទង្គិច (Collision Frequency)៖** តើការកែទិន្នន័យជាន់គ្នាលើជួរតែមួយកើតឡើងញឹកញាប់ប៉ុណ្ណា? ប្រសិនបើវាកើតឡើងក្រោម ១% នៃទិន្នន័យសរុប Optimistic Locking គឺល្អលើសលប់។
+
+## Options
+
+1. **អ្នកមកក្រោយឈ្នះ (Last Write Wins / Blind Update)៖** ឥរិយាបថធម្មតារបស់ SQL។ Query ណាដែលរត់ក្រោយគេ នឹងសរសេរជាន់លើទិន្នន័យចាស់ទាំងអស់។ (បណ្តាលឱ្យបាត់បង់ទិន្នន័យដោយស្ងាត់ៗ)។
+2. **Pessimistic Row Locking (`SELECT FOR UPDATE`)៖** ចាក់សោជួរទិន្នន័យផ្តាច់មុខក្នុង SQL Transaction។ (មានសុវត្ថិភាពសម្រាប់ Transaction ម៉ាស៊ីនដែលលឿនក្រោម 10 ms តែគ្រោះថ្នាក់បំផុតបើបើកចោលរង់ចាំ HTTP)។
+3. **Optimistic Locking ជាមួយ Version Number៖** បន្ថែមលេខ `version` (+1) រាល់ពេលសរសេរ (`UPDATE tbl SET val = ?, version = version + 1 WHERE id = ? AND version = ?`)។
+4. **Optimistic Locking ជាមួយ Compare-and-Swap (CAS)៖** ពិនិត្យលក្ខខណ្ឌអាជីវកម្មផ្ទាល់ (`UPDATE accounts SET balance = balance - 100 WHERE id = ? AND balance >= 100`)។
+
+## Trade-offs
+
+| យុទ្ធសាស្ត្រ | សមត្ថភាពអានស្របគ្នា | Throughput ពេលប៉ះទង្គិចទាប | Throughput ពេលប៉ះទង្គិចខ្ពស់ | ហានិភ័យបាត់បង់ទិន្នន័យ |
+| :--- | :--- | :--- | :--- | :--- |
+| **Last Write Wins** | គ្មានដែនកំណត់ | ខ្ពស់ | ខ្ពស់ | **១០០% (បាត់បង់ទិន្នន័យស្ងាត់ៗ)** |
+| **Pessimistic Locking** | ត្រូវរង់ចាំ Lock | ទាប (រង់ចាំ Lock) | ធ្លាក់ចុះ (ជួប Deadlock) | ០% |
+| **Optimistic (Version)** | គ្មានដែនកំណត់ | **អតិបរមា (គ្មាន Lock)** | ធ្លាក់ចុះ (ត្រូវ Retry ច្រើន) | ០% |
+| **Compare-and-Swap** | គ្មានដែនកំណត់ | **អតិបរមា** | ខ្ពស់ | ០% |
+
+## Decision
+
+- **ប្រើ Optimistic Locking សម្រាប់ដំណើរការ Web ដែលមានអន្តរកម្មជាមួយមនុស្ស៖** នៅពេលអ្នកប្រើប្រាស់បើក Form, កែសម្រួលព័ត៌មាន, និងចុច Submit (ប្រព័ន្ធគ្រប់គ្រងអត្ថបទ, Profile អតិថិជន, CRM) ត្រូវប្រើជួរឈរ `version` ជានិច្ច។
+- **ប្រគល់ HTTP 409 Conflict នៅពេល Version មិនត្រូវគ្នា៖** ប្រសិនបើពាក្យបញ្ជា Update ផ្តល់ផលប៉ះពាល់ស្មើនឹង ០ ជួរ (0 affected rows) ត្រូវបញ្ឈប់ Transaction ហើយប្រគល់ `409 Conflict` ទៅកាន់ Client ភ្លាម។ Frontend អាចសួរអ្នកប្រើប្រាស់ថា៖ *"ទិន្នន័យនេះត្រូវបានកែប្រែដោយអ្នកផ្សេងរួចទៅហើយ។ តើអ្នកចង់ពិនិត្យមើលកំណែថ្មីរបស់គេដែរឬទេ?"*
+- **ប្រើ Atomic Compare-and-Swap សម្រាប់លេខរាប់ និងស្តុកទំនិញ៖** សម្រាប់ការ Update ល្បឿនលឿនរបស់ម៉ាស៊ីន (កាត់ស្តុក ឬកាត់សមតុល្យលុយ) ត្រូវពិនិត្យលក្ខខណ្ឌផ្ទាល់ក្នុង SQL៖
+  ```sql
+  UPDATE inventory SET stock = stock - 1 WHERE product_id = $1 AND stock >= 1;
+  ```
+- **ប្រើ Pessimistic Locking តែក្នុងករណីកកស្ទះប្រជែងគ្នាកម្រិតម៉ាស៊ីនខ្លាំងប៉ុណ្ណោះ៖** ប្រសិនបើមាន 500 requests/sec កំពុងដណ្តើមសំបុត្រប្រគំតន្ត្រីតែមួយ ហើយអត្រាប៉ះទង្គិចលើសពី ២០% ការ Retry របស់ Optimistic នឹងស៊ី CPU អស់។ ក្នុងករណីនេះ ត្រូវប្រើ `SELECT FOR UPDATE` ក្នុង Transaction ដែលលឿនក្រោម 5 ms។
+
+## Implementation
+
+### 1. ការបង្កើត Table Schema ជាមួយ Version Column៖
+
+```sql
+CREATE TABLE articles (
+  id UUID PRIMARY KEY,
+  title VARCHAR(255) NOT NULL,
+  content TEXT NOT NULL,
+  version INT NOT NULL DEFAULT 1,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+```
+
+### 2. TypeScript Service ដែលប្រើប្រាស់ Optimistic Locking និងចាប់ Conflict៖
+
+```typescript
+export class ConflictError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ConflictError';
+  }
+}
+
+export class ArticleService {
+  constructor(private readonly db: any) {}
+
+  async updateArticle(id: string, newTitle: string, expectedVersion: number) {
+    // ដំណើរការ Atomic Update ដោយផ្ទៀងផ្ទាត់ថា Version មិនទាន់ផ្លាស់ប្តូរ
+    const result = await this.db.query(
+      `UPDATE articles 
+       SET title = $1, 
+           version = version + 1, 
+           updated_at = NOW() 
+       WHERE id = $2 AND version = $3 
+       RETURNING version`,
+      [newTitle, id, expectedVersion]
+    );
+
+    // ប្រសិនបើគ្មានជួរណាត្រូវបានកែប្រែ (rowCount === 0) បញ្ជាក់ថាមានអ្នកកែប្រែទិន្នន័យមុនយើងហើយ!
+    if (result.rowCount === 0) {
+      // ទាញយក Version បច្ចុប្បន្នដើម្បីផ្តល់ព័ត៌មានលម្អិត
+      const latest = await this.db.query('SELECT version, updated_at FROM articles WHERE id = $1', [id]);
+      const currentVersion = latest.rows[0]?.version;
+
+      throw new ConflictError(
+        `Optimistic Lock បរាជ័យសម្រាប់អត្ថបទ ${id}។ រំពឹងទុក Version ${expectedVersion} ប៉ុន្តែជាក់ស្តែងគឺជា Version ${currentVersion}។`
+      );
+    }
+
+    return { updatedVersion: result.rows[0].version };
+  }
+}
+```
+
+### 3. កូដជំនួយ Retry ដោយស្វ័យប្រវត្តិសម្រាប់ប្រតិបត្តិការកម្រិតម៉ាស៊ីន៖
+
+```typescript
+export async function withOptimisticRetry<T>(
+  operation: () => Promise<T>,
+  maxRetries = 3
+): Promise<T> {
+  let attempts = 0;
+  while (attempts < maxRetries) {
+    try {
+      return await operation();
+    } catch (err) {
+      if (err instanceof ConflictError && attempts < maxRetries - 1) {
+        attempts++;
+        // បន្ថែម Jitter ចៃដន្យបន្តិចមុននឹង Retry ដើម្បីកុំឱ្យ Worker ទាំងពីរប៉ះទង្គិចគ្នាម្តងទៀត
+        await new Promise((res) => setTimeout(res, Math.random() * 50));
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw new Error('បាន Retry លើសកម្រិតកំណត់អតិបរមាសម្រាប់ Optimistic Locking');
+}
+```
+
+## Verification
+
+1. **ការធ្វើតេស្តប៉ះទង្គិចគ្នា (Concurrent Collision Test)៖** ដំណើរការ Update ពីរស្របគ្នាលើជួរអត្ថបទដដែលដោយប្រើ Initial Version ដូចគ្នា។ ផ្ទៀងផ្ទាត់ថាមានតែ Update មួយគត់ដែលជោគជ័យ (rowCount = 1) ខណៈដែលមួយទៀតបោះ `ConflictError` (rowCount = 0)។
+2. **ផ្ទៀងផ្ទាត់ថាមិនមាន Database Lock Duration៖** វាស់វែង Lock Waits ក្នុង Database អំឡុងពេលមាន 5,000 Reads និង Updates ស្របគ្នា។ ធានាថា `pg_locks` បង្ហាញថាគ្មាន Long-running Exclusive Locks លើតារាងគោលដៅឡើយ។
+3. **ផ្ទៀងផ្ទាត់ការឆ្លើយតប HTTP 409៖** ក្នុង Web API Test សាកល្បងផ្ញើសំណើ PUT ដែលមាន `version: 1` នៅពេលដែល Database ឡើងដល់ `version: 2`។ ផ្ទៀងផ្ទាត់ថា API ឆ្លើយតប `409 Conflict` ជាមួយព័ត៌មានច្បាស់លាស់ ដោយមិនធ្វើឱ្យទិន្នន័យខូចខាតឡើយ។
+
+## Why
+
+Database Transactions មានតម្លៃថ្លៃខ្លាំងនៅពេលដែលវាត្រូវកាន់កាប់ Lock ក្នុងរយៈពេលយូរ។ ការកាន់កាប់ Row Lock ផ្តាច់មុខស៊ី Memory, រារាំងអ្នកដទៃមិនឱ្យអានឬសរសេរ, និងកម្រិត Throughput របស់ប្រព័ន្ធទាំងមូល។
+
+Optimistic Locking យល់ច្បាស់ថា នៅក្នុងកម្មវិធីភាគច្រើន ការកែទិន្នន័យជាន់គ្នាលើជួរតែមួយក្នុងវិនាទីតែមួយកម្រនឹងកើតមានណាស់។ តាមរយៈការផ្លាស់ប្តូរការទប់ស្កាត់ដោយការ Lock មកជាការផ្ទៀងផ្ទាត់នៅពេល Commit វិញ វាជួយដោះលែងសមត្ថភាពអានទិន្នន័យដល់កម្រិតអតិបរមា ជៀសវាង Deadlocks និងលុបបំបាត់ហានិភ័យនៃការបាត់បង់ទិន្នន័យទាំងស្រុង។
+
+## When Not To Use
+
+- **ការលក់បញ្ចុះតម្លៃពិសេសដែលមានការប្រជែងខ្លាំង (Flash Sales)៖** នៅពេលមនុស្ស ១០,០០០ នាក់ដណ្តើមទិញទំនិញ ៥០ មុខក្នុងរយៈពេល ២ វិនាទី Optimistic Locking នឹងបង្កឱ្យមានការបរាជ័យ ៩,៩៥០ ដង និងបង្កើតព្យុះ Retry ជន់ជោរ CPU Database។ ត្រូវប្រើ Queue (Redis Queue) ឬ `SELECT FOR UPDATE SKIP LOCKED` ជំនួសវិញ។
+- **ទិន្នន័យបែប Append-only៖** ប្រសិនបើទិន្នន័យគ្រាន់តែ Insert ថ្មីៗរហូត (Log, Time-series) ដោយមិនដែលកែប្រែទេនោះ ការប្រើ Version គឺគ្មានប្រយោជន៍ឡើយ។
+
+## Common Mistakes
+
+- **ភ្លេចពិនិត្យមើលចំនួនជួរដែលរងផលប៉ះពាល់ (Affected Row Count)៖** ដំណើរការ `UPDATE ... WHERE version = ?` តែមិនបានពិនិត្យថា `rowCount === 0` ឬអត់ ដែលធ្វើឱ្យ Query មិនដំណើរការអ្វីសោះ តែ App ស្មានតែជោគជ័យ។
+- **ប្រើ Timestamp ជំនួសឱ្យលេខ Integer Version៖** Timestamp អាចមានបញ្ហា Clock Skew ឬដំណើរការក្នុងមិល្លីវិនាទីតែមួយដែលធ្វើឱ្យលេខដូចគ្នា។ ត្រូវជ្រើសរើស Integer Version (`version + 1`) ជានិច្ច។
+- **Loop Retry គ្មានដែនកំណត់៖** ប្រសិនបើ Retry ដោយគ្មាន Max Attempts កំណត់ទេ Worker ពីរដែលប្រជែងគ្នាអាចធ្លាក់ចូលក្នុង Livelock Loop រហូតដល់គាំងម៉ាស៊ីន។

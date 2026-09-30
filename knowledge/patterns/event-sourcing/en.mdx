@@ -1,0 +1,198 @@
+---
+title: "Event Sourcing"
+question: "How do I maintain a complete, immutable audit trail of every state change in my system?"
+summary: "Instead of overwriting rows with their current state, store every state mutation as an append-only sequence of immutable events. Rehydrate current entity state by replaying events from genesis or snapshots."
+tags: [architecture, event-sourcing, ddd, audit, append-only]
+related: [patterns/cqrs, patterns/transactional-outbox, tradeoffs/saga-orchestration-vs-choreography]
+order: 13
+updated: "2026-09-12"
+contributors: [veasna]
+---
+
+## Context
+
+Traditional databases store the *current state* of an entity. When a user changes their shipping address, an `UPDATE users SET address = '...' WHERE id = 1` overwrites the old address. 
+
+While simple, this destroys history. You cannot answer critical business and compliance questions: "What was the customer's address when order #452 was placed?", "Who changed the bank account number at 2:00 AM?", or "How did this account balance become negative?"
+
+**Event Sourcing** inverts this paradigm. State is never updated or deleted. Instead, every change is captured as an immutable, append-only domain event (e.g. `AccountOpened`, `MoneyDeposited`, `AddressChanged`). The current state is simply the left-fold derivation of all historical events from the beginning of time.
+
+## Symptoms
+
+- Regulators or compliance auditors demand a forensic audit log of every change, but the database only holds current rows.
+- Developers write complex database triggers, audit tables, and shadow history tables (`users_history`), creating maintenance nightmares and schema synchronization bugs.
+- Debugging production bugs is frustrating because nobody knows what state transitions occurred leading up to the corrupt data state.
+- Business stakeholders frequently request historical time-travel queries ("Show me the inventory valuation as of last month").
+
+<Callout type="warning" title="CRUD UPDATE statements permanently discard business intent">
+When you execute an `UPDATE`, the database records what the data looks like now, but erases *why* it changed, *who* changed it, and *what* it looked like before.
+</Callout>
+
+## Diagnose
+
+1. **Audit compliance requirements:** Does your business operate in finance, healthcare, legal, or supply chain logistics where state history is legally mandated?
+2. **Review history table implementations:** Are you manually populating `audit_logs` or `history` tables in your application code, leading to drift between the primary record and the audit entry?
+3. **Assess temporal query needs:** Do business analysts ask questions about state at specific points in time in the past?
+4. **Evaluate aggregate boundaries:** Are entity lifecycles governed by clear business events (e.g. `OrderPlaced`, `PaymentAuthorized`, `OrderShipped`)?
+
+## Options
+
+1. **CRUD with audit log table:** Keep traditional `UPDATE` statements, but write a duplicate row into a separate `audit_events` table. (Fails to guarantee consistency if the audit write fails or schema drifts).
+2. **Database temporal tables / Change Data Capture (CDC):** Use Debezium or PostgreSQL system versioning to record row diffs. (Good for technical auditing, but lacks domain business context).
+3. **True Event Sourcing:** Make the append-only event store the single source of truth. Current state is never stored directly as a primary record; it is projected from events on demand or via read-model projections.
+4. **Event Sourcing with periodic Snapshots:** Store events, but save a state snapshot every 100 events to maintain sub-millisecond rehydration latency.
+
+## Trade-offs
+
+| Architecture | Auditability & History | Time-Travel Queries | Query Simplicity | Storage Growth |
+| :--- | :--- | :--- | :--- | :--- |
+| **Traditional CRUD** | Zero (unless manually tracked) | Impossible | Highest (simple `SELECT`) | Flat (in-place updates) |
+| **CRUD + Audit Table** | Moderate (prone to drift) | Hard (manual reconstruct) | High | Moderate |
+| **Event Sourcing** | 100% Complete & Immutable | Native (replay to timestamp) | Requires CQRS read models | High (append-only growth) |
+| **Event Sourcing + Snapshots** | 100% Complete | Native | Fast rehydration | High |
+
+## Decision
+
+- **Use Event Sourcing for core financial, ledger, and transactional domains:** Bank accounts, order fulfillment, medical records, and supply chain custody.
+- **Do not use Event Sourcing for transient, low-value data:** User session tokens, temporary cache entries, or UI theme preferences should remain simple key-value or CRUD records.
+- **Implement Snapshotting early:** Any aggregate that accumulates more than 50 events over its lifecycle must generate a snapshot every $N$ events (e.g., every 50 or 100 events) to prevent slow rehydration.
+- **Treat events as immutable contracts:** Once written to production, an event schema cannot be changed or deleted. Use schema upcasting or versioned event types (`OrderPlacedV1`, `OrderPlacedV2`).
+- **Always pair with CQRS:** You cannot efficiently run `SELECT * WHERE status = 'PENDING'` against an event stream. Project events into a read model for searching.
+
+## Implementation
+
+### 1. Domain Event Definitions and Bank Account Aggregate:
+
+```typescript
+// 1. Immutable Domain Events
+export type BankAccountEvent =
+  | { type: 'AccountOpened'; accountId: string; owner: string; initialBalanceCents: number; timestamp: string }
+  | { type: 'MoneyDeposited'; accountId: string; amountCents: number; timestamp: string }
+  | { type: 'MoneyWithdrawn'; accountId: string; amountCents: number; timestamp: string };
+
+// 2. Aggregate Root Rehydrated from Events
+export class BankAccount {
+  public id!: string;
+  public owner!: string;
+  public balanceCents = 0;
+  public version = 0;
+
+  // Replay historical events to reconstruct current state
+  static fromEvents(events: BankAccountEvent[]): BankAccount {
+    const account = new BankAccount();
+    for (const event of events) {
+      account.apply(event);
+      account.version++;
+    }
+    return account;
+  }
+
+  // Domain logic validates rules against current state before producing a new event
+  withdraw(amountCents: number): BankAccountEvent {
+    if (amountCents <= 0) throw new Error('Withdrawal amount must be positive');
+    if (this.balanceCents < amountCents) {
+      throw new Error(`Insufficient funds: balance is ${this.balanceCents}, attempted ${amountCents}`);
+    }
+
+    return {
+      type: 'MoneyWithdrawn',
+      accountId: this.id,
+      amountCents,
+      timestamp: new Date().toISOString(),
+    };
+  }
+
+  // State mutation handler (pure function of state + event)
+  private apply(event: BankAccountEvent) {
+    switch (event.type) {
+      case 'AccountOpened':
+        this.id = event.accountId;
+        this.owner = event.owner;
+        this.balanceCents = event.initialBalanceCents;
+        break;
+      case 'MoneyDeposited':
+        this.balanceCents += event.amountCents;
+        break;
+      case 'MoneyWithdrawn':
+        this.balanceCents -= event.amountCents;
+        break;
+    }
+  }
+}
+```
+
+### 2. Append-Only SQL Event Store with Optimistic Concurrency:
+
+```typescript
+export class EventStore {
+  constructor(private readonly pool: any) {}
+
+  async append(streamId: string, expectedVersion: number, events: BankAccountEvent[]) {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      // 1. Check optimistic concurrency version to prevent split-brain updates
+      const versionRes = await client.query(
+        'SELECT COALESCE(MAX(version), 0) AS current_version FROM event_stream WHERE stream_id = $1',
+        [streamId]
+      );
+      const currentVersion = parseInt(versionRes.rows[0].current_version, 10);
+
+      if (currentVersion !== expectedVersion) {
+        throw new Error(`Concurrency conflict on stream ${streamId}: expected ${expectedVersion}, found ${currentVersion}`);
+      }
+
+      // 2. Append immutable events
+      let newVersion = currentVersion;
+      for (const event of events) {
+        newVersion++;
+        await client.query(
+          `INSERT INTO event_stream (stream_id, version, event_type, payload, created_at)
+           VALUES ($1, $2, $3, $4, NOW())`,
+          [streamId, newVersion, event.type, JSON.stringify(event)]
+        );
+      }
+
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
+  async loadStream(streamId: string): Promise<BankAccountEvent[]> {
+    const res = await this.pool.query(
+      'SELECT payload FROM event_stream WHERE stream_id = $1 ORDER BY version ASC',
+      [streamId]
+    );
+    return res.rows.map((row: any) => row.payload);
+  }
+}
+```
+
+## Verification
+
+1. **Replay determinism:** Rehydrate an aggregate from 1,000 events 10 times in a test suite. Verify that the resulting state is 100% identical on every execution.
+2. **Concurrency conflict verification:** Simulate two parallel withdrawals against version 5 of the same account. Verify that one succeeds and the other fails immediately with a `Concurrency conflict` error without corrupting the balance.
+3. **Time-travel query verification:** Replay events only up to timestamp `2026-01-01T00:00:00Z`. Verify that the calculated balance matches the historical bank statement exactly.
+4. **Snapshot acceleration benchmark:** Measure rehydration time for an entity with 10,000 events with and without snapshots. Verify that snapshotting keeps rehydration under 5 ms.
+
+## Why
+
+In the real world, transactions are events: a bank customer deposits money, an airline passenger reserves a seat, a doctor prescribes medication. The real world is append-only; you cannot "undo" the past, you can only record a compensating event that happens after it.
+
+Event Sourcing models software to reflect reality. By recording truth as it happens, it guarantees that no information is ever lost, provides perfect auditability, and allows businesses to discover new insights from historical data long after it was recorded.
+
+## When Not To Use
+
+- **CRUD with high-frequency updates and no audit need:** An IoT sensor reporting GPS coordinates every 100 ms will generate billions of events that provide no business value over keeping just the latest location.
+- **GDPR "Right to be Forgotten" strict compliance:** In an append-only immutable event store, completely erasing a user's personal data requires cryptographic shredding (encrypting each user's events with a unique key that is deleted) or rewriting the event stream.
+
+## Common Mistakes
+
+- **Storing derived state inside events:** Events should record facts and inputs (e.g., `ItemsOrdered`), not calculated totals that could become invalid if calculation formulas change later.
+- **Mutating past events:** Modifying historical events in production invalidates all downstream projections and destroys trust in the audit log.
+- **Forgetting snapshots on long-lived aggregates:** Replaying 50,000 events to calculate an account balance introduces seconds of latency on every transaction.

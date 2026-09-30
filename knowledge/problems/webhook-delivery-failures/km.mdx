@@ -1,0 +1,175 @@
+---
+title: "តើខ្ញុំគ្រប់គ្រង webhooks ដោយរបៀបណា?"
+question: "តើខ្ញុំអាចគ្រប់គ្រង Webhooks ពីភាគីទីបីដោយទុកចិត្តបានដោយរបៀបណា?"
+summary: "Webhooks ពីភាគីទីបី (Stripe, GitHub, Shopify) បញ្ជូនសារតាមគោលការណ៍ at-least-once, អាចមកដល់ច្រាសលំដាប់គ្នា, និង retry យ៉ាងខ្លាំងពេលមានបញ្ហា។ ឆ្លើយតប HTTP 200 ភ្លាមៗ រួចបញ្ជូនទិន្នន័យចូល queue ខាងក្នុងដើម្បីដំណើរការបែប idempotent។"
+tags: [webhooks, integration, payments, queues, idempotency]
+related: [patterns/idempotency, patterns/retry, tradeoffs/sync-vs-async]
+order: 13
+updated: "2026-09-12"
+contributors: [veasna]
+translation: draft
+---
+
+## Context
+
+កម្មវិធី e-commerce, SaaS ឬ fintech មួយទទួលការជូនដំណឹងតាមរយៈ webhooks ពីសេវាកម្មភាគីទីបី៖ Stripe សម្រាប់បញ្ជាក់ការកាត់ប្រាក់តាមកាត, Shopify សម្រាប់ការ update ការបញ្ជាទិញ, ឬ Twilio សម្រាប់របាយការណ៍ផ្ញើសារ SMS។
+
+ការសរសេរកូដដំបូង ដំណើរការ business logic ទាំងអស់ដោយផ្ទាល់នៅក្នុង webhook HTTP handler៖ ផ្ទៀងផ្ទាត់ហត្ថលេខា HMAC, parse JSON, ដំណើរការ ៤ queries ចូល database, ហៅ API ទៅកាន់ប្រព័ន្ធ ERP ខាងក្រៅ, និងផ្ញើអ៊ីមែលបញ្ជាក់ រួចទើប return HTTP 200 ក្រោយពេលស៊ីពេលអស់ 1,800 ms។
+
+នៅថ្ងៃមួយនោះ អំឡុងពេល database ដើរយឺតបន្តិច ឬពេលកំពុង deploy កូដថ្មី webhook handler នោះស៊ីពេលដល់ទៅ 5,500 ms។ Stripe កំណត់ timeout នៅត្រឹម 5,000 ms ក៏កត់ត្រាថាកម្មវិធីបរាជ័យ រួចចាប់ផ្តើម retry បញ្ជូន webhook ដដែលនោះមកម្តងទៀតតាមកាលវិភាគ exponential backoff។
+
+## Symptoms
+
+- **ការដំណើរការស្ទួនពីរដង (Duplicate Processing)៖** អតិថិជនទទួលបានអ៊ីមែលស្វាគមន៍ពីរដង ឬការជាវ subscription ត្រូវបានកាត់លុយពីរដង ដោយសារតែ provider ធ្វើការ retry លើ webhook ដែលជាក់ស្តែងខាងក្នុងបានដំណើរការរួចរាល់ទៅហើយ។
+- **ការដំណើរការច្រាសលំដាប់ (Out-of-order execution)៖** Webhook `subscription.deleted` ត្រូវបានដំណើរការមុន webhook `subscription.created` ដែលមកដល់យឺត ដែលបណ្តាលឱ្យ account របស់អតិថិជននៅតែស្ថិតក្នុងស្ថានភាព active ខណៈដែលវាគួរតែត្រូវបាន cancel។
+- **Provider បិទ Webhook Endpoint ចោល៖** បន្ទាប់ពី timeout បរាជ័យ ៥០ ដងជាប់ៗគ្នា Stripe ឬ Shopify នឹងបិទ webhook endpoint នោះចោលដោយស្វ័យប្រវត្តិ ដែលធ្វើឱ្យដំណើរការស្វ័យប្រវត្តិនៃការកាត់ប្រាក់ទូទាំងក្រុមហ៊ុនត្រូវជាប់គាំងទាំងស្រុង។
+- **Cascading Timeouts៖** នៅពេល server មានបន្ទុកធ្ងន់ ការដំណើរការ webhook យឺតៗនឹងដណ្តើមយក HTTP worker threads ដែលធ្វើឱ្យ server កាន់តែគាំងខ្លាំងឡើង។
+
+<Callout type="warning" title="Webhook Providers ធានាការបញ្ជូនយ៉ាងតិចម្តង (At-least-once) ប៉ុន្តែមិនធានាលំដាប់ឡើយ">
+Webhook មិនមែនជា RPC call ធម្មតាទេ។ Providers គ្រាន់តែធានាថាពួកគេនឹងបញ្ជូន event នោះយ៉ាងតិចម្តង (*at least once*) ប៉ុន្តែពួកគេអាចនឹងផ្ញើសារស្ទួន, retry ពេលដាច់ network និងអាចបញ្ជូនសារក្រោយមកដល់មុនសារដំបូងក៏មាន។
+</Callout>
+
+## Diagnose
+
+1. **ពិនិត្យមើលផ្ទាំង Webhook Dashboard របស់ Provider៖** ពិនិត្យមើលក្រាហ្វិក latency លើ Stripe ឬ GitHub developer dashboard។ ប្រសិនបើ p95 latency នៃ webhook របស់អ្នកលើសពី 1,500 ms នោះអ្នកកំពុងប្រឈមនឹងបញ្ហា timeout ជិតកើតឡើងហើយ។
+2. **ពិនិត្យមើលកូដក្នុង Webhook Handler៖** តើ endpoint នោះដំណើរការ API ទៅក្រៅ, បង្កើត PDF, ឬផ្ញើអ៊ីមែល មុនពេល return HTTP 200 ដែរឬទេ?
+3. **ពិនិត្យមើល Table Idempotency៖** តើកូដរបស់អ្នកមាន table សម្រាប់កត់ត្រា ID នៃ webhook ដែលបានដំណើរការរួច មុននឹងអនុវត្ត business logic ដែរឬទេ?
+
+## Options
+
+1. **ដំណើរការ Synchronous ក្នុង Handler ផ្ទាល់។** ដំណើរការអ្វីៗទាំងអស់ក្នុង HTTP handler រួច return 200 ពេលចប់។ (បរាជ័យភ្លាមៗពេលមាន latency កើតឡើង)។
+2. **ស្នើសុំ Provider ដំឡើង Timeout ឱ្យយូរជាងមុន។** សុំឱ្យគេរង់ចាំ 30 វិនាទី។ (Provider ភាគច្រើនមិនគាំទ្រឡើយ ហើយថែមទាំងធ្វើឱ្យខាតបង់ worker threads ទៀតផង)។
+3. **Asynchronous Ingestion (Acknowledge & Queue)។** ផ្ទៀងផ្ទាត់ហត្ថលេខា រួចបញ្ចូលទិន្នន័យចូល queue ខាងក្នុង ឬ database outbox រួច return HTTP 200 ភ្លាមៗក្នុងរយៈពេលក្រោម ២០ ms។
+4. **Idempotent Background Consumer ជាមួយ Event Ordering។** ដំណើរការសារពី queue នៅ background ជាមួយការត្រួតពិនិត្យ idempotency key និង timestamp នៃព្រឹត្តិការណ៍។
+
+## Trade-offs
+
+| វិធីសាស្ត្រ | Latency ទៅកាន់ Provider | ភាពធន់ពេលមានបញ្ហា | សុវត្ថិភាពពីការស្ទួនទិន្នន័យ |
+| :--- | :--- | :--- | :--- |
+| **Sync Processing** | 1,000–5,000 ms | **អន់ខ្លាំង** (ប្រឈមនឹងការត្រូវគេបិទ) | ខ្សោយ |
+| **Async Buffer Queue** | **< 25 ms** | **អតិបរមា** (ធន់ទោះ app មានបញ្ហា) | ទាមទារ consumer deduplication |
+| **Direct DB Outbox** | **< 20 ms** | ខ្ពស់ (ប្រើប្រាស់ standard SQL) | រឹងមាំ (unique constraint លើ event ID) |
+
+## Decision
+
+អនុវត្តតាម **គំរូទទួលស្គាល់ភ្លាមៗ រួចរុញចូល Queue (Acknowledge-and-Queue pattern)**៖
+
+1. **Fast-path Ingestion (HTTP Handler)៖**
+   - ផ្ទៀងផ្ទាត់ cryptographic HMAC signature (បដិសេធអ្នកផ្ញើក្លែងក្លាយជាមួយ HTTP 400 ភ្លាមៗ)។
+   - ពិនិត្យមើលថាតើ event ID ត្រូវបានដំណើរការរួចហើយឬនៅ; បើមានហើយ return HTTP 200 ភ្លាមៗ។
+   - បញ្ចូល event ទៅក្នុង table `incoming_webhooks` ឬរុញចូល queue (BullMQ / RabbitMQ)។
+   - ឆ្លើយតប **HTTP 200 OK ភ្លាមៗ** (គោលដៅ latency៖ < 30 ms)។
+2. **Slow-path Processing (Background Worker)៖**
+   - Background worker ទាញយក event ពី queue មកដំណើរការ។
+   - ការពារកុំឱ្យដំណើរការស្ទួនដោយប្រើ unique constraint លើ `event_id`។
+   - ច្រានចោល event ណាដែលមកច្រាសលំដាប់ ដោយប្រៀបធៀប `created_at` របស់ event ជាមួយ `last_updated_at` នៃទិន្នន័យជាក់ស្តែង។
+
+## Implementation
+
+### 1. Fast-Path HTTP Webhook Ingestion (Node.js / Express)៖
+
+```typescript
+import express from 'express';
+import crypto from 'crypto';
+import { pool } from './db';
+
+const app = express();
+
+// ប្រើ express.raw() ដើម្បីរក្សា raw bytes ដើមសម្រាប់ផ្ទៀងផ្ទាត់ HMAC
+app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), async (req, res) => {
+  const signature = req.headers['stripe-signature'] as string;
+  const secret = process.env.STRIPE_WEBHOOK_SECRET!;
+
+  // 1. ផ្ទៀងផ្ទាត់ Cryptographic HMAC (< 2 ms)
+  try {
+    // ក្នុង production៖ stripe.webhooks.constructEvent(req.body, signature, secret)
+  } catch (err) {
+    return res.status(400).send('ហត្ថលេខាមិនត្រឹមត្រូវ');
+  }
+
+  const event = JSON.parse(req.body.toString());
+
+  try {
+    // 2. រក្សាទុកក្នុង database queue យ៉ាងលឿនបំផុត (< 10 ms)
+    await pool.query(
+      `INSERT INTO incoming_webhooks (provider, event_id, event_type, payload, status)
+       VALUES ('stripe', $1, $2, $3, 'pending')
+       ON CONFLICT (provider, event_id) DO NOTHING`,
+      [event.id, event.type, JSON.stringify(event)]
+    );
+
+    // 3. ឆ្លើយតបទៅកាន់ provider ភ្លាមៗ!
+    return res.status(200).json({ received: true });
+  } catch (err) {
+    console.error('ការរក្សាទុក webhook បរាជ័យ', err);
+    // Return 500 ដើម្បីឱ្យ provider ធ្វើការ retry ប្រសិនបើ database ដាច់បណ្តោះអាសន្ន
+    return res.status(500).send('Storage failure');
+  }
+});
+```
+
+### 2. Idempotent Background Worker Processing៖
+
+```typescript
+export async function processWebhookQueue() {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // ទាញយក webhook ដែលកំពុង pending ជាមួយ lock
+    const res = await client.query(`
+      SELECT id, event_id, event_type, payload
+      FROM incoming_webhooks
+      WHERE status = 'pending'
+      ORDER BY created_at ASC
+      LIMIT 1 FOR UPDATE SKIP LOCKED
+    `);
+
+    if (res.rows.length === 0) {
+      await client.query('COMMIT');
+      return;
+    }
+
+    const webhook = res.rows[0];
+    const payload = JSON.parse(webhook.payload);
+
+    // ដំណើរការ business logic (អាចស៊ីពេល ៣ វិនាទីដោយសុវត្ថិភាព!)
+    await handleBusinessEvent(webhook.event_type, payload);
+
+    // កត់ត្រាថាបានដំណើរការរួចរាល់
+    await client.query(
+      `UPDATE incoming_webhooks SET status = 'processed', processed_at = NOW() WHERE id = $1`,
+      [webhook.id]
+    );
+
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('ការដំណើរការ webhook បរាជ័យ; worker នឹងសាកល្បងម្តងទៀត', err);
+  } finally {
+    client.release();
+  }
+}
+```
+
+## Verification
+
+1. **ផ្ទៀងផ្ទាត់ Latency ពី Provider Console៖** ពិនិត្យមើល developer console របស់ provider (ឧ. Stripe Webhook logs)។ Latency ឆ្លើយតបត្រូវតែរាយការណ៍ថា **< 50 ms** លើគ្រប់ព្រឹត្តិការណ៍ទាំងអស់។
+2. **ភាពធន់នឹង Event ស្ទួន៖** ផ្ញើ payload ដូចគ្នាបេះបិទពីរដងក្នុងរយៈពេល 100 ms ដោយប្រើ curl។ Request ទាំងពីរត្រូវតែទទួលបាន HTTP 200 ប៉ុន្តែ business logic (ដូចជាការផ្ញើអ៊ីមែល) ត្រូវតែដំណើរការ **តែម្តងគត់**។
+3. **ការស្តារឡើងវិញក្រោយ Server ដាច់៖** បិទ background worker រយៈពេល ១០ នាទីខណៈកំពុងទទួល webhooks។ ការទទួល webhooks នៅតែឆ្លើយតប 200 OK ធម្មតា។ នៅពេល worker បើកដំណើរការឡើងវិញ វានឹងទាញយកទិន្នន័យដែលកកស្ទះទាំងអស់មកដំណើរការរហូតដល់អស់ដោយរលូន។
+
+## Why
+
+ប្រព័ន្ធបញ្ជូន Webhook គឺជាប្រព័ន្ធ distributed ដែលមានកម្រិតកំណត់ timeout តឹងរ៉ឹង (ជាទូទៅ ៥ វិនាទី)។ ប្រសិនបើ server របស់អ្នកធ្វើការងារច្រើនបែប synchronous នោះរាល់ការយឺតយ៉ាវតិចតួចនៅខាងក្រោយ នឹងធ្វើឱ្យ webhook sender កត់ត្រាថាបរាជ័យ។
+
+ការបំបែកការទទួល (fast HTTP buffer) ចេញពីការដំណើរការ (asynchronous queue) ជួយឱ្យប្រព័ន្ធរបស់អ្នកមាន availability ខ្ពស់បំផុត ដោយមិនបាច់ខ្វល់ពីល្បឿននៃការដំណើរការទិន្នន័យឡើយ។
+
+## When Not To Use
+
+- **Webhook Verification Handshakes បែប Synchronous៖** Provider មួយចំនួន (ដូចជា WhatsApp ឬ Zoom) នឹងផ្ញើ `GET` ឬ `POST` ដំបូងដែលមាន challenge token ដែលទាមទារឱ្យឆ្លើយតប token នោះត្រឡប់ទៅវិញភ្លាមៗក្នុង response body។ ក្នុងករណីនេះ ត្រូវឆ្លើយតប challenge ភ្លាមៗ; ចំណែក event notifications ធម្មតាត្រូវបញ្ជូនចូល queue ដដែល។
+
+## Common Mistakes
+
+- **Parse JSON មុនពេលផ្ទៀងផ្ទាត់ HMAC។** ប្រសិនបើ JSON parser កែប្រែគម្លាតដកឃ្លា ឬលំដាប់ keys នោះ hash របស់ HMAC នឹងមិនត្រូវគ្នាជាមួយ signature របស់ provider ឡើយ ដែលបណ្តាលឱ្យមានកំហុស 400 រហូត។ ត្រូវផ្ទៀងផ្ទាត់លើ raw byte buffer ជានិច្ច។
+- **ឆ្លើយតប HTTP 200 ពេល HMAC បរាជ័យ។** កុំឆ្លើយតប 200 ឱ្យសោះបើ signature មិនត្រូវ; ត្រូវឆ្លើយតប 400 ឬ 401 ដើម្បីកុំឱ្យជនអនាមិកអាចបន្លំផ្ញើទិន្នន័យក្លែងក្លាយបាន។
+- **ភ្លេចការពារ Event មកច្រាសលំដាប់។** ប្រសិនបើអតិថិជន cancel subscription រួចចុះឈ្មោះឡើងវិញក្នុងរយៈពេល ៥ នាទី ការដំណើរការ event cancel ក្រោយគេ នឹងធ្វើឱ្យពួកគេបាត់បង់សិទ្ធិប្រើប្រាស់។ ត្រូវប្រៀបធៀប event timestamp ជាមួយ version របស់ entity ជានិច្ច។

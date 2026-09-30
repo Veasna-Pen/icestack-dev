@@ -1,0 +1,134 @@
+---
+title: "តើខ្ញុំការពារ cache stampede ដោយរបៀបណា?"
+question: "ហេតុអ្វីបានជា Database របស់ខ្ញុំគាំងនៅពេល Cache ផុតកំណត់?"
+summary: "នៅពេល key ក្នុង cache ដែលមាន traffic ច្រើនផុតកំណត់ Request រាប់ពាន់ក្នុងពេលតែមួយនឹងខកខាន cache (miss) ហើយសម្រុកទៅកាន់ database ព្រមគ្នា (thundering herd)។ ប្រើប្រាស់ probabilistic early recomputation (XFetch) ឬ singleflight mutex locks។"
+tags: [cache, redis, performance, database, concurrency]
+related: [problems/database-is-slow, problems/should-i-use-redis, patterns/caching]
+order: 9
+updated: "2026-09-12"
+contributors: [veasna]
+translation: draft
+---
+
+## Context
+
+ទំព័រដើមនៃវេបសាយ e-commerce ឬ media feed មួយដែលមាន traffic ខ្ពស់ បម្រើ 5,000 requests ក្នុងមួយវិនាទី។ Query នៅលើទំព័រដើមនេះស៊ីកម្លាំងខ្លាំង៖ វាត្រូវបូកសរុបទំនិញពិសេសៗ, reviews, និងផ្ទាំងផ្សព្វផ្សាយ ដែលស៊ីពេលប្រហែល 400 ms លើ PostgreSQL។
+
+ដើម្បីការពារ database ក្រុមការងារបាន cache លទ្ធផលនោះទុកក្នុង Redis ជាមួយ Time-To-Live (TTL) ១០ នាទី៖ `SETEX home_feed 600 JSON_DATA`។
+
+ក្នុងរយៈពេល ៩ នាទី និង ៥៩ វិនាទី អ្វីៗដំណើរការលឿនដូចផ្លេកបន្ទោរ៖ Redis ឆ្លើយតបក្នុងរយៈពេលត្រឹមតែ 1 ms ហើយ CPU របស់ database ស្ថិតនៅត្រឹម 5% ប៉ុណ្ណោះ។ ប៉ុន្តែនៅវិនាទីដែលឈានចូលនាទីទី ១០ មហន្តរាយក៏កើតឡើង។
+
+## Symptoms
+
+- Database CPU ស្ទុះឡើងពី 5% ដល់ 100% ក្នុងរយៈពេលមិនដល់ ២ វិនាទីផង។
+- ចំនួន database connection ឡើងដល់កម្រិតកំណត់ `max_connections` ភ្លាមៗ។
+- API p99 latency ឡើងពី 20 ms ដល់ជាង 30 វិនាទី ដោយបង្ហាញកំហុស HTTP 504 Gateway Timeout ពេញវេបសាយទាំងមូល។
+- បញ្ហានេះកើតឡើងដដែលៗរៀងរាល់ ១០ នាទីម្តង (ត្រូវគ្នានឹងរយៈពេល TTL របស់ cache)។
+
+<Callout type="warning" title="ការ Cache លើ Heavy Query មិនអាចការពារ Database បានទេនៅពេលវាផុតកំណត់">
+ប្រសិនបើ endpoint មួយទទួល 2,000 requests ក្នុងមួយវិនាទី ហើយ query ស៊ីពេល 500 ms នោះត្រឹមតែកន្លះវិនាទីក្រោយពេល cache ផុតកំណត់ **query ធ្ងន់ៗចំនួន ១,០០០** នឹងសម្រុកចូល database ក្នុងពេលតែមួយ។ នេះគឺជាបាតុភូត **Cache Stampede** (Thundering Herd)។
+</Callout>
+
+## Diagnose
+
+1. **ប្រៀបធៀប Database Spikes ជាមួយ Cache TTL៖** ពិនិត្យក្រាហ្វិក CPU របស់ database ធៀបនឹង log នៃការផុតកំណត់ key ក្នុង Redis។ ប្រសិនបើ DB CPU ឡើងខ្ពស់ត្រូវគ្នានឹងរយៈពេលនៃ TTL របស់អ្នក (ឧ. រៀងរាល់ ១០ នាទីម្តង) នោះការផុតកំណត់ cache គឺជាមូលហេតុពិតប្រាកដ។
+2. **ពិនិត្យមើល Query Concurrency ក្នុង Postgres៖** ដំណើរការ `SELECT query, count(*) FROM pg_stat_activity GROUP BY query;`។ អ្នកនឹងឃើញ process រាប់សិប ឬរាប់រយ កំពុងដំណើរការ query ដូចគ្នាបេះបិទក្នុងពេលតែមួយ។
+3. **គណនាចំនួន Query ដែលសម្រុកចូល៖**
+```text
+ចំនួន Query ចូល DB = Requests ក្នុងមួយវិនាទី × រយៈពេល query ដើរ (វិនាទី)
+```
+   នៅកម្រិត 2,000 req/sec និង query ស៊ីពេល 0.5s នោះ query ចំនួន ១,០០០ នឹងបុកចូល PostgreSQL ភ្លាមៗនៅវិនាទីដែល key បាត់ពី Redis។
+
+## Options
+
+1. **មិនកំណត់ពេលផុតកំណត់ (Infinite TTL) + Background Refresh Cron។** រក្សាទុក key ក្នុង Redis រហូត; worker ខាងក្រៅគណនាទិន្នន័យថ្មីរៀងរាល់ ៥ នាទីម្តង។
+2. **Distributed Mutex Lock (Singleflight)។** ពេល cache miss កើតឡើង ត្រូវ lock key ក្នុង Redis ជាបណ្តោះអាសន្ន។ អនុញ្ញាតឱ្យមានតែ request មួយគត់ដំណើរការ query ចូល database; request ដទៃទៀតត្រូវរង់ចាំ ឬទទួលទិន្នន័យចាស់។
+3. **Probabilistic Early Expiration (ក្បួនដោះស្រាយ XFetch)។** នៅពេល key ជិតដល់ពេលផុតកំណត់ កម្មវិធីនឹងគណនាទិន្នន័យថ្មីជាមុនដោយផ្អែកលើប្រូបាប៊ីលីតេ មុនពេល key ផុតកំណត់ជាក់ស្តែង។
+4. **Soft TTL + Stale-While-Revalidate។** រក្សាទុក timestamp ក្នុង payload។ ពេលផុត soft TTL ត្រូវបញ្ជូនទិន្នន័យចាស់ភ្លាមៗទៅអ្នកប្រើប្រាស់ ខណៈពេលគណនាទិន្នន័យថ្មីនៅ background។
+
+## Trade-offs
+
+| យុទ្ធសាស្ត្រ | កម្រិតការពារ | ផលប៉ះពាល់លើ Latency | ភាពស្មុគស្មាញ |
+| :--- | :--- | :--- | :--- |
+| **Simple TTL (ស្ថានភាពបច្ចុប្បន្ន)** | **គ្មាន (ធ្វើឱ្យ DB គាំង)** | Timeout 30s ពេលផុតកំណត់ | ទាប |
+| **Background Cron** | ខ្ពស់ | 0 ms (គ្មានប៉ះពាល់) | ខ្ពស់ (ពិបាកគ្រប់គ្រង cron លើ key ច្រើន) |
+| **Mutex Lock (Singleflight)** | ខ្ពស់ (មានតែ 1 query ចូល DB) | Requests ផ្សេងទៀតត្រូវរង់ចាំ 400 ms | មធ្យម |
+| **XFetch / Early Recomputation** | **អតិបរមា (Key មិនដែលផុតកំណត់)** | **0 ms (អ្នកប្រើតែងតែបាន cache hit)** | មធ្យម (រូបមន្តគណិតវិទ្យា) |
+
+## Decision
+
+ប្រើប្រាស់ **ការការពារពីរជាន់ (Two-tier Defense)**៖
+1. **សម្រាប់ In-process Requests៖** ប្រើប្រាស់ **Singleflight pattern** ដើម្បីឱ្យ request ច្រើនដែលមកដល់ container តែមួយសម្រាប់ key តែមួយ ចែករំលែក Promise តែមួយជាមួយគ្នា។
+2. **សម្រាប់ Distributed Cache៖** ប្រើប្រាស់ **Probabilistic Early Expiration (XFetch)**។ ជំនួសឱ្យការទុកឱ្យ key បាត់ភ្លាមៗ កម្មវិធីនឹងគណនាទិន្នន័យថ្មីជាមុនបន្តិច។ កាលណា traffic អានកាន់តែច្រើន ប្រូបាប៊ីលីតេនៃការ refresh ជាមុនកាន់តែខ្ពស់ ដែលធានាថា key នឹងមិនដែលបាត់បង់ពី Redis ឡើយ។
+
+## Implementation
+
+### Probabilistic Early Expiration (XFetch ក្នុង TypeScript)៖
+
+```typescript
+interface CacheEntry<T> {
+  value: T;
+  delta: number;   // រយៈពេលដែលចំណាយក្នុងការគណនាគិតជា ms
+  expiry: number;  // ពេលវេលាជាក់ស្តែងដែល key ត្រូវផុតកំណត់
+}
+
+// beta > 0 (លំនាំដើម 1.0)។ តម្លៃកាន់តែធំ ជំរុញឱ្យមានការ refresh កាន់តែលឿន
+export async function getWithXFetch<T>(
+  key: string,
+  ttlMs: number,
+  compute: () => Promise<T>,
+  beta = 1.0
+): Promise<T> {
+  const raw = await redis.get(key);
+
+  if (raw) {
+    const entry: CacheEntry<T> = JSON.parse(raw);
+    const now = Date.now();
+    const remainingTime = entry.expiry - now;
+
+    // រូបមន្ត XFetch៖ -beta * delta * ln(random())
+    const shouldRecompute = -beta * entry.delta * Math.log(Math.random()) > remainingTime;
+
+    if (!shouldRecompute) {
+      return entry.value; // Cache hit៖ បញ្ជូនទិន្នន័យភ្លាមៗ!
+    }
+    console.log(`XFetch: កំពុង refresh key "${key}" ជាមុនដោយស្វ័យប្រវត្តិ`);
+  }
+
+  // គណនាទិន្នន័យថ្មី
+  const start = Date.now();
+  const value = await compute();
+  const delta = Date.now() - start;
+
+  const newEntry: CacheEntry<T> = {
+    value,
+    delta,
+    expiry: Date.now() + ttlMs,
+  };
+
+  await redis.set(key, JSON.stringify(newEntry), 'PX', ttlMs);
+  return value;
+}
+```
+
+## Verification
+
+1. **Load Test ឆ្លងកាត់ពេលផុតកំណត់៖** ដំណើរការ load test 3,000 req/sec រយៈពេល ១៥ នាទី (`k6 run --duration 15m script.js`)។
+2. **ស្ថិរភាព CPU៖** Postgres CPU ត្រូវតែរក្សាស្ថិរភាពដដែល (ក្រោម 10%) នៅនាទីទី ១០ ដែលជាពេល key ផុតកំណត់។
+3. **Cache Hit Ratio៖** ប្រព័ន្ធ Monitoring ត្រូវតែបង្ហាញថាគ្មាន cache miss សូម្បីតែមួយកើតឡើងលើ endpoint នោះឡើយ ក្រោយពេល startup រួចរាល់។
+
+## Why
+
+TTL ធម្មតាក្នុង cache បង្កើតជាជ្រោះមហន្តរាយមួយ។ នៅពេល $T$ ទិន្នន័យមានស្រាប់; ប៉ុន្តែនៅពេល $T + 1$ ms ទិន្នន័យស្រាប់តែរលាយបាត់។
+
+ដោយសារតែ request ក្នុងប្រព័ន្ធដែលមាន traffic ខ្ពស់មកដល់តាម Poisson distribution នោះ request រាប់រយនឹងមកដល់ក្នុងចន្លោះពេលតែមួយមិល្លីវិនាទីក្រោយពេល key ត្រូវលុប។ តាមរយៈការប្រើប្រាស់រូបមន្តប្រូបាប៊ីលីតេ ($-\beta \cdot \delta \cdot \ln(U)$) យើងបានបម្លែងជ្រោះដ៏ចោទនោះ ឱ្យទៅជាជម្រាលរលូនមួយ ដែលធានាថាមាន caller តែម្នាក់គត់ refresh ទិន្នន័យនោះជាមុន មុនពេល key អាចផុតកំណត់បាន។
+
+## When Not To Use
+
+- **Endpoints ដែលមាន Traffic ទាប៖** បើ key មួយមាន request តែមួយរៀងរាល់ ៥ នាទីម្តង នោះ cache stampede មិនអាចកើតឡើងបានឡើយ។ TTL ធម្មតាគឺគ្រប់គ្រាន់ណាស់ហើយ។
+- **Query ស្រាលៗ៖** បើ SQL query ស៊ីពេលត្រឹមតែ 2 ms ការដំណើរការ ៥០ query ព្រមគ្នាមិនធ្វើឱ្យ database ថប់ដង្ហើមឡើយ។
+
+## Common Mistakes
+
+- **កំណត់ TTL ដូចគ្នាបេះបិទលើ Keys រាប់ម៉ឺន។** បើទំព័រទំនិញ ១០០,០០០ ទំព័រមាន `TTL = 3600` ដូចគ្នា នោះពួកវានឹងផុតកំណត់ក្នុងវិនាទីតែមួយទាំងអស់ ដែលបណ្តាលឱ្យ database ដួលរលំភ្លាមៗ។ ត្រូវបន្ថែម random jitter ជានិច្ច៖ `ttl = 3600 + Math.random() * 300`។
+- **កំណត់ Mutex Timeout យូរជ្រុល។** បើ process ដែលកាន់កាប់ lock ត្រូវគាំង request ដទៃទៀតត្រូវរង់ចាំយូរ។ ត្រូវកំណត់ lock TTL ឱ្យខ្លី (ឧ. ២ ទៅ ៥ វិនាទី)។

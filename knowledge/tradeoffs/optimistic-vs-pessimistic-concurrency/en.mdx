@@ -1,0 +1,152 @@
+---
+title: "Optimistic vs Pessimistic Locking"
+question: "When should I use SELECT FOR UPDATE locking versus version-based optimistic checks?"
+summary: "Pessimistic locking (SELECT FOR UPDATE) prevents conflicts by locking rows upfront, ideal for high-contention, low-latency financial balances and limited inventory. Optimistic concurrency control (OCC) checks versions at commit time, ideal for human editing workflows and low-conflict web requests."
+tags: [database, concurrency, transactions, locking, postgresql]
+related: [patterns/optimistic-locking, problems/database-deadlocks, patterns/distributed-lock]
+order: 9
+updated: "2026-09-12"
+contributors: [veasna]
+---
+
+## Context
+
+Whenever two or more database transactions attempt to read and modify the exact same row concurrently, concurrency control is required to prevent data corruption, race conditions, and the lost update problem.
+
+Engineers face a fundamental choice between two philosophies:
+1. **Pessimistic Concurrency Control (PCC):** Assume collisions are likely. Acquire exclusive row-level locks immediately upon reading (`SELECT ... FOR UPDATE`). Block all other transactions until the current transaction commits or rolls back.
+2. **Optimistic Concurrency Control (OCC):** Assume collisions are rare. Allow all transactions to read concurrently without any locks. At write time, verify that the record's version or state has not changed (`UPDATE ... WHERE id = ? AND version = ?`). If a collision occurs, abort the transaction and retry.
+
+Choosing incorrectly leads to either crippling database lock contention and deadlocks (misused pessimistic locking) or retry storms and CPU thrashing (misused optimistic concurrency).
+
+## Symptoms
+
+- **Pessimistic Failure Mode:** API throughput collapses under load; database connection pool is exhausted with transactions in `idle in transaction` or `waiting on lock`; frequent `ERROR: deadlock detected (SQLSTATE 40P01)`.
+- **Optimistic Failure Mode:** During a high-demand flash sale or ticket launch, 95% of customer transactions fail with `409 Conflict`; retry loops saturate web server and database CPU while processing almost zero successful orders.
+
+<Callout type="warning" title="Contention level dictates the right concurrency strategy">
+Optimistic concurrency excels when collision probability is < 2%. Pessimistic locking excels when collision probability is > 20% within short sub-5ms transactions.
+</Callout>
+
+## Diagnose
+
+1. **Calculate collision rate:** What percentage of concurrent writes target the exact same primary key within a 1-second window?
+2. **Measure transaction lifespan:** How many milliseconds does the transaction stay open? Does it involve external HTTP calls, file uploads, or user think time?
+3. **Inspect lock waiting metrics:** Check PostgreSQL `pg_stat_activity` for `wait_event_type = 'Lock'`. Are queries spending more time waiting for locks than executing?
+4. **Assess retry penalty:** If a transaction is aborted due to a conflict, how expensive is it to re-read and retry from scratch?
+
+## Options
+
+1. **Optimistic Concurrency Control (OCC) with Version:** Add a `version INT` column. Increment on update. Abort and return HTTP 409 if version mismatches.
+2. **Optimistic Atomic CAS (Compare-and-Swap):** Use conditional SQL without full versions: `UPDATE inventory SET stock = stock - 1 WHERE id = $1 AND stock >= 1`.
+3. **Pessimistic Exclusive Locking (`SELECT ... FOR UPDATE`):** Lock the target row for the duration of the transaction.
+4. **Pessimistic Non-Blocking (`SELECT ... FOR UPDATE NOWAIT` / `SKIP LOCKED`):** Attempt to lock; if already locked, fail fast or skip to the next available row (ideal for job worker queues).
+
+## Trade-offs
+
+| Dimension | Optimistic Concurrency (OCC) | Pessimistic Locking (PCC) |
+| :--- | :--- | :--- |
+| **Read Concurrency** | **Unrestricted (zero locks)** | Blocked by active updates |
+| **Performance Under Low Contention** | **Maximum throughput** | Slight lock overhead |
+| **Performance Under High Contention** | Degrades (CPU retry storms) | **Stable (queued in lock order)** |
+| **Deadlock Risk** | **Zero** | High (if lock order inconsistent) |
+| **Human Think-Time Compatibility** | **Fully compatible (stateless)** | **Catastrophic (holds DB connections)** |
+| **Transaction Duration** | Can span across HTTP calls | **Must be ultra-short (< 5 ms)** |
+
+## Decision
+
+- **Use Optimistic Concurrency Control for:**
+  - Human workflows: Web forms, document editing, user profile updates, CRM management where users open a page, think for minutes, and click Save.
+  - Low-contention distributed systems where concurrent updates to the same row occur on less than 1% of transactions.
+  - Read-heavy entities where locking would unnecessarily block millions of read-only queries.
+- **Use Pessimistic Locking (`SELECT FOR UPDATE`) for:**
+  - High-contention, machine-to-machine financial balances and wallet transfers where 50 concurrent payments target the same account within 100 ms.
+  - Highly limited inventory items (e.g. reserving the last 2 seats on an airplane) where optimistic retries would waste massive computing resources.
+  - Work queue consumer workers (use `SELECT ... FOR UPDATE SKIP LOCKED` to distribute background jobs across workers without collision).
+- **Golden Rule of Pessimistic Locking:** Never hold a pessimistic lock across a network call, third-party API request, or user interaction. Always keep pessimistic transactions under 5 milliseconds.
+
+## Implementation
+
+### 1. Pessimistic Locking: High-Contention Wallet Transfer (Strictly Ordered to Prevent Deadlocks)
+
+```typescript
+export async function transferFundsPessimistic(
+  client: any,
+  senderId: string,
+  recipientId: string,
+  amountCents: number
+) {
+  try {
+    await client.query('BEGIN');
+
+    // Prevent deadlocks by always locking rows in deterministic ascending ID order
+    const [firstId, secondId] = [senderId, recipientId].sort();
+
+    await client.query('SELECT id, balance_cents FROM accounts WHERE id = $1 FOR UPDATE', [firstId]);
+    await client.query('SELECT id, balance_cents FROM accounts WHERE id = $1 FOR UPDATE', [secondId]);
+
+    // Check balance and transfer atomically
+    const senderRes = await client.query('SELECT balance_cents FROM accounts WHERE id = $1', [senderId]);
+    if (senderRes.rows[0].balance_cents < amountCents) {
+      throw new Error('Insufficient funds');
+    }
+
+    await client.query('UPDATE accounts SET balance_cents = balance_cents - $1 WHERE id = $2', [amountCents, senderId]);
+    await client.query('UPDATE accounts SET balance_cents = balance_cents + $1 WHERE id = $2', [amountCents, recipientId]);
+
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  }
+}
+```
+
+### 2. Optimistic Concurrency: Document Editing with Version Checking
+
+```typescript
+export async function updateDocumentOptimistic(
+  db: any,
+  docId: string,
+  newContent: string,
+  expectedVersion: number
+) {
+  // Pure single query - no open transaction required!
+  const result = await db.query(
+    `UPDATE documents 
+     SET content = $1, version = version + 1, updated_at = NOW() 
+     WHERE id = $2 AND version = $3 
+     RETURNING version`,
+    [newContent, docId, expectedVersion]
+  );
+
+  if (result.rowCount === 0) {
+    throw new Error('Conflict: Document has been modified by another user. Please reload.');
+  }
+
+  return { newVersion: result.rows[0].version };
+}
+```
+
+## Verification
+
+1. **High contention stress test:** Simulate 500 concurrent requests trying to decrement a single counter from 500 to 0. Pessimistic locking should process all 500 cleanly in serial order, whereas optimistic locking will exhaust retries and waste CPU.
+2. **Low contention read throughput:** Under 10,000 req/sec across 1,000 different rows, verify that optimistic concurrency achieves 2–3x higher throughput than pessimistic locking by eliminating lock acquisition overhead.
+3. **Deadlock monitoring:** Ensure zero `deadlock detected` errors occur in PostgreSQL logs when running concurrent pessimistic transactions.
+
+## Why
+
+The trade-off between optimistic and pessimistic concurrency is fundamentally a choice between **optimizing for throughput** versus **optimizing for contention**:
+- When collisions are rare, locking rows upfront is unnecessary waste. Optimistic concurrency allows infinite read concurrency and eliminates lock coordination costs.
+- When collisions are guaranteed, allowing transactions to proceed optimistically only to fail at commit time creates wasted computation and severe retry storms. Pessimistic locking queues callers orderly at the database engine.
+
+## When Not To Use
+
+- **Pessimistic locking across HTTP calls:** Opening `BEGIN ... SELECT FOR UPDATE`, calling Stripe via HTTPS, and then committing will exhaust database connection pools in seconds.
+- **Optimistic concurrency for high-velocity auction bidding:** During the final 10 seconds of an online auction with 100 bids per second on 1 item, optimistic retries will cause 99% failures.
+
+## Common Mistakes
+
+- **Random lock ordering in pessimistic transactions:** Locking account A then B in one thread, and account B then A in another thread causes instant deadlocks. Always sort lock IDs.
+- **Missing retry limits in optimistic workflows:** Allowing an automated retry loop to run infinitely can cause livelocks that bring down application servers.
+- **Ignoring affected row counts in optimistic queries:** Forgetting to check `result.rowCount === 0` treats a failed optimistic update as a success.

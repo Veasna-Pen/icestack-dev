@@ -1,0 +1,122 @@
+---
+title: "SQL vs NoSQL"
+question: "តើខ្ញុំគួរប្រើ SQL ឬ NoSQL?"
+summary: "ជ្រើសរើស relational database ជាលំនាំដើម៖ វាដោះស្រាយសំណួរដែលផ្លាស់ប្តូរ ទំនាក់ទំនង និង transactions បានល្អ ហើយពង្រីកបានឆ្ងាយជាងអ្វីដែលផលិតផលភាគច្រើនត្រូវការ។ ជ្រើសរើស NoSQL store សម្រាប់ access pattern ជាក់លាក់មួយដែលវាបម្រើបានល្អជាង មិនមែនសម្រាប់តម្រូវការ 'scale' ឬ 'flexibility' ដែលមិនច្បាស់លាស់ទេ។"
+tags: [database, sql, nosql, postgres, mongodb, data-modeling]
+related: [problems/database-is-slow, problems/should-i-use-redis, tradeoffs/monolith-vs-microservices]
+order: 3
+updated: "2026-09-11"
+translation: draft
+---
+
+## Context
+
+ផលិតផលថ្មីមួយ ឬ service ថ្មីមួយនៅក្នុងប្រព័ន្ធដែលមានស្រាប់ ត្រូវការ primary database មួយ។ ក្រុមស្គាល់ SQL; មាននរណាម្នាក់ស្នើ MongoDB, DynamoDB ឬ Cassandra ព្រោះ «វា scale» ឬ «schema បត់បែន»។ នេះគឺជាការសម្រេចចិត្តមួយក្នុងចំណោមការសម្រេចចិត្តដែលពិបាកត្រឡប់វិញបំផុត ព្រោះទិន្នន័យរស់នៅយូរជាងកូដ។
+
+«NoSQL» គ្របដណ្តប់ប្រព័ន្ធដែលខុសគ្នាខ្លាំង៖ document stores (MongoDB), key-value stores (DynamoDB, Redis), wide-column stores (Cassandra) និង graph databases (Neo4j)។ អ្វីតែមួយគត់ដែលពួកវាមានរួមគ្នា គឺអ្វីដែលពួកវាមិនមែន។
+
+## Symptoms
+
+អ្វីដែលជាធម្មតាធ្វើឱ្យកើតសំណួរនេះ៖
+
+- Data model ដែលហាក់ដូចជាផ្លាស់ប្តូររៀងរាល់សប្តាហ៍។
+- ទិន្នន័យដែលមានកម្រិតជ្រៅ ដូចជា document ដែលមាន arrays នៅខាងក្នុង ដែលមានអារម្មណ៍ថាឆ្គងនៅក្នុង tables។
+- បរិមាណ write ខ្ពស់ដែលរំពឹងទុក៖ events, ទិន្នន័យពី IoT, logs។
+- ជំនឿថា relational databases «មិន scale»។
+- ក្រុមដែលស៊ាំនឹង JSON ច្រើនជាង SQL។
+
+## Diagnose
+
+សរសេរ **access patterns** ចុះ មិនមែន entities ទេ៖
+
+1. **តើអ្នកនឹងសួរសំណួរអ្វីខ្លះទៅកាន់ទិន្នន័យ?** រាយ queries សំខាន់បំផុតទាំងដប់។ តើវា filter, sort, join ឬ aggregate ឆ្លង entities ដែរឬទេ?
+2. **តើអ្នកដឹងសំណួរទាំងអស់ឥឡូវនេះហើយឬនៅ?** សំណួរអនាគតដែលមិនទាន់ដឹង គាំទ្រ SQL៖ query ថ្មីត្រូវការ index ថ្មី មិនមែនការរៀបចំទិន្នន័យថ្មីទេ។
+3. **តើអ្វីខ្លះត្រូវផ្លាស់ប្តូរជាមួយគ្នាដោយ atomic?** លុយផ្លាស់ទីរវាងគណនី; ស្តុក និង orders។ នោះមានន័យថា transactions ឆ្លង records។
+4. **តើបរិមាណពិតប្រាកដប៉ុន្មាន?** Rows, writes ក្នុងមួយវិនាទី ការកើនឡើងក្នុងមួយខែ។ Postgres instance តែមួយដែលមាន indexes ល្អ អាចដោះស្រាយ writes រាប់ពាន់ក្នុងមួយវិនាទី និង tables ដែលមាន rows រាប់ពាន់លាន។
+5. **នរណានឹងដំណើរការវា?** Managed Postgres និង MySQL ត្រូវបានគេយល់យ៉ាងច្បាស់។ ប្រព័ន្ធ NoSQL ខ្លះត្រូវការជំនាញដែលក្រុមមិនមាន។
+
+## Options
+
+1. **Relational (Postgres, MySQL)** ជាមួយ JSON columns សម្រាប់ផ្នែកដែលពិតជាប្រែប្រួល។
+2. **Document store (MongoDB)** សម្រាប់ documents ដែលឯករាជ្យ ដែលជាធម្មតាត្រូវបានអាន និងសរសេរទាំងមូល។
+3. **Key-value ឬ wide-column (DynamoDB, Cassandra)** សម្រាប់ទំហំធំខ្លាំង ដែល access patterns ត្រូវបានដឹងជាមុន។
+4. **Polyglot៖** relational ជា system of record បូក store ពិសេសមួយសម្រាប់ workload មួយ៖ search ក្នុង Elasticsearch ឬ OpenSearch, cache ក្នុង Redis, time series ក្នុង TimescaleDB ឬ ClickHouse។
+
+## Trade-offs
+
+| | Relational | Document | Key-value / wide-column |
+| :--- | :--- | :--- | :--- |
+| Queries ថ្មី និងមិនបានគ្រោងទុក | ល្អឥតខ្ចោះ | ល្អនៅក្នុង collection មួយ | ខ្សោយ៖ query នីមួយៗត្រូវរចនាជាមុន |
+| ទំនាក់ទំនង និង joins | មានស្រាប់ | មានកម្រិត (`$lookup`); ជាធម្មតា denormalize | គ្មាន; denormalize |
+| Transactions | ACID ច្រើន rows | ច្រើន documents ដោយមានដែនកំណត់ | មានកម្រិត ជាញឹកញាប់តែ item មួយ |
+| ការផ្លាស់ប្តូរ schema | Migrations ជាទម្លាប់ | បត់បែន ប៉ុន្តែកូដត្រូវដោះស្រាយទម្រង់ចាស់ៗ | បត់បែនតាម item នីមួយៗ |
+| ការពង្រីក writes តាមទទឹង | ពិបាកជាង៖ partitioning, sharding | Sharding មានស្រាប់ | មានស្រាប់ ជិតលីនេអ៊ែរ |
+| កម្រិតដែលក្រុមស្គាល់វា | ស្គាល់ច្បាស់ណាស់ | ស្គាល់ច្បាស់ | ខុសៗគ្នា; managed services ជួយបាន |
+| សមស្របធម្មតា | Business applications ភាគច្រើន | មាតិកា, catalogs, documents តាមអ្នកប្រើ | បរិមាណខ្ពស់ខ្លាំង ជាមួយ access ដែលអាចព្យាករបាន |
+
+គុណសម្បត្តិ «flexible schema» មួយផ្នែកគឺជាការបំភាន់។ Schema ផ្លាស់ចេញពី database ទៅក្នុងកូដ application ដែលអ្នកអានគ្រប់រូបត្រូវដោះស្រាយគ្រប់ទម្រង់ដែលទិន្នន័យធ្លាប់មាន។
+
+## Decision
+
+**ជ្រើសរើស Postgres (ឬ MySQL) ជាលំនាំដើម។** ប្រើ columns `jsonb` សម្រាប់ attributes ដែលប្រែប្រួល ហើយរក្សាទំនាក់ទំនង និងលុយនៅក្នុង tables។ ពិនិត្យឡើងវិញ នៅពេលអ្នកមាន access pattern **ជាក់លាក់ ដែលបានវាស់វែង** ដែល relational database បម្រើបានមិនល្អ៖
+
+- writes ជាប់លាប់លើសពីអ្វីដែល primary ដែលបានកែសម្រួលល្អអាចដោះស្រាយបាន ជាមួយទិន្នន័យដែលបែងចែកតាម key បានយ៉ាងស្អាត;
+- ការរកតាម key ក្នុងទំហំដែល managed key-value store ងាយស្រួលដំណើរការជាង;
+- documents ដែលតែងតែត្រូវបានអាន និងសរសេរទាំងមូល ហើយមិនដែល query ឆ្លងគ្នាទេ។
+
+ទោះបីជាដូច្នោះក៏ដោយ គួរបន្ថែម store ពិសេសមួយនៅក្បែរ relational system of record ជាជាងជំនួសវា។
+
+## Implementation
+
+Attributes បត់បែន ដោយមិនចាកចេញពី SQL៖ product catalog មួយដែលប្រភេទនីមួយៗមាន attributes ខុសៗគ្នា។
+
+```sql
+CREATE TABLE products (
+  id          bigserial PRIMARY KEY,
+  sku         text      NOT NULL UNIQUE,
+  name        text      NOT NULL,
+  price_cents integer   NOT NULL CHECK (price_cents >= 0),
+  category    text      NOT NULL,
+  attributes  jsonb     NOT NULL DEFAULT '{}'   -- e.g. {"screen_inches": 6.1, "color": "black"}
+);
+
+-- Index the JSON you actually query.
+CREATE INDEX products_attributes_idx ON products USING gin (attributes jsonb_path_ops);
+
+-- Query it like a document, join it like a table.
+SELECT p.sku, p.name
+FROM products p
+WHERE p.category = 'phones'
+  AND p.attributes @> '{"color": "black"}'
+ORDER BY p.price_cents
+LIMIT 20;
+```
+
+ទំនាក់ទំនង constraints និង transactions នៅតែនៅកន្លែងដែលវាថោក ហើយផ្នែកដែលប្រែប្រួលនៅតែបត់បែន។
+
+## Verification
+
+- **Queries កំពូលលឿន** លើបរិមាណទិន្នន័យជាក់ស្តែង៖ ដំណើរការ `EXPLAIN ANALYZE` លើទិន្នន័យទំហំប៉ុន production។
+- **ការព្យាករការកើនឡើងសមស្រប៖** rows និង writes ក្នុងមួយវិនាទីនៅ 12 និង 24 ខែ នៅតែស្ថិតក្នុងអ្វីដែល instance តែមួយ (បូក read replicas) អាចដោះស្រាយបាន ដោយមានលំហបម្រុង។
+- **សំណួរថ្មីៗមានតម្លៃថោក៖** សំណើមុខងារថ្មីៗមួយចំនួនចុងក្រោយ ត្រូវការ index ឬ query មិនមែន data migration ទេ។
+- **ប្រសិនបើអ្នកជ្រើសរើស NoSQL៖** រាល់ access pattern ត្រូវបានបម្រើដោយ key ឬ index ដែលរចនាសម្រាប់វា ហើយអ្នកបានសរសេរកត់ត្រាថា queries អនាគតណាខ្លះដែលការរចនានេះនឹងធ្វើឱ្យពិបាក។
+
+## Why
+
+Relational databases ធ្វើឱ្យប្រសើរសម្រាប់ការមិនដឹងសំណួររបស់អ្នកជាមុន៖ ទិន្នន័យដែលបាន normalize, joins និង indexes អនុញ្ញាតឱ្យអ្នកសួររឿងថ្មីៗពីទិន្នន័យចាស់។ NoSQL stores ភាគច្រើនធ្វើឱ្យប្រសើរសម្រាប់ការដឹងសំណួរ និងទំហំរបស់អ្នកជាមុន៖ ទិន្នន័យត្រូវបានរៀបចំសម្រាប់ access patterns ជាក់លាក់ ដែលជាអ្វីដែលធ្វើឱ្យការពង្រីកតាមទទឹងងាយស្រួល។ នៅដំណាក់កាលដំបូងនៃផលិតផល សំណួរផ្លាស់ប្តូរជានិច្ច ហើយទំហំនៅតិចតួច ដែលជាស្ថានភាពដែល relational databases ដោះស្រាយបានល្អបំផុត។
+
+## When Not To Use
+
+Relational ជាលំនាំដើម គឺជាជម្រើសខុស នៅពេល៖
+
+- **បរិមាណ write ពិតជាខ្លាំងមែនទែន** ហើយទិន្នន័យបែងចែកបានស្អាត ដូចជា telemetry ឬការទទួល events រាប់សែនក្នុងមួយវិនាទី។
+- **Workload មានលក្ខណៈពិសេស៖** full-text search, graph traversal, time-series analytics ឬ caching។ ប្រើ store ពិសេសសម្រាប់ workload នោះ នៅក្បែរ system of record។
+- **ក្រុមដំណើរការប្រព័ន្ធ NoSQL បានល្អរួចហើយ** ហើយ access patterns សមនឹងវា។
+
+## Common Mistakes
+
+- **ជ្រើសរើស NoSQL សម្រាប់ «scale» ដែលនៅឆ្ងាយរាប់ឆ្នាំ** ហើយបង់ថ្លៃការខ្វះ joins និង transactions តាំងពីថ្ងៃដំបូង។
+- **ចាត់ទុក MongoDB ដូច relational database** ដោយមាន references គ្រប់ទីកន្លែង និង `$lookup` នៅក្នុងផ្លូវដែលប្រើញឹកញាប់។
+- **ដាក់អ្វីៗទាំងអស់ក្នុង `jsonb`** ដែលសាងសង់ document store ឡើងវិញនៅក្នុង Postgres ហើយបោះបង់ constraints របស់វា។
+- **រចនា DynamoDB ដូច tables** ជំនួសឱ្យការរចនាពី access patterns បន្ទាប់មករកឃើញថា query ថ្មីត្រូវការ full scan។
+- **រំលង migrations សម្រាប់ទិន្នន័យ «schemaless»** ដូច្នេះទម្រង់ document ចាស់ៗរស់នៅជារៀងរហូត។

@@ -1,0 +1,155 @@
+---
+title: "CSR vs SSR"
+question: "តើនៅពេលណាដែលកម្មវិធី Web គួរប្រើប្រាស់ Client-Side Rendering (SPAs) ហើយនៅពេលណាដែលគួរប្រើ Server-Side Rendering (SSR / SSG)?"
+summary: "Client-Side Rendering (React/Vue SPAs) រុញបន្ទុក Render ទៅលើ Browser របស់អ្នកប្រើប្រាស់ ដែលផ្តល់នូវការប្តូរទំព័រលឿនដូចផ្លេកបន្ទោរ និងមិនស៊ី CPU របស់ Server ឡើយសម្រាប់ Dashboard ផ្ទៃក្នុង។ ចំណែក Server-Side Rendering (Next.js/Nuxt) រៀបចំ HTML ស្រេចនៅលើ Server ដែលល្អឥតខ្ចោះសម្រាប់ SEO, Social Share Previews, និងល្បឿនបង្ហាញទំព័រដំបូង (FCP) សម្រាប់វេបសាយសាធារណៈ។"
+tags: [frontend, architecture, ssr, csr, react, performance, web]
+related: [tradeoffs/serverless-vs-containers, patterns/caching, problems/slow-first-request]
+order: 16
+updated: "2026-09-12"
+contributors: [veasna]
+translation: draft
+---
+
+## Context
+
+នៅក្នុងការអភិវឌ្ឍន៍ Web សម័យទំនើប ការបង្កើតចំណុចប្រទាក់អ្នកប្រើប្រាស់ (UI Rendering) អាចធ្វើឡើងនៅទីតាំងចម្បងពីរ៖
+1. **Client-Side Rendering (CSR / Single Page Application - SPA)៖** Server គ្រាន់តែប្រគល់សំបក HTML ទទេមួយ (`<div id="root"></div>`) និងកញ្ចប់ JavaScript ធំមួយ។ Browser របស់អ្នកប្រើប្រាស់ជាអ្នកទាញយកកូដ JS, Parse វា, ដំណើរការកូដ, Fetch JSON ពី API, និង Render ទម្រង់ DOM ទាំងអស់ក្នុង RAM របស់ Browser ផ្ទាល់។
+2. **Server-Side Rendering (SSR)៖** Server ទាញយកទិន្នន័យពី Database រួច Render អត្ថបទ និងរូបភាពទាំងអស់ឱ្យក្លាយជា HTML ពេញលេញជាមុនសិន មុននឹងបញ្ជូនតាម Network។ អ្នកប្រើប្រាស់មើលឃើញទិន្នន័យភ្លាមៗពេលទំព័រមកដល់ រួចទើបកូដ JavaScript ភ្ជាប់ Event Listeners តាមក្រោយ (ដំណើរការ Hydration)។
+3. **Static Site Generation (SSG)៖** HTML ត្រូវបាន Render ទុកជាមុនតាំងពីពេល Build កូដ ហើយរក្សាទុកលើ CDN Edge ទូទាំងពិភពលោក។
+
+ការជ្រើសរើសខុស នឹងធ្វើឱ្យ Search Engine មើលមិនឃើញទិន្នន័យវេបសាយ និងធ្វើឱ្យទូរស័ព្ទដៃដំណើរការយឺត (ករណីយក CSR ទៅប្រើលើ E-commerce) ឬធ្វើឱ្យខាតបង់ថ្លៃ Server និងជួបបញ្ហា Hydration ស្មុគស្មាញ (ករណីយក SSR ទៅប្រើលើ Private Dashboard)។
+
+## Symptoms
+
+- **រោគសញ្ញាបរាជ័យនៃ CSR៖** Googlebot, Facebook, និង Telegram មិនអាចចាប់យកទិន្នន័យដើម្បីធ្វើ SEO ឬបង្កើតផ្ទាំង Preview ពេល Share Link បានឡើយ; អ្នកប្រើប្រាស់ទូរស័ព្ទដែលប្រើអ៊ីនធឺណិត 3G ត្រូវសម្លឹងមើលផ្ទាំងសទទេស្អាតអស់រយៈពេល ៤ វិនាទី អំឡុងពេលទាញយកកញ្ចប់ JS ទំហំ 3 MB។
+- **រោគសញ្ញាបរាជ័យនៃ SSR៖** CPU របស់ Node.js Server ឡើងកម្តៅដល់ ១០០% ដោយសារតែត្រូវ Render ដើមឈើ Component របស់ React រាល់ពេលមានសំណើចូល; អ្នកប្រើប្រាស់ចុចប៊ូតុងមិនដើរ (Rage Clicks) ព្រោះប៊ូតុងបង្ហាញរូបរាងហើយ តែមិនទាន់ Hydrate ចប់; ថ្លៃសេវា Hosting ឡើងខ្ពស់ខ្លាំង។
+
+<Callout type="warning" title="ទំព័រសាធារណៈទាមទារ SSR ឬ SSG; Private Dashboard ត្រូវការ CSR">
+ប្រសិនបើទំព័ររបស់អ្នកត្រូវការចំណាត់ថ្នាក់ល្អលើ Google Search ឬត្រូវការបង្ហាញផ្ទាំង Share លើ Telegram/Facebook ការប្រើ CSR គឺជាកំហុសធ្ងន់ធ្ងរសម្រាប់អាជីវកម្ម។ តែបើទំព័រនោះស្ថិតនៅពីក្រោយផ្ទាំង Login ការប្រើ SSR គ្រាន់តែបន្ថែមការស៊ី CPU របស់ Server ឥតប្រយោជន៍។
+</Callout>
+
+## Diagnose
+
+1. **ពិនិត្យមើលតម្រូវការ SEO និង Bots៖** តើប្រាក់ចំណូលរបស់ក្រុមហ៊ុនពឹងផ្អែកលើការស្វែងរកតាម Google (E-commerce, ព័ត៌មាន, Blog) ដែរឬទេ?
+2. **វាស់ស្ទង់ First Contentful Paint (FCP)៖** បើក Chrome DevTools Lighthouse លើទម្រង់ 4G Mobile។ តើ FCP យឺតលើសពី ២.៥ វិនាទីដោយសារតែការទាញយកកញ្ចប់ JavaScript ធំមែនទេ?
+3. **ពិនិត្យមើលរបាំងការពារ Login៖** តើទំព័រនោះស្ថិតនៅពីក្រោយផ្ទាំង Login ១០០% (ដូចជា Jira, Figma, Admin Portal) មែនទេ?
+4. **វាយតម្លៃថវិកា Server Compute៖** តើ Backend របស់អ្នកមានលទ្ធភាពចំណាយ CPU ដើម្បី Render ទំព័រ React រាប់ពាន់ក្នុងមួយវិនាទីទេ ឬតើគួររុញបន្ទុកនោះឱ្យទូរស័ព្ទ និងកុំព្យូទ័ររបស់ User ជាអ្នក Render?
+
+## Options
+
+1. **Pure Client-Side SPA (Vite + React / Vue)៖** ឯកសារ Static ផ្ទុកលើ S3 ឬ Cloudflare Pages។ គ្មានថ្លៃ Server ដំណើរការឡើយ។ (ការប្តូរទំព័រលឿន តែខ្សោយខាង SEO និងការបើកលើកដំបូង)។
+2. **Server-Side Rendering (Next.js / Nuxt / Remix)៖** Dynamic HTML ត្រូវបាន Render លើរាល់សំណើក្នុង Node.js/Edge។ (បង្ហាញទំព័រដំបូងភ្លាមៗ, SEO ល្អឥតខ្ចោះ, ស៊ី CPU របស់ Server)។
+3. **Static Site Generation (SSG / Astro)៖** HTML ត្រូវបាន Render ទុកជាមុនលើ CDN Edge។ (ល្បឿនបើកដំបូងលឿនបំផុត, ស៊ី CPU ០%, ពិបាកធ្វើទិន្នន័យ Real-time)។
+4. **Island Architecture (Astro)៖** ទំព័រជា HTML សុទ្ធពី Server ដោយដាក់បញ្ចូលកូដ Interactive "Islands" តែត្រង់កន្លែងណាដែលចាំបាច់ប៉ុណ្ណោះ។
+
+## Trade-offs
+
+| លក្ខណៈវិនិច្ឆ័យ | Client-Side Rendering (CSR) | Server-Side Rendering (SSR) | Static Site Generation (SSG) |
+| :--- | :--- | :--- | :--- |
+| **First Contentful Paint (FCP)** | យឺត (រង់ចាំទាញយក JS សិន) | **លឿន (ចេញ HTML ភ្លាម)** | **លឿនបំផុត (មាន HTML ស្រាប់)** |
+| **SEO & Social Previews** | ខ្សោយ / មិនច្បាស់លាស់ | **ល្អឥតខ្ចោះ (HTML ពេញលេញ)** | **ល្អឥតខ្ចោះ** |
+| **ការប្តូរទំព័របន្ទាប់** | **ភ្លាមៗ (Client-side Router)** | លឿន (Prefetch JSON) | លឿន |
+| **ថ្លៃដើម Server Compute** | **សូន្យ (ដាក់លើ CDN ឥតគិតថ្លៃ)** | ខ្ពស់ (Node.js Render រាល់ដង) | សូន្យ |
+| **រយៈពេល Build កូដ** | លឿន (ចេញ Bundle តែមួយ) | លឿន | យឺត (កើនតាមចំនួនទំព័រ) |
+| **ភាពស្រស់នៃទិន្នន័យ** | ស្រស់ជានិច្ច (Real-time) | ស្រស់ជានិច្ច | ចាស់រហូតដល់ Rebuild |
+
+## Decision
+
+- **ជ្រើសរើស Server-Side Rendering (SSR) ឬ SSG សម្រាប់៖**
+  - ហាងលក់ទំនិញអនឡាញ (E-commerce បញ្ជីទំនិញ, ទំព័រព័ត៌មានលម្អិត, Reviews)។
+  - ទំព័រផ្សព្វផ្សាយពាណិជ្ជកម្ម (Landing Pages), Blog ក្រុមហ៊ុន, ឯកសារ Documentation។
+  - វេទិកាព័ត៌មាន និងបណ្តាញសង្គមដែលការ Share Link លើ Telegram, Facebook, និង Twitter គឺជាប្រភព Traffic ចម្បង។
+- **ជ្រើសរើស Client-Side Rendering (CSR / SPA) សម្រាប់៖**
+  - Dashboard SaaS ដែលត្រូវ Login (Stripe Dashboard, Jira, Google Analytics)។
+  - កម្មវិធី Web ដែលមានអន្តរកម្មខ្ពស់ (Canva, Figma, កម្មវិធីកាត់តវីដេអូ, Spreadsheets)។
+  - ប្រព័ន្ធគ្រប់គ្រងផ្ទៃក្នុងរបស់បុគ្គលិក ដែលមិនខ្វល់ពីរឿង SEO ហើយការដាក់លើ Static Storage ជួយសន្សំសំចៃលុយ។
+- **ប្រើប្រាស់ Incremental Static Regeneration (ISR)៖** សម្រាប់វេបសាយ E-commerce ធំៗ (១០០,០០០ មុខទំនិញ) ត្រូវប្រើ SSG រួមផ្សំជាមួយ ISR ដើម្បី Cache ទំព័រទំនិញជា Static HTML ហើយ Re-generate ឡើងវិញក្នុង Background តែនៅពេលមានសំណើចូលមកក្រោយពេលផុត TTL ប៉ុណ្ណោះ។
+
+## Implementation
+
+### 1. SSR Route ទំនើបជាមួយ Next.js App Router (Server Component)៖
+
+```tsx
+// app/products/[id]/page.tsx - Server Component
+import { Suspense } from 'react';
+
+// កូដនេះដំណើរការតែនៅលើ Server ប៉ុណ្ណោះ! Secret Key និង DB មិនដែលលេចធ្លាយទៅ Client ឡើយ
+async function ProductDetails({ id }: { id: string }) {
+  const res = await fetch(`https://api.internal/products/${id}`, { next: { revalidate: 60 } });
+  const product = await res.json();
+
+  return (
+    <div className="product-card">
+      <h1>{product.title}</h1>
+      <p className="price">${(product.priceCents / 100).toFixed(2)}</p>
+      <p>{product.description}</p>
+    </div>
+  );
+}
+
+export default async function Page({ params }: { params: { id: string } }) {
+  return (
+    <main>
+      {/* Search Engine ទទួលបានទិន្នន័យ HTML ភ្លាមៗ; Client គ្រាន់តែ Hydrate ប៊ូតុងទិញ */}
+      <Suspense fallback={<p>កំពុងទាញយកព័ត៌មានទំនិញ...</p>}>
+        <ProductDetails id={params.id} />
+      </Suspense>
+    </main>
+  );
+}
+```
+
+### 2. Client-Side SPA (Vite + React) សម្រាប់ Dashboard ផ្ទៃក្នុង៖
+
+```tsx
+// CSR សុទ្ធ៖ លឿន មិនអស់លុយ Server Compute
+import { useEffect, useState } from 'react';
+
+export function UserDashboard() {
+  const [stats, setStats] = useState<any>(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    fetch('/api/user/stats')
+      .then((res) => res.json())
+      .then((data) => {
+        setStats(data);
+        setLoading(false);
+      });
+  }, []);
+
+  if (loading) return <div>កំពុងដំណើរការ Dashboard...</div>;
+
+  return (
+    <div className="dashboard-grid">
+      <h2>សូមស្វាគមន៍មកវិញ, {stats.name}!</h2>
+      <p>គម្រោងកំពុងដំណើរការ៖ {stats.activeProjects}</p>
+    </div>
+  );
+}
+```
+
+## Verification
+
+1. **ការធ្វើតេស្ត Search Engine Preview៖** ទាញយកទំព័រដោយប្រើ `curl -A "Googlebot" https://mywebsite.com/product/123`។ ផ្ទៀងផ្ទាត់ថាឈ្មោះទំនិញ, តម្លៃ, និង Meta Description មានវត្តមានក្នុង Raw HTML Response។
+2. **ផ្ទៀងផ្ទាត់ Social Share Card៖** ធ្វើតេស្ត Link លើ Telegram ឬ Facebook Sharing Debugger។ ធានាថា OpenGraph Image និង Description បង្ហាញរូបរាងភ្លាមៗ។
+3. **ការពិនិត្យ Core Web Vitals៖** វាស់វែង Largest Contentful Paint (LCP) លើទូរស័ព្ទដៃដោយប្រើ Google PageSpeed Insights។ ទំព័រ SSR/SSG គួរតែទទួលបានពិន្ទុលើសពី ៩០។
+
+## Why
+
+Web Browser គឺជាកម្មវិធីមើលឯកសារដែលទើបតែរៀនចេះដំណើរការកូដកម្មវិធីនៅពេលក្រោយ។
+- **SSR ចាត់ទុក Web ជាឯកសារមុនគេ៖** វាផ្តល់អាទិភាពដល់ការបញ្ជូនអត្ថបទ និងរូបភាពជាមុន ដើម្បីធានាថាមនុស្ស និង Web Crawlers អាចអានព័ត៌មានបានភ្លាមៗដោយមិនបាច់រង់ចាំកូដ JavaScript ដំណើរការចប់ឡើយ។
+- **CSR ចាត់ទុក Web ជា Application Runtime៖** វាប្តូរការខាតបង់ពេលទាញយកដំបូង ដើម្បីទទួលបានបទពិសោធន៍រលូនដូចកម្មវិធី Desktop នៅពេលដែលសំបក App បានទាញយកចប់សព្វគ្រប់។
+
+ការជ្រើសរើសស្ថាបត្យកម្ម Rendering ឱ្យស្របគ្នានឹងលក្ខណៈឯកជន ឬសាធារណៈនៃទិន្នន័យ គឺជាការសម្រេចចិត្តដ៏សំខាន់បំផុតក្នុងសមត្ថភាពនៃ Web សម័យទំនើប។
+
+## When Not To Use
+
+- **SSR សម្រាប់កម្មវិធី Offline-first Web App៖** ប្រសិនបើកម្មវិធីរបស់អ្នកត្រូវដំណើរការពេលគ្មានអ៊ីនធឺណិតតាមរយៈ Service Worker នោះការប្រើ SSR នឹងធ្វើឱ្យខូចសមត្ថភាព Offline; ត្រូវប្រើ Client-side PWA ជំនួសវិញ។
+- **CSR សម្រាប់សារព័ត៌មាន៖** ការបញ្ជូនអត្ថបទព័ត៌មានជាសំបក HTML ទទេដែលទាមទារកូដ JS ទំហំ 3 MB ដើម្បីអាន នឹងបំផ្លាញចំណាត់ថ្នាក់ស្វែងរក និងធ្វើឱ្យបាត់បង់អ្នកអានលើទូរស័ព្ទដៃ។
+
+## Common Mistakes
+
+- **បញ្ហា Hydration Mismatch ក្នុង SSR៖** ការ Render ម៉ោងដោយប្រើ Timezone របស់ម៉ាស៊ីន Client (`new Date().toLocaleTimeString()`) ធ្វើឱ្យ HTML លើ Server និង DOM លើ Client ខុសគ្នា ដែលបណ្តាលឱ្យ React បោះ Warning។
+- **កញ្ចប់ JS ធំពេកក្នុង CSR (Huge Bundles)៖** ការភ្លេចប្រើ Code-splitting (`React.lazy()`) បង្ខំឱ្យអ្នកប្រើប្រាស់ទូរស័ព្ទដៃត្រូវទាញយកកូដ Admin ទំហំ 5 MB គ្រាន់តែដើម្បីមើលទំព័រ Login មួយ។
+- **ដំណើរការ SSR ដោយគ្មាន Edge Caching៖** ការ Render ទំព័រសាធារណៈដែលដូចៗគ្នាឡើងវិញលើរាល់ Request ក្នុង Node.js ជំនួសឱ្យការ Cache HTML លើ CDN Edge។

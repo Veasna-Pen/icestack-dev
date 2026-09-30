@@ -1,0 +1,180 @@
+---
+title: "Ruby on Rails"
+question: "How do I configure Faraday timeouts, ActiveRecord idempotency, rack-attack, and Sidekiq in Rails?"
+summary: "Faraday timeouts and retries, database connection pools, atomic idempotency keys in ActiveRecord, Rails.cache, rack-attack, and Sidekiq background jobs."
+tags: [ruby, rails, activerecord, sidekiq, implementation]
+related: [patterns/retry, patterns/idempotency, patterns/caching, patterns/rate-limiting]
+order: 10
+updated: "2026-09-12"
+contributors: [veasna]
+---
+
+Production patterns for Ruby on Rails 7/8 on Ruby 3.3+. Covers Faraday outbound timeouts and retry middleware, ActiveRecord connection pool limits, atomic idempotency keys, Rails.cache, rack-attack rules, and Sidekiq jobs.
+
+## Timeouts first
+
+In Rails, configure database statement timeouts in `config/database.yml` and outbound HTTP timeouts on your HTTP client:
+
+```yaml
+# config/database.yml
+production:
+  adapter: postgresql
+  encoding: unicode
+  pool: <%= ENV.fetch("RAILS_MAX_THREADS") { 5 } %>
+  timeout: 5000
+  variables:
+    statement_timeout: 5000 # 5s statement timeout enforced by Postgres
+    lock_timeout: 2000      # 2s lock wait timeout
+```
+
+For outbound HTTP calls, always specify connect and read deadlines with Faraday:
+
+```ruby
+require 'faraday'
+
+class RatesService
+  def self.fetch_rates
+    conn = Faraday.new(url: 'https://api.example.com') do |f|
+      f.options.timeout = 2.0         # Total read timeout
+      f.options.open_timeout = 1.0    # Connect timeout
+      f.response :raise_error
+      f.adapter Faraday.default_adapter
+    end
+
+    response = conn.get('/rates')
+    JSON.parse(response.body)
+  rescue Faraday::TimeoutError
+    Rails.logger.error("Rates service timed out after 2s")
+    raise CustomTimeoutError, "Upstream rates API timed out"
+  end
+end
+```
+
+## Retry with backoff (Faraday Retry)
+
+Use Faraday's built-in retry middleware with exponential backoff and jitter:
+
+```ruby
+conn = Faraday.new(url: 'https://api.example.com') do |f|
+  f.request :retry, {
+    max: 3,
+    interval: 0.1,
+    interval_randomness: 0.5, # Jitter
+    backoff_factor: 2,
+    exceptions: [Faraday::TimeoutError, Faraday::ConnectionFailed],
+    retry_statuses: [408, 429, 500, 502, 503, 504],
+    methods: [:get, :head]    # Only retry idempotent verbs
+  }
+  f.adapter Faraday.default_adapter
+end
+```
+
+## Idempotency keys
+
+Enforce unique constraints in PostgreSQL and wrap order creation inside an `ActiveRecord::Base.transaction`:
+
+```ruby
+class OrdersController < ApplicationController
+  def create
+    idempotency_key = request.headers['Idempotency-Key']
+    return render json: { error: 'Idempotency-Key required' }, status: :bad_request unless idempotency_key
+
+    ActiveRecord::Base.transaction do
+      record = IdempotencyRecord.lock.find_or_initialize_by(key: idempotency_key)
+
+      if record.persisted?
+        if record.response_body.present?
+          return render json: record.response_body, status: record.status_code
+        else
+          return render json: { error: 'Request currently processing' }, status: :conflict
+        end
+      end
+
+      # Save record to claim lock
+      record.save!
+
+      order = Order.create!(
+        customer_id: params[:customer_id],
+        total_cents: params[:total_cents]
+      )
+
+      record.update!(
+        status_code: 201,
+        response_body: order.as_json
+      )
+
+      render json: order, status: :created
+    end
+  rescue ActiveRecord::RecordNotUnique
+    render json: { error: 'Concurrent duplicate request' }, status: :conflict
+  end
+end
+```
+
+## Caching (`Rails.cache`)
+
+Use `Rails.cache.fetch` with Redis to cache expensive queries with a strict TTL:
+
+```ruby
+class ProductService
+  def self.find_product(id)
+    Rails.cache.fetch("product:#{id}", expires_in: 5.minutes, race_condition_ttl: 10.seconds) do
+      Product.find_by(id: id)
+    end
+  end
+end
+```
+
+## Rate limiting (`rack-attack`)
+
+Protect endpoints against abuse in `config/initializers/rack_attack.rb`:
+
+```ruby
+class Rack::Attack
+  # Throttle POST requests to /login by IP address (5 requests per 20 seconds)
+  throttle('logins/ip', limit: 5, period: 20.seconds) do |req|
+    req.ip if req.path == '/login' && req.post?
+  end
+
+  # Throttle all API requests by bearer token or IP (100 req/min)
+  throttle('api/general', limit: 100, period: 1.minute) do |req|
+    if req.path.start_with?('/api')
+      req.env['HTTP_AUTHORIZATION'] || req.ip
+    end
+  end
+
+  self.throttled_responder = lambda do |_env|
+    [429, { 'Content-Type' => 'application/json' }, [{ error: 'Rate limit exceeded. Try later.' }.to_json]]
+  end
+end
+```
+
+## Background jobs with Sidekiq
+
+Enqueue jobs only after database commits using `after_commit` hooks:
+
+```ruby
+class Order < ApplicationRecord
+  after_commit :enqueue_receipt, on: :create
+
+  private
+
+  def enqueue_receipt
+    SendReceiptJob.perform_async(id)
+  end
+end
+
+class SendReceiptJob
+  include Sidekiq::Job
+  sidekiq_options retry: 5, backoff: :exponential
+
+  def perform(order_id)
+    order = Order.find_by(id: order_id)
+    return unless order # Guard against missing record
+    return if order.receipt_sent_at.present? # Idempotency check
+
+    # Send receipt logic...
+    order.update!(receipt_sent_at: Time.current)
+  end
+end
+```

@@ -1,0 +1,187 @@
+---
+title: "Ktor (Kotlin)"
+question: "How do I handle coroutine timeouts, Exposed connection pooling, and rate limiting in Ktor?"
+summary: "Coroutine timeouts, Ktor client retry with jitter, Exposed ORM with HikariCP, RateLimit plugin, and atomic idempotency in Kotlin."
+tags: [kotlin, ktor, coroutines, exposed, implementation]
+related: [patterns/retry, patterns/idempotency, patterns/caching, patterns/rate-limiting]
+order: 15
+updated: "2026-09-12"
+contributors: [veasna]
+---
+
+Production patterns for Ktor 3+ and Kotlin 2+. Demonstrates structured concurrency timeouts with coroutines, resilient Ktor client retries, Exposed ORM with HikariCP connection pooling, atomic transactions, and route-level rate limiting.
+
+## Timeouts first (Coroutines)
+
+In Kotlin, structured concurrency allows scoping timeouts to any suspending function using `withTimeout`:
+
+```kotlin
+package com.example.rates
+
+import io.ktor.client.*
+import io.ktor.client.request.*
+import io.ktor.client.statement.*
+import io.ktor.server.application.*
+import io.ktor.server.response.*
+import io.ktor.server.routing.*
+import io.ktor.http.*
+import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.TimeoutCancellationException
+
+fun Route.ratesRouting(client: HttpClient) {
+    get("/rates") {
+        try {
+            // Cancel coroutine and socket if response takes longer than 2000 ms
+            val body = withTimeout(2000L) {
+                val response = client.get("https://api.example.com/rates")
+                if (response.status != HttpStatusCode.OK) {
+                    throw IllegalStateException("Upstream returned ${response.status}")
+                }
+                response.bodyAsText()
+            }
+            call.respondText(body, ContentType.Application.Json)
+        } catch (e: TimeoutCancellationException) {
+            call.respond(HttpStatusCode.GatewayTimeout, mapOf("error" to "Exchange rates service timed out"))
+        }
+    }
+}
+```
+
+## Retry with backoff (Ktor Client Plugins)
+
+Configure `HttpTimeout` and `HttpRequestRetry` directly on the Ktor `HttpClient`:
+
+```kotlin
+import io.ktor.client.*
+import io.ktor.client.engine.cio.*
+import io.ktor.client.plugins.*
+import io.ktor.client.plugins.HttpRequestRetry
+import io.ktor.http.*
+import kotlin.time.Duration.Companion.seconds
+
+val httpClient = HttpClient(CIO) {
+    install(HttpTimeout) {
+        requestTimeoutMillis = 3000
+        connectTimeoutMillis = 1500
+        socketTimeoutMillis = 3000
+    }
+
+    install(HttpRequestRetry) {
+        maxRetries = 3
+        exponentialDelay(base = 0.2, maxDelayMs = 2000)
+        retryIf { _, response ->
+            response.status.value in listOf(408, 429, 500, 502, 503, 504)
+        }
+        retryOnExceptionIf { _, cause ->
+            cause is java.io.IOException
+        }
+        modifyRequest { request ->
+            request.headers.append("X-Retry-Attempt", retryCount.toString())
+        }
+    }
+}
+```
+
+## Database connection pool (HikariCP + Exposed)
+
+Configure HikariCP with statement timeouts and wrap operations in `newSuspendedTransaction`:
+
+```kotlin
+import com.zaxxer.hikari.HikariConfig
+import com.zaxxer.hikari.HikariDataSource
+import org.jetbrains.exposed.sql.Database
+import org.jetbrains.exposed.sql.transactions.experimental.newSuspendedTransaction
+import kotlinx.coroutines.Dispatchers
+
+fun initDatabase(jdbcUrl: String): Database {
+    val config = HikariConfig().apply {
+        this.jdbcUrl = jdbcUrl
+        driverClassName = "org.postgresql.Driver"
+        maximumPoolSize = 20
+        minimumIdle = 5
+        idleTimeout = 300_000
+        connectionTimeout = 3_000 // 3 seconds wait for connection
+        addDataSourceProperty("options", "-c statement_timeout=5000ms")
+    }
+
+    val dataSource = HikariDataSource(config)
+    return Database.connect(dataSource)
+}
+
+// Suspending query wrapper:
+suspend fun <T> dbQuery(block: suspend () -> T): T =
+    newSuspendedTransaction(Dispatchers.IO) { block() }
+```
+
+## Idempotency keys
+
+Safely insert orders using database constraints and atomic transactions:
+
+```kotlin
+import io.ktor.server.application.*
+import io.ktor.server.request.*
+import io.ktor.server.response.*
+import io.ktor.http.*
+import org.jetbrains.exposed.sql.*
+
+suspend fun handleCreateOrder(call: ApplicationCall) {
+    val key = call.request.headers["Idempotency-Key"]
+    if (key.isNullOrBlank()) {
+        call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Idempotency-Key header is required"))
+        return
+    }
+
+    val result = dbQuery {
+        val existing = IdempotencyTable.select { IdempotencyTable.key eq key }.singleOrNull()
+        if (existing != null) {
+            val cached = existing[IdempotencyTable.response]
+            return@dbQuery if (cached != null) {
+                HttpStatusCode.OK to cached
+            } else {
+                HttpStatusCode.Conflict to "{\"error\":\"Request in flight\"}"
+            }
+        }
+
+        // Insert claim
+        IdempotencyTable.insert {
+            it[IdempotencyTable.key] = key
+        }
+
+        // Create Order
+        val newId = OrdersTable.insertAndGetId {
+            it[customerId] = "cust_99"
+            it[totalCents] = 5000
+        }
+
+        val json = "{\"orderId\":${newId.value},\"status\":\"created\"}"
+        IdempotencyTable.update({ IdempotencyTable.key eq key }) {
+            it[response] = json
+        }
+
+        HttpStatusCode.Created to json
+    }
+
+    call.respondText(result.second, ContentType.Application.Json, result.first)
+}
+```
+
+## Rate limiting (`RateLimit` plugin)
+
+Ktor provides built-in rate limiting with token buckets:
+
+```kotlin
+import io.ktor.server.application.*
+import io.ktor.server.plugins.ratelimit.*
+import kotlin.time.Duration.Companion.seconds
+
+fun Application.configureRateLimiting() {
+    install(RateLimit) {
+        register(RateLimitName("public-api")) {
+            rateLimiter(limit = 60, refillPeriod = 60.seconds)
+            requestKey { call ->
+                call.request.origin.remoteAddress
+            }
+        }
+    }
+}
+```

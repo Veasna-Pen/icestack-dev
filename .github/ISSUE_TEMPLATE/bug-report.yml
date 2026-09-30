@@ -1,0 +1,37 @@
+name: Bug report
+description: Something on the website is broken or wrong.
+title: '[Bug] '
+labels: ['bug']
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. For a mistake in a page's content, a pull request using the page's **Edit this page** link is often quicker.
+  - type: input
+    id: url
+    attributes:
+      label: Page
+      description: The URL where it happens.
+      placeholder: 'https://…/en/problems/database-is-slow'
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what you saw instead. Screenshots help.
+    validations:
+      required: true
+  - type: input
+    id: browser
+    attributes:
+      label: Browser and device
+      placeholder: 'Chrome 140 on Android'
+  - type: dropdown
+    id: language
+    attributes:
+      label: Language
+      options:
+        - English
+        - Khmer
+        - Both

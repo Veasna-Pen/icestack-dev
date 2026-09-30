@@ -1,0 +1,162 @@
+---
+title: "ហេតុអ្វីបានជា request ដំបូងយឺត?"
+question: "ហេតុអ្វីបានជា API របស់ខ្ញុំដើរយឺតខ្លាំងលើ request ដំបូង?"
+summary: "ការឡើង latency ខ្ពស់លើ request ដំបូងជាទូទៅបណ្តាលមកពី lazy initialization៖ ការពន្យារពេលបង្កើត database connection handshake, JIT compilation, និង cache ដែលមិនទាន់កម្តៅ (warm up)។ ចូរបង្កើត connection pool ឱ្យរួចរាល់ជាមុនសិន មុននឹងបើកទទួល traffic។"
+tags: [performance, latency, cold-start, database, serverless]
+related: [problems/database-is-slow, problems/running-out-of-connections, patterns/caching]
+order: 8
+updated: "2026-09-12"
+contributors: [veasna]
+translation: draft
+---
+
+## Context
+
+សេវាកម្ម backend មួយដំណើរការលើ Kubernetes, AWS ECS ឬ serverless platform (ដូចជា AWS Lambda ឬ Google Cloud Run)។ នៅក្នុងប្រតិបត្តិការធម្មតា API endpoints ឆ្លើយតបយ៉ាងលឿនក្នុងរង្វង់ 30–50 ms។
+
+ប៉ុន្តែភ្លាមៗក្រោយពេលទើប deploy កូដថ្មីរួច, អំឡុងពេល autoscaling ពង្រីក container បន្ថែម, ឬបន្ទាប់ពីស្ងាត់ traffic មួយយប់ ស្រាប់តែ request ដំបូងបង្អស់ស៊ីពេលដល់ទៅ **2,500 ទៅ 4,000 ms**។ Request បន្ទាប់ៗមកទៀតដំណើរការលឿនធម្មតាវិញ។ អ្នកប្រើប្រាស់ជួបប្រទះការរង់ចាំវិលកង់យូរ ហើយ automated health check ពេលខ្លះ timeout និងបណ្តាលឱ្យ Kubernetes restart container ថ្មីនោះចោលទាំងមិនទាន់បានបម្រើ traffic ផង។
+
+## Symptoms
+
+- ក្រាហ្វិក P99.9 latency បង្ហាញការស្ទុះឡើងខ្ពស់ខ្លាំងភ្លាមៗក្រោយពេល deploy តាម CI/CD។
+- អ្នកប្រើប្រាស់ដំបូងគេដែលចុច checkout ឬ search ក្រោយពេល autoscaling ត្រូវរង់ចាំវិលកង់ដល់ទៅ ៣ វិនាទី។
+- Container logs បង្ហាញថា process ចាប់ផ្តើម startup ក្នុងរយៈពេលតែ 300 ms ប៉ុណ្ណោះ ប៉ុន្តែ HTTP handler ដំបូងស៊ីពេលដល់ 2,800 ms។
+- ការធ្វើ rolling update លើ Kubernetes បង្កឱ្យមានកំហុស 504 Gateway Timeout បណ្តោះអាសន្ននៅលើ ingress controllers។
+
+<Callout type="warning" title="Server ចាប់ផ្តើមលឿន មិនមែនមានន័យថា Server នោះក្តៅរួចរាល់ (warm) ទេ">
+ការបង្ហាញសារ `"Server listening on port 3000"` គ្រាន់តែមានន័យថា TCP port ត្រូវបានបើកប៉ុណ្ណោះ។ វាមិនមានន័យថា database connection ត្រូវបានបង្កើតរួច, TLS certificate ត្រូវបាន verify, ឬកូដត្រូវបាន JIT compiler compile រួចរាល់នោះឡើយ។
+</Callout>
+
+## Diagnose
+
+បំបែកមើលពេលវេលាដែល request ដំបូងចំណាយជាក់ស្តែង៖
+
+```text
+ពេលវេលាសរុបនៃ Request ដំបូង៖ 3,250 ms
+├── DNS Resolution & TCP/TLS Handshake៖ 120 ms
+├── ការបង្កើត Database Connection៖ 1,850 ms  <-- ៥៧% នៃពេលវេលាសរុប!
+│   ├── ស្វែងរក DNS ទៅកាន់ database host
+│   ├── TCP 3-way handshake
+│   ├── TLS handshake & certificate verification
+│   └── Database authentication & session initialization
+├── JIT bytecode compilation / classloading៖ 800 ms
+└── ការដំណើរការ SQL Query ជាក់ស្តែង៖ 480 ms
+```
+
+នៅក្នុងករណី 90% លើ non-serverless apps មូលហេតុចម្បងគឺ **Lazy Connection Pooling**៖
+Libraries ភាគច្រើន (ដូចជា `pg`, `node-postgres`, `HikariCP`, ឬ ORMs ដូចជា Prisma និង Hibernate) មិនបង្កើត database connection នៅពេល server ចាប់ផ្តើមដំណើរការនោះទេ។ ពួកវារង់ចាំរហូតដល់មាន request ដំបូងគេមកហៅ `db.query()` ទើបចាប់ផ្តើមបង្កើត។ អ្នកប្រើប្រាស់អភ័ព្វដំបូងគេនោះ ត្រូវរ៉ាប់រងការចំណាយពេលទាំងស្រុងក្នុងការបង្កើត connection pool។
+
+## Options
+
+1. **Keep-warm Cron Ping។** ដំណើរការ script ហៅ curl រៀងរាល់ ៥ នាទីម្តង ដើម្បីកុំឱ្យ container ដេកលក់។ (ជាវិធីដោះស្រាយបណ្តោះអាសន្នទូទៅលើ serverless ប៉ុន្តែគ្មានប្រសិទ្ធភាពពេល autoscaling បង្កើត container ថ្មីៗពេល traffic ឡើងខ្ពស់ឡើយ)។
+2. **Eager Database Connection Pre-warming។** ភ្ជាប់ទៅកាន់ database និងបង្កើតចំនួន connection អប្បបរមាទុកជាមុន អំឡុងពេល startup មុនពេលបើកទទួល HTTP traffic។
+3. **Pre-warming Caches សំខាន់ៗ។** ទាញយកទិន្នន័យ reference ថេរ (feature flags, permissions, configurations) មកដាក់ក្នុង memory អំឡុងពេល boot។
+4. **ទប់ស្កាត់តាមរយៈ Kubernetes Readiness Probes។** កំណត់ pod ថាជា `Ready` លុះត្រាតែដំណើរការកម្តៅ (warmup) ត្រូវបានបញ្ចប់សព្វគ្រប់ ដើម្បីកុំឱ្យ load balancer បញ្ជូន traffic ទៅកាន់ pod ដែលមិនទាន់រួចរាល់។
+
+## Trade-offs
+
+| វិធីសាស្ត្រ | ការការពារ Latency | ល្បឿន Startup | កម្លាំងអនុវត្ត |
+| :--- | :--- | :--- | :--- |
+| **Keep-warm Cron** | ខ្សោយ (មិនដំណើរការលើ pod ថ្មីពេល autoscaling) | លឿន | ទាប |
+| **Eager Pool Initialization** | **ខ្ពស់ (លុបបំបាត់ការពន្យារពេល DB ទាំងស្រុង)** | បន្ថែម ១–២ វិនាទីលើ startup | ទាប (កូដតែ ៥ ជួរ) |
+| **Readiness Probe Gating** | **ខ្ពស់ (ការពារអ្នកប្រើប្រាស់)** | Pod ស៊ីពេលយូរបន្តិចទើប Ready | កំណត់ config បន្តិចបន្តួច |
+| **Ahead-Of-Time (AOT) Build** | មធ្យម (ជួយសម្រាល JIT) | លឿន | ខ្ពស់ (ត្រូវកែប្រែ build tooling) |
+
+## Decision
+
+1. **កម្តៅ (Warm up) Database Pool ឱ្យរួចរាល់ពេល Startup៖** កុំពន្យារពេលបង្កើត database handshake រហូតដល់មាន request ដំបូងពីអ្នកប្រើប្រាស់ឱ្យសោះ។ ដំណើរការ query សាមញ្ញដូចជា `SELECT 1` មួយអំឡុងពេល boot ដើម្បីបង្ខំឱ្យ pool បង្កើត connection ទុកជាមុន។
+2. **ទប់ស្កាត់ Traffic ដោយប្រើ Readiness Probes៖** ត្រូវប្រាកដថា Kubernetes ឬ Cloud Load Balancer មិនបញ្ជូន traffic មកឡើយ រហូតទាល់តែការងារ initialize ត្រូវបានបញ្ចប់ដោយជោគជ័យ។
+3. **កុំពឹងផ្អែកលើ Keep-warm Cron Jobs៖** វិធីនេះបង្កើត traffic ក្លែងក្លាយ និងបរាជ័យទាំងស្រុងនៅពេល autoscaling បង្កើត replica pods ថ្មីៗអំឡុងពេល traffic ឡើងខ្ពស់ជាក់ស្តែង។
+
+## Implementation
+
+### 1. ការកម្តៅ Connection ជាមុនក្នុង Node.js
+
+```typescript
+import express from 'express';
+import { Pool } from 'pg';
+
+const app = express();
+export const pool = new Pool({
+  host: process.env.DB_HOST,
+  database: process.env.DB_NAME,
+  user: process.env.DB_USER,
+  password: process.env.DB_PASSWORD,
+  max: 10,
+  min: 2, // រក្សាទុក connection យ៉ាងតិច ២ ឱ្យក្តៅស្រាប់
+});
+
+let isReady = false;
+
+// Health check endpoint សម្រាប់ Kubernetes
+app.get('/healthz/ready', (req, res) => {
+  if (isReady) {
+    return res.status(200).send('READY');
+  }
+  return res.status(503).send('WARMING_UP');
+});
+
+async function startServer() {
+  console.log('កំពុងកម្តៅ database connection pool ជាមុន...');
+  const start = Date.now();
+
+  try {
+    // បង្កើត និងតេស្ត connection ជាមុន
+    const client = await pool.connect();
+    await client.query('SELECT 1');
+    client.release();
+    console.log(`Database pool បានកម្តៅរួចរាល់ក្នុងរយៈពេល ${Date.now() - start} ms`);
+
+    // កំណត់ថាសេវាកម្មរួចរាល់សម្រាប់ទទួល traffic
+    isReady = true;
+
+    app.listen(3000, () => {
+      console.log('HTTP server កំពុងបើកទទួល traffic លើ port 3000');
+    });
+  } catch (err) {
+    console.error('ការកម្តៅ database បរាជ័យ, បញ្ឈប់ការ startup', err);
+    process.exit(1);
+  }
+}
+
+startServer();
+```
+
+### 2. ការកំណត់រចនាសម្ព័ន្ធ Kubernetes Readiness Probe
+
+ត្រូវប្រាកដថា Kubernetes រង់ចាំរហូតដល់ដំណើរការ warmup បញ្ចប់ ទើបបញ្ជូន traffic មក៖
+
+```yaml
+readinessProbe:
+  httpGet:
+    path: /healthz/ready
+    port: 3000
+  initialDelaySeconds: 3
+  periodSeconds: 2
+  failureThreshold: 3
+```
+
+## Verification
+
+1. **វាស់ស្ទង់ Latency នៃ Request ដំបូង៖** ធ្វើការ deploy កូដថ្មី រួចបញ្ជូន curl request ទៅកាន់ endpoint ភ្លាមៗ។ Latency នៃ request ទី ១ គួរតែមានល្បឿនប្រហាក់ប្រហែលនឹង request ទី ១០០ ក្នុងចន្លោះខុសគ្នាត្រឹម $\pm 20$ ms ប៉ុណ្ណោះ។
+2. **គ្មាន Error ពេល Rolling Deploy៖** ដំណើរការ continuous load test (`k6 run loadtest.js`) ខណៈពេលកំពុង deploy កូដថ្មី។ ត្រូវប្រាកដថា **គ្មានកំហុស HTTP 502, 503, ឬ 504 សូម្បីតែមួយ** ហើយគ្មានការឡើង latency គំហុកឡើយ។
+
+## Why
+
+Network protocols ត្រូវការ round-trips ជាច្រើនដងដើម្បីបង្កើតការជឿទុកចិត្ត និង state មុនពេលអាចចាប់ផ្តើមបញ្ជូន application payload បាន៖
+- TCP៖ ១ round-trip (SYN, SYN-ACK, ACK)
+- TLS 1.3៖ ១ round-trip សម្រាប់ cryptographic key exchange
+- PostgreSQL៖ ២ ទៅ ៣ round-trips សម្រាប់ authentication salt, ការផ្ទៀងផ្ទាត់លេខសម្ងាត់ និងការកំណត់ session parameters
+
+ប្រសិនបើ database របស់អ្នកស្ថិតក្នុង availability zone ផ្សេង ឬ cloud region ផ្សេង ការចរចាបង្កើត connection តែមួយអាចស៊ីពេលរាប់រយមិល្លីវិនាទី។ ការទុកឱ្យដំណើរការនេះកើតឡើងលើ request ដំបូងរបស់អ្នកប្រើប្រាស់ គឺជាការធ្វើបាបអ្នកប្រើប្រាស់ដោយសារបញ្ហាប្រតិបត្តិការរបស់ប្រព័ន្ធ។
+
+## When Not To Use
+
+- **CLI Tools និង Batch Scripts ខ្លីៗ៖** ប្រសិនបើ script ដំណើរការតែម្តងហើយបិទវិញក្នុងរយៈពេល 500 ms នោះ lazy initialization គឺលឿនជាង ពីព្រោះ script នោះប្រហែលជាមិនទាំងត្រូវដំណើរការ query ទាំងអស់ផង។
+- **Serverless Scale-to-zero ខ្លាំង៖** លើ AWS Lambda ដែលមាន traffic ទាបខ្លាំង ហើយ instance ត្រូវបិទចោលរាល់ពេលដំណើរការចប់ ចូររក្សា startup code ឱ្យតូចបំផុត ហើយពិចារណាប្រើ connection proxy ដូចជា AWS RDS Proxy វិញ។
+
+## Common Mistakes
+
+- **បើក HTTP Listener មុនពេល Database រួចរាល់។** ប្រសិនបើ app បើក port 3000 ភ្លាម load balancer នឹងបញ្ជូន request មកភ្លាម មុនពេល pool ត្រូវបានបង្កើតរួចរាល់។
+- **ប្រើ Readiness Probe ដែលស៊ីកម្លាំងខ្លាំង។** Readiness probe ដំណើរការរៀងរាល់ប៉ុន្មានវិនាទីម្តង; វាគួរតែពិនិត្យត្រឹម boolean flag `isReady` មិនមែនទៅ run heavy SQL query រៀងរាល់ ៥ វិនាទីនោះឡើយ។
+- **ខកខានមិនបាន Cache DNS។** Node.js មិន cache DNS តាមលំនាំដើមឡើយ។ Request ដំបូងទៅកាន់ external API តែងតែរងការយឺតយ៉ាវដោយសារ DNS lookup ពេញលេញ។ គួរប្រើ caching DNS agent ឬកំណត់ `dns.setDefaultResultOrder`។

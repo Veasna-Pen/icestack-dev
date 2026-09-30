@@ -1,0 +1,177 @@
+---
+title: "How do I handle queue backpressure?"
+question: "Why is my message queue consumer running out of memory?"
+summary: "Message queue consumers crash with Out-Of-Memory errors when the broker pushes thousands of messages faster than the worker can process them. Enforce consumer prefetch limits and reactive backpressure."
+tags: [queues, rabbitmq, kafka, memory, backpressure, nodejs]
+related: [problems/memory-leak-in-production, problems/should-i-use-kafka, patterns/transactional-outbox]
+order: 20
+updated: "2026-09-12"
+contributors: [veasna]
+---
+
+## Context
+
+A background worker service processing jobs from a message broker (RabbitMQ, AWS SQS, or Redis BullMQ). The jobs perform I/O-heavy operations: downloading a PDF, resizing an image, or generating an AI transcription, each taking about 2,000 ms to complete.
+
+During normal business hours, jobs arrive at a rate of 5 per second. The worker process easily handles the workload using 150 MB of RAM.
+
+At 9:00 AM, a batch cron job enqueues 25,000 tasks into the queue within 10 seconds. The message broker immediately pushes all 25,000 messages to the connected worker. Within 4 seconds, the worker container's memory skyrockets past its 512 MB limit, and Kubernetes terminates the container with `OOMKilled` (Exit Code 137).
+
+The container restarts, reconnects to the queue, is immediately flooded with the same 25,000 unacknowledged messages, and crashes again in a continuous crash loop.
+
+## Symptoms
+
+- Queue worker pods restart in an infinite crash loop (`CrashLoopBackOff / OOMKilled`) whenever queue depth spikes.
+- The message broker reports 0 unacked messages before connection, and instantly thousands of unacked messages the millisecond the worker connects.
+- Memory usage spikes vertically within seconds of worker startup, even though the worker is only designed to process 5 tasks concurrently.
+- Other healthy consumers are starved of work because one greedy consumer pulled the entire queue into its internal RAM buffer.
+
+<Callout type="warning" title="By default, message brokers push as fast as the network allows">
+In protocols like AMQP (RabbitMQ), the broker does not wait for a worker to finish task #1 before sending task #2. Unless you explicitly set a **prefetch count**, the broker will dump every single pending message into the worker process's memory buffer.
+</Callout>
+
+## Diagnose
+
+1. **Check consumer unacked message count:** Look at your RabbitMQ or SQS management console. If a single consumer has 10,000 "Unacknowledged" messages in flight, the consumer lacks backpressure.
+2. **Review consumer initialization code:**
+   ```typescript
+   // THE UNBOUNDED CONSUMER BUG (RabbitMQ)
+   await channel.assertQueue('tasks');
+   // Missing: channel.prefetch(N)
+   channel.consume('tasks', async (msg) => {
+     await processTask(msg); // 25,000 promises created simultaneously in RAM!
+     channel.ack(msg);
+   });
+   ```
+   Without `channel.prefetch(10)`, RabbitMQ delivers all 25,000 messages into Node.js heap memory, creating 25,000 active JavaScript Promises concurrently.
+3. **Calculate memory per message:** If each message payload is 50 KB and creates 100 KB of execution context, buffering 20,000 messages consumes 20,000 × 150 KB = 3 GB of RAM!
+
+## Options
+
+1. **Increase container RAM to 8 GB.** (Expensive and fails as soon as a batch has 100,000 messages).
+2. **Enforce Consumer Prefetch Limit (`prefetch`).** Tell the message broker to send at most $N$ unacknowledged messages at a time (e.g. `prefetch: 10`). The broker holds the remaining 24,990 messages on disk.
+3. **Pull-based Polling (Long Polling).** Switch from push-based streams to explicit pull requests (`sqs.receiveMessage({ MaxNumberOfMessages: 10 })`).
+4. **Stream Backpressure.** Use Node.js Streams or Reactive Streams with high-watermark thresholds that pause the socket when memory buffers fill up.
+
+## Trade-offs
+
+| Strategy | Memory Safety | Queue Throughput | Implementation Effort |
+| :--- | :--- | :--- | :--- |
+| **No Limit (Default)** | **Dangerous (OOM Crash)** | High until crash | Zero |
+| **Prefetch Limit (e.g. 10)** | **100% Safe (Flat memory)** | **Optimal** | **1 line of code** |
+| **Pull-based (SQS Polling)** | **100% Safe** | Slightly higher latency | Low |
+| **Dynamic Concurrency Tuning** | Safe + Auto-tuning | Maximum | High |
+
+## Decision
+
+1. **Always set an explicit prefetch count:** Before consuming messages from any push-based broker (RabbitMQ, Redis Streams, Kafka), configure `channel.prefetch(N)`.
+   - Formula for optimal prefetch:
+     ```text
+     prefetch = concurrent_workers × 2
+     ```
+   - For a worker that processes 5 jobs concurrently, set `prefetch = 10`. This ensures worker threads never idle while preventing memory bloat.
+2. **Acknowledge (`ack`) only after completion:** Acknowledge the message only after business logic and database writes finish cleanly, so messages are re-queued if a worker ever crashes.
+
+## Implementation
+
+### 1. Enforcing Prefetch Limit in RabbitMQ / amqplib (TypeScript):
+
+```typescript
+import amqp from 'amqplib';
+
+const CONCURRENT_JOBS = 5;
+
+export async function startWorker() {
+  const connection = await amqp.connect(process.env.RABBITMQ_URL!);
+  const channel = await connection.createChannel();
+
+  const queueName = 'heavy_video_processing';
+  await channel.assertQueue(queueName, { durable: true });
+
+  // CRITICAL FIX: Tell RabbitMQ to send at most 10 unacknowledged messages to this worker
+  await channel.prefetch(CONCURRENT_JOBS * 2);
+
+  console.log(`Worker started with prefetch limit: ${CONCURRENT_JOBS * 2}`);
+
+  channel.consume(
+    queueName,
+    async (msg) => {
+      if (!msg) return;
+
+      try {
+        const data = JSON.parse(msg.content.toString());
+        console.log(`Processing job ${data.id}...`);
+
+        // Heavy I/O processing (e.g. 2,000 ms)
+        await processVideoJob(data);
+
+        // Acknowledge ONLY after successful processing
+        channel.ack(msg);
+      } catch (err) {
+        console.error('Job failed; rejecting without requeue', err);
+        // Reject and send to Dead Letter Queue (DLQ)
+        channel.nack(msg, false, false);
+      }
+    },
+    { noAck: false } // Enforce manual acknowledgments
+  );
+}
+```
+
+### 2. Pull-Based Batching in AWS SQS:
+
+```typescript
+import { SQSClient, ReceiveMessageCommand, DeleteMessageCommand } from '@aws-sdk/client-sqs';
+
+const sqs = new SQSClient({ region: process.env.AWS_REGION });
+
+export async function pollSQSQueue() {
+  while (true) {
+    // Pull-based: Worker dictates how much work it can take
+    const response = await sqs.send(
+      new ReceiveMessageCommand({
+        QueueUrl: process.env.SQS_QUEUE_URL,
+        MaxNumberOfMessages: 5, // Never pull more than 5 messages!
+        WaitTimeSeconds: 20,    // Long polling to eliminate empty responses
+      })
+    );
+
+    if (response.Messages && response.Messages.length > 0) {
+      await Promise.all(
+        response.Messages.map(async (message) => {
+          await processJob(message.Body);
+          await sqs.send(
+            new DeleteMessageCommand({
+              QueueUrl: process.env.SQS_QUEUE_URL,
+              ReceiptHandle: message.ReceiptHandle,
+            })
+          );
+        })
+      );
+    }
+  }
+}
+```
+
+## Verification
+
+1. **Backlog flood test:** Publish 20,000 messages to the queue while the worker is offline.
+2. **Start the worker:** Boot the worker container.
+3. **Verify memory flatness:** Inspect container memory in `kubectl top pod` or Datadog. Memory usage must stay **completely flat (< 120 MB)** throughout the entire multi-hour drainage.
+4. **Queue distribution:** If you scale up to 4 worker pods, the 20,000 messages should be distributed evenly (10 unacked messages per pod).
+
+## Why
+
+Push-based messaging models decouple producers from consumers. While this protects producers from slowing down, it shifts the burden of buffer management to the network and consumer.
+
+Without backpressure, the consumer's TCP socket receive buffer continuously reads incoming frames and enqueues them into JavaScript heap memory. Backpressure throttles the producer by pausing TCP window updates, forcing the message broker to keep the backlog safely persisted on its own disk storage.
+
+## When Not To Use
+
+- **Sub-millisecond gaming telemetry:** For ultra-lightweight, loss-tolerant metrics where losing messages is better than delaying them, unbuffered UDP streams or drop-tail queues are used instead of flow-controlled queues.
+
+## Common Mistakes
+
+- **Setting `noAck: true`.** In RabbitMQ, `noAck: true` tells the broker that messages are acknowledged the instant they leave the broker's socket. This disables prefetch completely and deletes messages if the worker crashes mid-task!
+- **Setting prefetch to 1 on high-throughput queues.** While safe, `prefetch: 1` introduces network latency bubbles: when the worker finishes a job, it must wait for a network round-trip to receive the next message. Setting `prefetch = concurrent_jobs * 2` keeps the pipeline full.
+- **Forgetting Dead-Letter Queues (DLQ).** If a malformed message throws a crash on every processing attempt and is rejected with `requeue: true`, it creates a poison pill loop that spins CPU infinitely. Always configure a dead-letter exchange.

@@ -1,0 +1,84 @@
+---
+title: "Storing passwords safely"
+summary: "Hash passwords with a slow, salted algorithm, so a leaked database doesn't hand attackers your users' passwords."
+minutes: 10
+related: [patterns/rate-limiting]
+updated: "2026-09-30"
+contributors: [Veasna-Pen]
+---
+
+## The problem
+
+A backup of your database is leaked. The `users` table has a `password` column containing values like `5f4dcc3b5aa765d61d8327deb882cf99`. It looks scrambled, so you feel safe.
+
+It isn't. That is an unsalted MD5 hash of `password`. An attacker can look it up in a public table in a second, and with a graphics card they can try **billions** of MD5 guesses per second against the rest. Many of your users reuse that password for their email.
+
+## The idea
+
+Never store the password itself. Store a **hash**: the output of a one-way function. At login, hash what the user typed and compare the two.
+
+But not every hash is suitable. A good password hash has three properties:
+
+1. **Salted.** A random value, different for every user, is mixed in. Two users with the same password get different hashes, so one guess can't crack them all at once, and precomputed tables don't work.
+2. **Slow on purpose.** MD5 and SHA-256 are designed to be fast, which is exactly what an attacker wants. Password hashes like **Argon2id** or **bcrypt** are designed to take tens of milliseconds, which is nothing for one login but makes billions of guesses impossible.
+3. **Tunable.** You can raise the cost as computers get faster.
+
+Libraries handle all three for you: they generate the salt, store it inside the hash string, and compare safely. **Never write your own.**
+
+## Example
+
+With the `argon2` package in Node.js:
+
+```ts
+import argon2 from 'argon2';
+
+// sign-up: store only the hash
+const hash = await argon2.hash(password, { type: argon2.argon2id });
+await db.user.create({ data: { email, passwordHash: hash } });
+// hash looks like: $argon2id$v=19$m=65536,t=3,p=4$<salt>$<hash>
+
+// login: compare what they typed with the stored hash
+const user = await db.user.findUnique({ where: { email } });
+const valid = user ? await argon2.verify(user.passwordHash, password) : false;
+if (!valid) return res.status(401).json({ error: 'Wrong email or password' });
+```
+
+Each hash takes about 50 ms to compute: fine for a login, but it means an attacker who steals the database can try only about 20 guesses per second per CPU core, instead of billions.
+
+<Warning title="Also limit login attempts">
+A slow hash protects a stolen database. Attackers can also guess through your login form, so rate-limit login attempts per account and per IP address.
+</Warning>
+
+## Try it
+
+1. Find how your app stores passwords. Search for `password` in the database schema and the sign-up code.
+2. If it uses MD5, SHA-1, SHA-256 or no hash at all, plan a migration: hash new passwords with Argon2id or bcrypt, and re-hash old ones the next time each user logs in successfully.
+3. Time one `hash` call in your environment. Aim for roughly 50 to 250 ms.
+4. Check that your login error message is the same for "no such email" and "wrong password".
+
+## Check yourself
+
+**1. Why is SHA-256 a poor choice for passwords, even though it is secure for other uses?**
+
+<Answer>
+It is designed to be fast. An attacker with a stolen database can compute billions of SHA-256 guesses per second. Password hashes such as Argon2id and bcrypt are deliberately slow and salted.
+</Answer>
+
+**2. Two users both choose `sunshine1`. With a salted hash, do they get the same stored value?**
+
+<Answer>
+No. Each has a different random salt, so their hashes differ. An attacker has to crack each one separately, and precomputed lookup tables don't help.
+</Answer>
+
+**3. Why should "email not found" and "wrong password" show the same message?**
+
+<Answer>
+Different messages tell an attacker which email addresses have accounts, which helps them target those accounts with guesses or phishing.
+</Answer>
+
+## Key takeaways
+
+- Store a **hash**, never the password.
+- Use a **slow, salted password hash**: Argon2id or bcrypt, not MD5 or SHA-256.
+- Let a **library** handle salts and comparison.
+- Pair it with **rate-limited logins** and one generic error message.

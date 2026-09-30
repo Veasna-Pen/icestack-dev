@@ -1,0 +1,133 @@
+---
+title: "How do I fix N+1 queries?"
+question: "Why is my ORM making hundreds of database queries?"
+summary: "The N+1 query problem happens when fetching a list of records executes one initial query followed by N individual queries for each item's relation. Use eager loading, batch joins, or DataLoader."
+tags: [database, orm, prisma, performance, sql]
+related: [problems/database-is-slow, patterns/caching]
+order: 10
+updated: "2026-09-12"
+contributors: [veasna]
+---
+
+## Context
+
+An API endpoint that returns a list of 50 recent blog posts or orders. The endpoint uses an ORM (like Prisma, TypeORM, Hibernate, or Eloquent) or a GraphQL resolver.
+
+In development, with 3 test items in the database, the page loaded in 15 ms. In production, with 50 items per page, the endpoint takes 1,400 ms. Looking at database query logs reveals that a single API request triggered **51 separate SQL queries**.
+
+## Symptoms
+
+- A single HTTP request produces dozens or hundreds of SQL statements in database logs:
+  ```sql
+  SELECT * FROM orders LIMIT 50;
+  SELECT * FROM users WHERE id = 1;
+  SELECT * FROM users WHERE id = 2;
+  SELECT * FROM users WHERE id = 3;
+  -- ... repeating 50 times!
+  ```
+- Database connection pool exhaustion under modest traffic.
+- P95 latency scales linearly with the number of items on the page (20 items = 200 ms, 100 items = 1,200 ms).
+- High network latency overhead between the application server and the database.
+
+<Callout type="warning" title="Network round-trips kill ORM performance, not SQL execution">
+Running 50 queries that take 0.5 ms each does not take 25 ms in production. If the network round-trip between your app container and your cloud database is 2 ms, 50 queries take at least 50 × 2 ms = 100 ms of pure idle network waiting.
+</Callout>
+
+## Diagnose
+
+1. **Enable query logging:** In your development environment or staging, turn on ORM query logging (e.g. `DEBUG="prisma:client:query"` or `DB::enableQueryLog()`). Count how many queries execute for a single request.
+2. **Inspect loops in application code:** Search for `for` loops or `.map()` calls that execute `await db...` inside the iteration:
+   ```typescript
+   // THE N+1 ANTI-PATTERN
+   const orders = await db.orders.findMany(); // 1 query
+   for (const order of orders) {
+     order.user = await db.users.findUnique({ where: { id: order.userId } }); // N queries!
+   }
+   ```
+3. **GraphQL Resolvers:** In GraphQL, if a field resolver fetches relations without batching, fetching a list of 100 authors and their books will trigger 1 query for authors and 100 queries for books.
+
+## Options
+
+1. **Eager Loading with SQL Joins.** Tell the ORM to load the relation upfront using a SQL `LEFT JOIN` or eager `include`.
+2. **Two-Query In-Memory Joining.** Execute 1 query for the parent records, collect all unique foreign IDs, execute 1 `WHERE id IN (...)` query for all children, and join them in application memory.
+3. **DataLoader Pattern.** Coalesce and batch individual item requests from different parts of the call tree into a single batched query during the same event loop tick.
+
+## Trade-offs
+
+| Approach | Query Count | Memory Overhead | Good For |
+| :--- | :--- | :--- | :--- |
+| **N+1 (Naive)** | $N + 1$ (51 queries) | Low | Never in production |
+| **SQL Join (`include`)** | **1 query** | Duplicate parent columns over wire | 1-to-1 or 1-to-few relations |
+| **Batch (`IN (...)`)** | **2 queries** | Clean memory allocation | 1-to-many collections |
+| **DataLoader** | **2 queries per tick** | Caches within request scope | GraphQL, nested service architectures |
+
+## Decision
+
+- **For standard REST endpoints:** Use ORM **eager loading** (`include` in Prisma, `relations` in TypeORM, `with()` in Laravel/Eloquent). This replaces 51 queries with either 1 single `JOIN` query or 2 batched queries.
+- **For GraphQL or decoupled service trees:** Use the **DataLoader pattern** to automatically batch individual key lookups across resolvers without tight coupling.
+
+## Implementation
+
+### 1. Fixing N+1 in Prisma (TypeScript)
+
+```typescript
+// BEFORE (N+1 queries):
+// const posts = await prisma.post.findMany({ take: 50 });
+// for (const post of posts) {
+//   post.author = await prisma.user.findUnique({ where: { id: post.authorId } });
+// }
+
+// AFTER (Eager Loading - 1 single optimized batch query):
+export async function getRecentPostsWithAuthors() {
+  return await prisma.post.findMany({
+    take: 50,
+    include: {
+      author: {
+        select: { id: true, name: true, avatarUrl: true },
+      },
+    },
+  });
+}
+```
+
+### 2. Using DataLoader for decoupled batching
+
+```typescript
+import DataLoader from 'dataloader';
+
+// Batches 50 individual calls into: SELECT * FROM users WHERE id IN ($1, $2, ...)
+const userLoader = new DataLoader(async (userIds: readonly string[]) => {
+  const users = await prisma.user.findMany({
+    where: { id: { in: [...userIds] } },
+  });
+
+  const userMap = new Map(users.map((u) => [u.id, u]));
+  // DataLoader requires results returned in the EXACT order of the keys
+  return userIds.map((id) => userMap.get(id) || null);
+});
+
+// Call from anywhere in your resolvers:
+export async function getAuthorForPost(authorId: string) {
+  return await userLoader.load(authorId); // Automatically batched!
+}
+```
+
+## Verification
+
+1. **Query count assertion in unit tests:** Add a test verifying that fetching 10 items and fetching 100 items executes the **exact same number of SQL queries** (e.g. exactly 1 or 2 queries).
+2. **Latency stability:** Compare endpoint response times: latency should remain virtually identical whether loading 10 or 100 rows.
+
+## Why
+
+Relational database engines are designed from the ground up for set-based operations. They can scan, filter, and join 10,000 rows in 5 milliseconds.
+
+Conversely, client-server network protocols are serialized. Sending 100 individual queries incurs 100 separate network round-trips, 100 query parsing phases, 100 permission checks, and 100 transaction lock acquisitions.
+
+## When Not To Use
+
+- **Huge Many-to-Many Cartesian Products:** If loading a post with 50 tags, 100 comments, and 20 attachments using SQL `JOIN`s, the database returns $50 \times 100 \times 20 = 100,000$ duplicate rows. In that case, 3 separate `WHERE id IN (...)` queries are faster than 1 giant Cartesian join.
+
+## Common Mistakes
+
+- **Assuming ORMs optimize queries automatically.** Most ORMs default to lazy loading properties to conserve memory. Unless you explicitly specify `include` or `with`, N+1 queries will occur.
+- **Accidental N+1 in serializer methods.** Defining virtual properties (like `get fullName()` or `get commentCount()`) on model objects that execute database queries behind the scenes.

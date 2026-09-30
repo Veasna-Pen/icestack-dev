@@ -1,0 +1,158 @@
+---
+title: "Saga"
+question: "តើខ្ញុំអាចរក្សាភាពត្រឹមត្រូវនៃទិន្នន័យ (Data Consistency) ឆ្លងកាត់ Microservices ជាច្រើនយ៉ាងដូចម្តេចដោយមិនបាច់ប្រើ Two-Phase Commit (2PC) Locks?"
+summary: "សម្របសម្រួលលំដាប់នៃ Local Transactions ឆ្លងកាត់ Microservices ផ្សេងៗគ្នា។ ប្រសិនបើជំហានណាមួយជួបការបរាជ័យ ប្រព័ន្ធនឹងដំណើរការ Compensating Transactions ត្រឡប់ក្រោយតាមលំដាប់បញ្ច្រាស ដើម្បីលុបចោលរាល់ការផ្លាស់ប្តូរដែលបាន Commit រួចពីមុន។"
+tags: [architecture, saga, distributed-transactions, microservices, reliability]
+related: [tradeoffs/saga-orchestration-vs-choreography, patterns/transactional-outbox, problems/when-to-use-microservices]
+order: 14
+updated: "2026-09-12"
+contributors: [veasna]
+translation: draft
+---
+
+## Context
+
+នៅក្នុងស្ថាបត្យកម្ម Monolith ការរក្សាភាពត្រឹមត្រូវនៃទិន្នន័យមានភាពងាយស្រួលបំផុត៖ គ្រាន់តែស្រោបការ Update តារាងច្រើនចូលក្នុង `BEGIN TRANSACTION ... COMMIT`។ ប្រសិនបើជោគជ័យ ទិន្នន័យទាំងអស់ត្រូវបានរក្សាទុក; ប្រសិនបើមាន Error ដាតាបេសនឹង `ROLLBACK` ត្រឡប់មកដូចដើមវិញភ្លាមៗ។
+
+ប៉ុន្តែនៅក្នុងស្ថាបត្យកម្ម Microservices សេវាកម្មនីមួយៗគ្រប់គ្រង Database ដាច់ដោយឡែកផ្ទាល់ខ្លួន។ ប្រតិបត្តិការអាជីវកម្មតែមួយ (ឧ. "អតិថិជនកុម្ម៉ង់ទិញទំនិញ") ត្រូវរត់កាត់ Microservices ចំនួន ៤ និង Database ចំនួន ៤ ផ្សេងគ្នា៖
+1. **Order Service:** បង្កើតកំណត់ត្រា Order ក្នុង `orders_db`។
+2. **Payment Service:** កាត់ប្រាក់ពីកាតធនាគារតាមរយៈ Stripe API។
+3. **Inventory Service:** កាត់បន្ថយចំនួនទំនិញក្នុងស្តុកក្នុង `inventory_db`។
+4. **Notification Service:** បញ្ជូនសារ Email ឬ SMS បញ្ជាក់ការទិញ។
+
+ការប្រើប្រាស់ Distributed Transactions បែបប្រពៃណី (Two-Phase Commit / 2PC, XA Transactions) ទាមទារការ Lock ជួរទិន្នន័យឆ្លងកាត់ Network លើ Database ទាំងអស់រហូតដល់គ្រប់ Node យល់ព្រម Commit ព្រមគ្នា។ នៅក្នុង Cloud សម័យទំនើប 2PC គឺជាមហន្តរាយ៖ វាបំផ្លាញ Throughput ប្រព័ន្ធ, បង្កើត Deadlock សកល, និងគាំងទាំងស្រុងប្រសិនបើ Network មានការរអាក់រអួលបន្តិចបន្តួច។
+
+**Saga Pattern** ដោះស្រាយបញ្ហានេះដោយមិនចាំបាច់មាន 2PC Lock ឡើយ។ Saga គឺជាខ្សែសង្វាក់នៃ *Local Transactions* ផ្ទាល់ខ្លួនរបស់សេវាកម្មនីមួយៗ។ ប្រសិនបើជំហានណាមួយបរាជ័យ Saga នឹងដំណើរការ *Compensating Transactions* ត្រឡប់ក្រោយដើម្បីលុបចោលផលប៉ះពាល់នៃជំហានមុនៗ។
+
+## Symptoms
+
+- Order ត្រូវបានរក្សាទុកក្នុង Database ប៉ុន្តែ Payment Gateway បរាជ័យកាត់លុយមិនបាន; អតិថិជនមិនអស់លុយ តែទំនិញក្នុងស្តុកជាប់សោរ (Lock) រហូត។
+- កាតធនាគាររបស់អតិថិជនត្រូវបានកាត់លុយរួចរាល់ ប៉ុន្តែ Inventory Service អស់ទំនិញពីស្តុក; អតិថិជនបាត់បង់លុយតែមិនទទួលបានទំនិញ។
+- ការព្យាយាមប្រើ Two-Phase Commit (XA) ឆ្លងកាត់ Microservices បណ្តាលឱ្យមាន Lock Contention ធ្ងន់ធ្ងរ ដែលទាញទម្លាក់ Throughput ពី 2,000 req/sec មកនៅត្រឹម 15 req/sec។
+- ទិន្នន័យមិនស៊ីសង្វាក់គ្នារវាងសេវាកម្មបង្ខំឱ្យ Developer ត្រូវសរសេរ SQL Script រៀបចំទិន្នន័យឡើងវិញជារៀងរាល់ព្រឹក។
+
+<Callout type="warning" title="Compensating Transactions មិនមែនជាការ Rollback Database ដោយស្វ័យប្រវត្តិឡើយ">
+ដោយសារតែ Local Transaction នីមួយៗបាន Commit ភ្លាមៗរួចទៅហើយ ទិន្នន័យគឺត្រូវបានមើលឃើញដោយអ្នកដទៃមុនពេល Saga បញ្ចប់ទាំងស្រុង។ កូដ Compensating Transaction ត្រូវតែសរសេរដោយផ្ទាល់ដើម្បីលុបចោលផលប៉ះពាល់អាជីវកម្ម (ដូចជា ការសងលុយត្រឡប់ទៅវិញ ជំនួសឱ្យការ Rollback ធម្មតា)។
+</Callout>
+
+## Diagnose
+
+1. **គូរប្លង់លំហូរនៃការសរសេរឆ្លងកាត់ច្រើនសេវាកម្ម៖** កំណត់រាល់ដំណើរការអាជីវកម្មណាដែលកែប្រែទិន្នន័យឆ្លងកាត់លើសពី Database មួយ។
+2. **ពិនិត្យមើលការដោះស្រាយបញ្ហាបរាជ័យពាក់កណ្តាលផ្លូវ (Partial Failure)៖** តើមានអ្វីកើតឡើងប្រសិនបើជំហានទី ៣ នៃការ Checkout ឆ្លើយតប HTTP 500? តើជំហានទី ១ ត្រូវបានលុបចោល ឬទុកទិន្នន័យចោលគ្មានមេបា (Orphaned Record)?
+3. **វាយតម្លៃរយៈពេល Lock ទិន្នន័យ៖** តើសេវាកម្មរបស់អ្នកកំពុងព្យាយាមប្រើប្រាស់ Distributed Locks ឆ្លងកាត់ Network ដែរឬទេ?
+4. **កំណត់ជំហានដែលអាចត្រឡប់ក្រោយបាន និងមិនអាចត្រឡប់ក្រោយបាន៖** តើជំហានណាខ្លះអាចលុបចោលបាន (ឧ. សងលុយវិញ, ដាក់ទំនិញចូលស្តុកវិញ) និងជំហានណាដែលមិនអាចត្រឡប់ក្រោយបាន (ឧ. ការផ្ញើ Email រួច)?
+
+## Options
+
+1. **បង្រួបបង្រួមក្នុង Monolith វិញ៖** រក្សាទុកតារាងទាំងអស់ក្នុង PostgreSQL តែមួយដោយប្រើ Native ACID Transactions (`BEGIN ... COMMIT`)។ (សាមញ្ញបំផុត មិនបាច់ឈឺក្បាលនឹង Saga)។
+2. **Choreographed Saga (Event-driven)៖** សេវាកម្មនីមួយៗបញ្ចប់ Local Transaction របស់ខ្លួន រួចបាញ់ Event (ឧ. `OrderCreated`)។ សេវាកម្មបន្ទាប់ស្តាប់ Event នោះហើយដំណើរការបន្តដោយស្វ័យប្រវត្តិ។ (វិមជ្ឈការ ប៉ុន្តែពិបាកតាមដាន Trace ពេលដំណើរការមានលើសពី ៥ ជំហាន)។
+3. **Orchestrated Saga (Command-driven)៖** មានសេវាកម្មអ្នកសម្របសម្រួលកណ្តាល (Coordinator) មួយច្បាស់លាស់ដែលបញ្ជាសេវាកម្មនីមួយៗតាមរយៈ Commands និងកត់ត្រា State Machine ទុកក្នុង Log។ (ងាយស្រួលគ្រប់គ្រង, ច្បាស់លាស់, ងាយស្រួល Debug)។
+
+## Trade-offs
+
+| យុទ្ធសាស្ត្រ | ការធានា ACID | Throughput ប្រព័ន្ធ | ការស្រោចស្រង់ពេលបរាជ័យ | ភាពស្មុគស្មាញស្ថាបត្យកម្ម |
+| :--- | :--- | :--- | :--- | :--- |
+| **Monolith ACID** | ពេញលេញ (ភ្លាមៗ) | ខ្ពស់ (DB តែមួយ) | ស្វ័យប្រវត្តិ (`ROLLBACK`) | ទាបបំផុត |
+| **Two-Phase Commit (2PC)** | ពេញលេញ | ទាបបំផុត (ទប់ Lock ជាប់) | ផុយស្រួយ (បើ Coordinator ដាច់) | ខ្ពស់ខ្លាំង |
+| **Choreographed Saga** | Eventual Consistency | ខ្ពស់បំផុត | ប្រតិកម្មតាម Events | មធ្យម (ពិបាកតាមដាន Trace) |
+| **Orchestrated Saga** | Eventual Consistency | ខ្ពស់ | គ្រប់គ្រងតាម State Machine | មធ្យម (មាន Central Coordinator) |
+
+## Decision
+
+- **ជ្រើសរើស Orchestrated Saga សម្រាប់ប្រតិបត្តិការអាជីវកម្មស្មុគស្មាញ៖** នៅពេលដំណើរការពាក់ព័ន្ធនឹងសេវាកម្មចាប់ពី ៣ ឡើងទៅដែលមានការត្រឡប់ក្រោយស្មុគស្មាញ (ដូចជា ការ Checkout, ការអនុម័តប្រាក់កម្ចី) ត្រូវប្រើ Central State Machine Orchestrator។
+- **ធានាថាគ្រប់ជំហានទៅមុខទាំងអស់សុទ្ធតែមាន Compensating Action ដែល Idempotent៖**
+  - ទៅមុខ៖ `ReserveCredit()` -> ត្រឡប់ក្រោយ៖ `ReleaseCredit()`
+  - ទៅមុខ៖ `ChargePayment()` -> ត្រឡប់ក្រោយ៖ `RefundPayment()`
+  - ទៅមុខ៖ `DeductInventory()` -> ត្រឡប់ក្រោយ៖ `RestockInventory()`
+- **រៀបចំជំហានដោយផ្អែកលើ Pivot Point៖** ជំហានដែលមិនអាចត្រឡប់ក្រោយបាន (ដូចជាការផ្ញើ Email ឬការចេញសំបុត្រយន្តហោះ) ត្រូវដាក់នៅ *ពីក្រោយ* ជំហានដែលអាចត្រឡប់ក្រោយបានទាំងអស់។ ជំហានដែលធានាថាដំណើរការនឹងចប់សព្វគ្រប់ហៅថា **Pivot Transaction**។
+- **Compensating Action ត្រូវតែ Retry បានរហូតដល់ជោគជ័យ៖** ការសងលុយវិញ ឬការបញ្ចូលស្តុកវិញក៏អាចជួបបញ្ហា Network Timeout ដែរ។ Saga Orchestrator ត្រូវតែ Retry រហូតទាល់តែការត្រឡប់ក្រោយជោគជ័យជាស្ថាពរ។
+
+## Implementation
+
+### ការបង្កើត Orchestrated Saga Coordinator ក្នុង TypeScript៖
+
+```typescript
+export interface SagaContext {
+  orderId: string;
+  customerId: string;
+  amountCents: number;
+  items: Array<{ productId: string; qty: number }>;
+}
+
+export class OrderSagaOrchestrator {
+  constructor(
+    private readonly paymentClient: any,
+    private readonly inventoryClient: any,
+    private readonly orderClient: any
+  ) {}
+
+  async execute(ctx: SagaContext): Promise<{ success: boolean; error?: string }> {
+    const executedSteps: string[] = [];
+
+    try {
+      // ជំហានទី ១: បង្កើត Order ក្នុងស្ថានភាព PENDING
+      await this.orderClient.createPendingOrder(ctx.orderId, ctx.customerId, ctx.amountCents);
+      executedSteps.push('ORDER_CREATED');
+
+      // ជំហានទី ២: កក់ទុកទំនិញក្នុងស្តុក (Reserve Inventory)
+      await this.inventoryClient.reserveStock(ctx.orderId, ctx.items);
+      executedSteps.push('INVENTORY_RESERVED');
+
+      // ជំហានទី ៣: កាត់ប្រាក់ពីកាត (Pivot Transaction)
+      await this.paymentClient.processCharge(ctx.orderId, ctx.customerId, ctx.amountCents);
+      executedSteps.push('PAYMENT_CHARGED');
+
+      // ជំហានទី ៤: បញ្ជាក់ការបញ្ជាទិញជា CONFIRMED
+      await this.orderClient.confirmOrder(ctx.orderId);
+
+      return { success: true };
+    } catch (err) {
+      console.error(`[Saga] បរាជ័យក្នុង Order ${ctx.orderId}: ${(err as Error).message}។ ចាប់ផ្តើមដំណើរការ Compensation។`);
+      await this.compensate(ctx, executedSteps);
+      return { success: false, error: (err as Error).message };
+    }
+  }
+
+  private async compensate(ctx: SagaContext, executedSteps: string[]) {
+    // ដំណើរការ Compensating Transactions ត្រឡប់ក្រោយតាមលំដាប់បញ្ច្រាស
+    for (const step of executedSteps.reverse()) {
+      try {
+        if (step === 'PAYMENT_CHARGED') {
+          await this.paymentClient.refundCharge(ctx.orderId);
+        } else if (step === 'INVENTORY_RESERVED') {
+          await this.inventoryClient.releaseStock(ctx.orderId, ctx.items);
+        } else if (step === 'ORDER_CREATED') {
+          await this.orderClient.cancelOrder(ctx.orderId, 'Saga execution failed');
+        }
+      } catch (compensationErr) {
+        // Compensations ត្រូវតែ Retry ឬបញ្ជូនទៅ Alert Queue ពេលបរាជ័យ
+        console.error(`[Saga Alert] បរាជ័យក្នុងការធ្វើ Compensation ជំហាន ${step} សម្រាប់ Order ${ctx.orderId}:`, compensationErr);
+      }
+    }
+  }
+}
+```
+
+## Verification
+
+1. **ការធ្វើតេស្ត Failure Compensation៖** ចាក់បញ្ចូល Error ទៅក្នុងជំហានទូទាត់ប្រាក់ (ជំហានទី ៣)។ ផ្ទៀងផ្ទាត់ថា `releaseStock` ត្រូវបានហៅលើ Inventory Service ហើយ `cancelOrder` ត្រូវបានហៅលើ Order Service។
+2. **ផ្ទៀងផ្ទាត់ភាព Idempotency៖** ដំណើរការជំហាន Compensation ដដែលពីរដងជាមួយ `orderId` ដូចគ្នា។ ធានាថា Database និង Payment Gateway មិនបង្កើត Error ឬសងលុយស្ទួនពីរដងឡើយ។
+3. **វាស់វែង Database Lock Duration៖** ធ្វើតេស្តបន្ទុកលើលំហូរ Saga។ ផ្ទៀងផ្ទាត់ថារយៈពេល Transaction ក្នុង Database នីមួយៗនៅក្រោម 10 ms ព្រោះជំហាននីមួយៗ Commit ភ្លាមៗដោយមិនកាន់កាប់ Lock ឆ្លងកាត់ Network ឡើយ។
+4. **ការគ្រប់គ្រង Eventual Consistency៖** វាស់វែងរយៈពេលរវាង Commit ដំបូង និងការ Confirm ចុងក្រោយ។ ធានាថា Frontend បង្ហាញស្ថានភាពកណ្តាល (`Processing...`) ដោយមិនធ្វើឱ្យអ្នកប្រើប្រាស់ច្របូកច្របល់។
+
+## Why
+
+នៅក្នុងប្រព័ន្ធ Distributed Systems ទ្រឹស្តីបទ CAP Theorem និងការពិតនៃបណ្តាញ Network ធ្វើឱ្យ Distributed ACID Transactions មិនអាចដំណើរការប្រកបដោយប្រសិទ្ធភាពឡើយ។ ការកាន់កាប់ Lock ឆ្លងកាត់ Network ធានាថានៅពេលមានបញ្ហា Network ឬ Node ណាមួយគាំង ប្រព័ន្ធទាំងមូលនឹងត្រូវគាំងដំណើរការ។
+
+Saga Pattern ធ្វើការផ្លាស់ប្តូរ Immediate Consistency មកយក High Availability និង Scalability ជំនួសវិញ។ តាមរយៈការបំបែកប្រតិបត្តិការសកលទៅជាខ្សែសង្វាក់នៃ Local Transactions ដែលមានស្វ័យប្រវត្តិនៃការលុបចោលត្រឡប់ក្រោយ វាជួយឱ្យ Microservice នីមួយៗរក្សាបាននូវស្វ័យភាព ល្បឿនលឿន និងការការពារកុំឱ្យបញ្ហារាលដាល។
+
+## When Not To Use
+
+- **ស្ថាបត្យកម្មដែលប្រើ Database តែមួយ៖** ប្រសិនបើតារាងទាំងអស់ស្ថិតក្នុង PostgreSQL ឬ MySQL តែមួយ ត្រូវប្រើ Native ACID Transactions (`BEGIN ... COMMIT`) ជានិច្ច។ កុំប្រើ Saga ព្រោះវាស្មុគស្មាញឥតប្រយោជន៍។
+- **ប្រតិបត្តិការដែលមានជំហានមិនអាចត្រឡប់ក្រោយបាននៅខាងដើម៖** ប្រសិនបើជំហានទី ១ គឺជាការផ្ញើសារ SMS ឬការផ្ទេរលុយអន្តរជាតិដែលមិនអាចដកមកវិញបាន អ្នកមិនអាចបង្កើត Compensation Rollback ប្រសិនបើជំហានទី ២ បរាជ័យឡើយ។
+
+## Common Mistakes
+
+- **សន្មតថា Compensation មិនចេះបរាជ័យ៖** ប្រសិនបើការហៅសងលុយជួបបញ្ហា Network Timeout អ្នកមិនត្រូវបោះបង់វាចោលឡើយ។ Compensating Actions ត្រូវតែមានយន្តការ Retry ជាមួយ Exponential Backoff រហូតដល់ជោគជ័យ។
+- **ខ្វះស្ថានភាពកណ្តាល (Intermediate States)៖** ការបង្ហាញ Order ថា "ជោគជ័យ" មុនពេលការកាត់លុយចប់សព្វគ្រប់ នឹងធ្វើឱ្យមានការលេចធ្លាយទំនិញ។ ត្រូវប្រើស្ថានភាពច្បាស់លាស់ដូចជា `PENDING_PAYMENT`, `CANCELLED`, និង `COMPLETED`។
+- **កូដ Compensation មិន Idempotent៖** ប្រសិនបើការ Retry ធ្វើឱ្យកូដដំណើរការពីរដង អតិថិជនអាចនឹងទទួលបានការសងប្រាក់លើសពីរដងដែលនាំឱ្យខាតបង់ប្រាក់កាស។

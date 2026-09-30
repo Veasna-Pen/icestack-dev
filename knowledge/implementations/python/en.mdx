@@ -1,0 +1,195 @@
+---
+title: "Python"
+question: "How do I configure httpx timeouts, tenacity retries, async SQLAlchemy pooling, and Celery in Python?"
+summary: "Timeouts with httpx, retries with tenacity, idempotency in a SQLAlchemy transaction, cache-aside with redis-py, rate limiting in FastAPI and retrying Celery tasks."
+tags: [python, fastapi, sqlalchemy, celery, implementation]
+related: [patterns/retry, patterns/idempotency, patterns/caching, patterns/rate-limiting]
+order: 4
+updated: "2026-09-11"
+---
+
+Production patterns for Python 3.12 and FastAPI. Focuses on explicit httpx timeouts, declarative tenacity retry policies, async SQLAlchemy connection pool tuning with statement timeouts, Redis caching, and Celery tasks.
+
+## Timeouts first
+
+`httpx` has no default overall timeout you should rely on; set one explicitly, including a shorter connect timeout:
+
+```python
+import httpx
+
+client = httpx.AsyncClient(timeout=httpx.Timeout(2.0, connect=1.0))
+```
+
+For Postgres, pass a statement timeout when the engine connects:
+
+```python
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+engine = create_async_engine(
+    DATABASE_URL,
+    pool_size=10,
+    pool_timeout=2,                                          # seconds to wait for a free connection
+    connect_args={"server_settings": {"statement_timeout": "5000"}},  # ms, asyncpg
+)
+SessionLocal = async_sessionmaker(engine, expire_on_commit=False)
+```
+
+## Retry with backoff
+
+`tenacity` expresses the policy declaratively: which errors, how long to wait, when to stop. See [Retry](../../patterns/retry).
+
+```python
+import httpx
+from tenacity import retry, retry_if_exception, stop_after_attempt, stop_after_delay, wait_random_exponential
+
+TRANSIENT = {408, 429, 500, 502, 503, 504}
+
+
+def is_transient(exc: BaseException) -> bool:
+    if isinstance(exc, httpx.TransportError):              # includes timeouts and connection errors
+        return True
+    return isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code in TRANSIENT
+
+
+@retry(
+    retry=retry_if_exception(is_transient),
+    wait=wait_random_exponential(multiplier=0.1, max=2),    # full jitter, in seconds
+    stop=stop_after_attempt(3) | stop_after_delay(5),
+    reraise=True,
+)
+async def fetch_rates() -> dict:
+    response = await client.get("https://api.example.com/rates")
+    response.raise_for_status()
+    return response.json()
+```
+
+## Idempotency keys
+
+Claim the key and create the order in one transaction. The primary key on `idempotency_keys.key` turns a concurrent duplicate into an `IntegrityError`, and the handler returns the stored response. See [Idempotency](../../patterns/idempotency).
+
+```python
+from fastapi import FastAPI, Header, HTTPException, Response
+from sqlalchemy import update
+from sqlalchemy.exc import IntegrityError
+
+app = FastAPI()
+
+
+@app.post("/orders", status_code=201)
+async def create_order(order: OrderIn, response: Response, idempotency_key: str = Header()):
+    try:
+        async with SessionLocal.begin() as session:             # one transaction
+            session.add(IdempotencyKey(key=idempotency_key))
+            await session.flush()                                # a duplicate key fails here
+            created = Order(customer_id=order.customer_id, total_cents=order.total_cents)
+            session.add(created)
+            await session.flush()
+            result = {"id": created.id, "total_cents": created.total_cents}
+            await session.execute(
+                update(IdempotencyKey)
+                .where(IdempotencyKey.key == idempotency_key)
+                .values(response=result)
+            )
+            return result
+    except IntegrityError:
+        async with SessionLocal() as session:
+            saved = await session.get(IdempotencyKey, idempotency_key)
+        if saved is None or saved.response is None:
+            raise HTTPException(409, "The original request is still in progress")
+        response.status_code = 200
+        return saved.response
+```
+
+FastAPI reads the `idempotency_key` parameter from the `Idempotency-Key` header, converting underscores to hyphens.
+
+## Caching
+
+Cache-aside with `redis-py`, a TTL with jitter, and a fall-through to the database when Redis is unavailable. [Caching](../../patterns/caching) covers invalidation and stampedes.
+
+```python
+import json
+import os
+import random
+
+from redis.asyncio import Redis
+from redis.exceptions import RedisError
+
+redis = Redis.from_url(os.environ["REDIS_URL"], socket_timeout=0.2)
+
+
+async def get_product(product_id: int) -> dict | None:
+    key = f"product:v1:{product_id}"
+    try:
+        if (cached := await redis.get(key)) is not None:
+            return json.loads(cached)
+    except RedisError:
+        pass                                                     # Redis is down: use the database
+
+    async with SessionLocal() as session:
+        product = await session.get(Product, product_id)
+    if product is None:
+        return None
+
+    data = {"id": product.id, "name": product.name, "price_cents": product.price_cents}
+    try:
+        await redis.set(key, json.dumps(data), ex=int(60 * random.uniform(0.9, 1.1)))
+    except RedisError:
+        pass
+    return data
+```
+
+## Rate limiting
+
+`slowapi` brings a decorator-based limiter to FastAPI, stored in Redis so every worker process shares the counts:
+
+```python
+from fastapi import Request
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
+
+
+def client_key(request: Request) -> str:
+    return request.headers.get("x-api-key") or get_remote_address(request)
+
+
+limiter = Limiter(key_func=client_key, storage_uri=os.environ["REDIS_URL"], default_limits=["100/minute"])
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+
+@app.post("/login")
+@limiter.limit("5/minute")
+async def login(request: Request, credentials: LoginIn):
+    ...
+```
+
+The decorated route must take a `request` argument. Behind a proxy, run Uvicorn with `--proxy-headers` and the right `--forwarded-allow-ips` so the client address is correct. See [Rate limiting](../../patterns/rate-limiting).
+
+## Background tasks
+
+Celery tasks declare their own retry policy. `acks_late` means a task that was running when a worker died is delivered again, so the task must be idempotent:
+
+```python
+import httpx
+from celery import Celery
+
+celery = Celery("app", broker=os.environ["REDIS_URL"])
+
+
+@celery.task(
+    acks_late=True,
+    autoretry_for=(httpx.TransportError,),
+    retry_backoff=True,        # exponential: 1 s, 2 s, 4 s, …
+    retry_jitter=True,
+    retry_kwargs={"max_retries": 5},
+)
+def send_receipt(order_id: int) -> None:
+    order = load_order(order_id)
+    if order.receipt_sent_at:
+        return                  # already sent: tasks can run more than once
+    mailer.send_receipt(order)
+    mark_receipt_sent(order_id)
+```
+
+Enqueue the task only after the order's transaction has committed (or from an outbox), so the worker never looks for an order that doesn't exist yet.

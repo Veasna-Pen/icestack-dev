@@ -1,0 +1,196 @@
+---
+title: "Python"
+question: "តើត្រូវកំណត់ httpx Timeouts, Tenacity Retries, Async SQLAlchemy Pooling, និង Celery ក្នុង Python ដោយរបៀបណា?"
+summary: "Timeouts ជាមួយ httpx, retries ជាមួយ tenacity, idempotency នៅក្នុង SQLAlchemy transaction, cache-aside ជាមួយ redis-py, rate limiting ក្នុង FastAPI និង Celery tasks ដែល retry បាន។"
+tags: [python, fastapi, sqlalchemy, celery, implementation]
+related: [patterns/retry, patterns/idempotency, patterns/caching, patterns/rate-limiting]
+order: 4
+updated: "2026-09-11"
+translation: draft
+---
+
+ការអនុវត្ត Patterns ជាក់ស្តែងសម្រាប់ Python 3.12 និង FastAPI។ ផ្តោតលើការកំណត់ httpx Timeouts, tenacity Retry Policies, Async SQLAlchemy Connection Pooling ជាមួយ Statement Timeouts, Redis Caching, និង Celery Background Tasks។
+
+## Timeouts first
+
+`httpx` មិនមាន timeout សរុបលំនាំដើមដែលអ្នកគួរពឹងផ្អែកទេ; កំណត់វាឱ្យច្បាស់ រួមទាំង connect timeout ដែលខ្លីជាង៖
+
+```python
+import httpx
+
+client = httpx.AsyncClient(timeout=httpx.Timeout(2.0, connect=1.0))
+```
+
+សម្រាប់ Postgres បញ្ជូន statement timeout នៅពេល engine ភ្ជាប់៖
+
+```python
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+engine = create_async_engine(
+    DATABASE_URL,
+    pool_size=10,
+    pool_timeout=2,                                          # seconds to wait for a free connection
+    connect_args={"server_settings": {"statement_timeout": "5000"}},  # ms, asyncpg
+)
+SessionLocal = async_sessionmaker(engine, expire_on_commit=False)
+```
+
+## Retry with backoff
+
+`tenacity` បង្ហាញ policy ជាលក្ខណៈប្រកាស (declarative)៖ errors ណាខ្លះ រង់ចាំប៉ុន្មាន និងពេលណាត្រូវឈប់។ សូមមើល [Retry](../../patterns/retry)។
+
+```python
+import httpx
+from tenacity import retry, retry_if_exception, stop_after_attempt, stop_after_delay, wait_random_exponential
+
+TRANSIENT = {408, 429, 500, 502, 503, 504}
+
+
+def is_transient(exc: BaseException) -> bool:
+    if isinstance(exc, httpx.TransportError):              # includes timeouts and connection errors
+        return True
+    return isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code in TRANSIENT
+
+
+@retry(
+    retry=retry_if_exception(is_transient),
+    wait=wait_random_exponential(multiplier=0.1, max=2),    # full jitter, in seconds
+    stop=stop_after_attempt(3) | stop_after_delay(5),
+    reraise=True,
+)
+async def fetch_rates() -> dict:
+    response = await client.get("https://api.example.com/rates")
+    response.raise_for_status()
+    return response.json()
+```
+
+## Idempotency keys
+
+កាន់កាប់ key និងបង្កើត order នៅក្នុង transaction តែមួយ។ Primary key លើ `idempotency_keys.key` ប្រែក្លាយ duplicate ដែលកើតឡើងព្រមគ្នា ទៅជា `IntegrityError` ហើយ handler ផ្តល់ response ដែលបានរក្សាទុក។ សូមមើល [Idempotency](../../patterns/idempotency)។
+
+```python
+from fastapi import FastAPI, Header, HTTPException, Response
+from sqlalchemy import update
+from sqlalchemy.exc import IntegrityError
+
+app = FastAPI()
+
+
+@app.post("/orders", status_code=201)
+async def create_order(order: OrderIn, response: Response, idempotency_key: str = Header()):
+    try:
+        async with SessionLocal.begin() as session:             # one transaction
+            session.add(IdempotencyKey(key=idempotency_key))
+            await session.flush()                                # a duplicate key fails here
+            created = Order(customer_id=order.customer_id, total_cents=order.total_cents)
+            session.add(created)
+            await session.flush()
+            result = {"id": created.id, "total_cents": created.total_cents}
+            await session.execute(
+                update(IdempotencyKey)
+                .where(IdempotencyKey.key == idempotency_key)
+                .values(response=result)
+            )
+            return result
+    except IntegrityError:
+        async with SessionLocal() as session:
+            saved = await session.get(IdempotencyKey, idempotency_key)
+        if saved is None or saved.response is None:
+            raise HTTPException(409, "The original request is still in progress")
+        response.status_code = 200
+        return saved.response
+```
+
+FastAPI អាន parameter `idempotency_key` ពី header `Idempotency-Key` ដោយប្តូរ underscores ទៅជា hyphens។
+
+## Caching
+
+Cache-aside ជាមួយ `redis-py`, TTL ដែលមាន jitter និងការធ្លាក់ទៅប្រើ database នៅពេល Redis មិនអាចប្រើបាន។ ទំព័រ [Caching](../../patterns/caching) ពន្យល់ពី invalidation និង stampedes។
+
+```python
+import json
+import os
+import random
+
+from redis.asyncio import Redis
+from redis.exceptions import RedisError
+
+redis = Redis.from_url(os.environ["REDIS_URL"], socket_timeout=0.2)
+
+
+async def get_product(product_id: int) -> dict | None:
+    key = f"product:v1:{product_id}"
+    try:
+        if (cached := await redis.get(key)) is not None:
+            return json.loads(cached)
+    except RedisError:
+        pass                                                     # Redis is down: use the database
+
+    async with SessionLocal() as session:
+        product = await session.get(Product, product_id)
+    if product is None:
+        return None
+
+    data = {"id": product.id, "name": product.name, "price_cents": product.price_cents}
+    try:
+        await redis.set(key, json.dumps(data), ex=int(60 * random.uniform(0.9, 1.1)))
+    except RedisError:
+        pass
+    return data
+```
+
+## Rate limiting
+
+`slowapi` នាំយក limiter ដែលផ្អែកលើ decorator មកកាន់ FastAPI ដែលរក្សាទុកក្នុង Redis ដើម្បីឱ្យ worker processes ទាំងអស់ចែករំលែកការរាប់៖
+
+```python
+from fastapi import Request
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
+
+
+def client_key(request: Request) -> str:
+    return request.headers.get("x-api-key") or get_remote_address(request)
+
+
+limiter = Limiter(key_func=client_key, storage_uri=os.environ["REDIS_URL"], default_limits=["100/minute"])
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+
+@app.post("/login")
+@limiter.limit("5/minute")
+async def login(request: Request, credentials: LoginIn):
+    ...
+```
+
+Route ដែលមាន decorator ត្រូវតែទទួល argument `request`។ នៅពីក្រោយ proxy សូមដំណើរការ Uvicorn ជាមួយ `--proxy-headers` និង `--forwarded-allow-ips` ដែលត្រឹមត្រូវ ដើម្បីឱ្យអាសយដ្ឋាន client ត្រឹមត្រូវ។ សូមមើល [Rate limiting](../../patterns/rate-limiting)។
+
+## Background tasks
+
+Celery tasks ប្រកាស retry policy ផ្ទាល់ខ្លួន។ `acks_late` មានន័យថា task ដែលកំពុងដំណើរការនៅពេល worker ស្លាប់ នឹងត្រូវបញ្ជូនម្តងទៀត ដូច្នេះ task ត្រូវតែ idempotent៖
+
+```python
+import httpx
+from celery import Celery
+
+celery = Celery("app", broker=os.environ["REDIS_URL"])
+
+
+@celery.task(
+    acks_late=True,
+    autoretry_for=(httpx.TransportError,),
+    retry_backoff=True,        # exponential: 1 s, 2 s, 4 s, …
+    retry_jitter=True,
+    retry_kwargs={"max_retries": 5},
+)
+def send_receipt(order_id: int) -> None:
+    order = load_order(order_id)
+    if order.receipt_sent_at:
+        return                  # already sent: tasks can run more than once
+    mailer.send_receipt(order)
+    mark_receipt_sent(order_id)
+```
+
+ដាក់ task ចូល queue លុះត្រាតែ transaction របស់ order បាន commit រួច (ឬពី outbox) ដើម្បីកុំឱ្យ worker ស្វែងរក order ដែលមិនទាន់មាន។

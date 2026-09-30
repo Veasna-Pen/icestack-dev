@@ -1,0 +1,83 @@
+---
+title: "Keeping cached data fresh"
+summary: "Choose between waiting for the TTL and deleting the key on write, so users don't see old data for longer than they should."
+minutes: 12
+related: [patterns/caching, tradeoffs/cache-aside-vs-write-through, tradeoffs/eventual-vs-strong-consistency]
+updated: "2026-09-29"
+contributors: [Veasna-Pen]
+---
+
+## The problem
+
+Product pages are fast now. Then a customer writes in: the admin lowered a price from $50 to $40, but the product page still showed $50 for almost a minute, and the customer was charged $40 at checkout. Nobody is hurt, but it looks broken.
+
+The cache did exactly what you told it: keep a copy for 60 seconds. Now you need the copy to change **when the data changes**.
+
+## The idea
+
+There are two ways to refresh a cached value. Most apps use both together.
+
+| Approach | How it works | Stale for up to |
+| --- | --- | --- |
+| **Expire** | Wait for the TTL to delete the key | The whole TTL |
+| **Invalidate** | Delete the key when the data is written | A few milliseconds |
+
+**Invalidation** means: whenever you update the database, **delete** the matching cache key. The next read misses and loads the new value.
+
+Delete, don't update. If two writes happen close together, updating the cache from each one can store them in the wrong order and leave the older value behind. Deleting is always safe: the next reader loads whatever the database holds now.
+
+Keep the TTL as a safety net. If an invalidation is ever lost, the TTL still limits how long the wrong value lives.
+
+## Example
+
+The write path for a price change, next to the read path from the last lesson:
+
+```ts
+async function updatePrice(id: string, price: number) {
+  await db.product.update({ where: { id }, data: { price } }); // 1. write the source of truth
+  await redis.del(`product:${id}`); // 2. then delete the copy
+}
+```
+
+The order matters. Write the database **first**, then delete the key. If you delete first, a read that arrives in between can load the old price from the database and put it straight back into the cache.
+
+With this change, the page shows $40 on the next request after the update, instead of up to 60 seconds later.
+
+<Info title="When one change affects many keys">
+If a price also appears in `category:shoes` and `homepage:featured`, delete those keys too, or give them a short TTL. List every key that holds a copy of the data before you ship the cache.
+</Info>
+
+## Try it
+
+1. Add a write endpoint (or use an existing one) that updates a record you cache.
+2. Read the record so it is cached, then update it.
+3. Without invalidation, read again: you get the old value until the TTL runs out.
+4. Add `redis.del(key)` after the database write and repeat: the new value appears at once.
+5. Write down every cache key that holds a copy of this record.
+
+## Check yourself
+
+**1. Why delete the key instead of writing the new value into the cache?**
+
+<Answer>
+Deleting cannot store the wrong version. When two updates race, writing each value into the cache can leave the older one there last. After a delete, the next read always loads the current value from the database.
+</Answer>
+
+**2. You delete the cache key and then update the database. What can go wrong?**
+
+<Answer>
+A read can arrive between the two steps, miss the cache, load the old value from the database, and store it again. The stale value then stays until the TTL expires. Update the database first, then delete.
+</Answer>
+
+**3. If you invalidate on every write, do you still need a TTL?**
+
+<Answer>
+Yes. Invalidation can fail, for example when the process crashes between the two steps or someone edits the database by hand. The TTL puts an upper limit on how long a wrong value can survive.
+</Answer>
+
+## Key takeaways
+
+- **Expire** with a TTL, and **invalidate** by deleting the key on every write.
+- **Delete, don't update** the cached copy.
+- **Write the database first, then delete** the key.
+- Know every key that holds a copy of the data before you ship.

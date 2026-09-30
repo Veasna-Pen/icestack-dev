@@ -1,0 +1,144 @@
+---
+title: "Rate limiting"
+question: "How do I protect an API from too much traffic?"
+summary: "Limit by the identity that matters (user, API key, IP) with an algorithm that allows short bursts, enforced where every request passes. Return 429 with Retry-After so well-behaved clients slow down instead of retrying harder."
+tags: [rate-limiting, api, security, redis, reliability]
+related: [patterns/retry, patterns/caching, problems/should-i-use-redis]
+order: 4
+updated: "2026-09-11"
+---
+
+## Context
+
+A public or partner API, a login form, an endpoint that sends OTP codes by SMS, or an expensive search. Without limits, one misbehaving client (a bug, a scraper, a credential-stuffing script, a retry loop) can use up capacity meant for everyone, or run up per-call costs for SMS, AI or third-party APIs.
+
+Rate limiting caps how many requests one identity can make in a period of time. It protects capacity, money and security. It is not a substitute for making the system itself efficient.
+
+## Symptoms
+
+- One client or IP address accounts for a large share of traffic.
+- Bursts of failed logins, or many OTP requests for one phone number.
+- A partner's retry loop turns a short incident into an overload.
+- An unexpected bill from a provider that charges per call (SMS, email, an LLM API).
+
+## Diagnose
+
+1. **What are you protecting?** Capacity (CPU, the database), money (per-call costs) or security (brute force)? Each points to a different limit and a different key.
+2. **Who is the unit?** An authenticated user, an API key, a tenant, an IP address, a phone number. IP addresses are shared by offices and by mobile carriers using CGNAT, so IP-only limits hit innocent users.
+3. **What is normal?** Look at the 99th-percentile request rate per identity over a week, and set limits above normal peaks rather than at the average.
+4. **Where can it be enforced once?** An API gateway, a reverse proxy, or middleware every request passes through. Separate in-memory counters on each server multiply the limit by the number of servers.
+5. **What should a limited client do?** Clients need a clear signal (status 429, `Retry-After`, the remaining quota) to know when to back off.
+
+## Options
+
+1. **Fixed window counter:** count requests per key per minute. The simplest option, but it allows a double burst across a window boundary.
+2. **Sliding window:** smooths the boundary using the previous window's count, or a log of timestamps.
+3. **Token bucket:** tokens refill at a steady rate up to a burst size, and each request spends one. Allows short bursts while enforcing an average.
+4. **Concurrency limit:** caps requests in flight instead of requests per second. Good for slow, expensive endpoints.
+5. **Where to enforce:** at the edge (Nginx `limit_req`, an API gateway, a CDN or WAF), in the application with a shared store such as Redis, or both.
+
+## Trade-offs
+
+| Option | Bursts | Accuracy | Cost | Notes |
+| :--- | :--- | :--- | :--- | :--- |
+| Fixed window | Poor at window edges | Approximate | Lowest: one counter | Fine for coarse abuse protection |
+| Sliding window | Good | Good | Two counters, or a log | A good default in Redis |
+| Token bucket | Configurable | Good | A little state per key | Best fit for APIs with bursty clients |
+| Concurrency limit | Not applicable | Exact | One counter per key | Protects slow endpoints and their dependencies |
+| At the edge | Depends on the tool | Per node unless shared | No application code | Stops traffic before it costs you anything |
+| Application + Redis | Any algorithm | Global | A Redis round trip per request | Knows about users, plans and tenants |
+
+## Decision
+
+- Use **two layers**: a coarse per-IP limit at the edge to absorb floods cheaply, and a **per-identity sliding window or token bucket** in the application, backed by a shared store, for fairness and pricing plans.
+- Key by the **most specific identity** available: API key or user ID first, IP address as the fallback.
+- Put **stricter limits on sensitive endpoints** (login, OTP, password reset), keyed by account or phone number as well as by IP.
+- If the limiter's store is down, **fail open** for general traffic and **fail closed** for security-critical endpoints such as OTP.
+- Always answer with **429 and `Retry-After`**.
+
+## Implementation
+
+A sliding-window limit in Node.js with Redis. The check and the increment run in one Lua script, so concurrent requests can't both slip through:
+
+```ts
+const SLIDING_WINDOW = `
+local current_key  = KEYS[1]
+local previous_key = KEYS[2]
+local limit        = tonumber(ARGV[1])
+local window       = tonumber(ARGV[2])
+local elapsed      = tonumber(ARGV[3])
+
+local current  = tonumber(redis.call('GET', current_key) or '0')
+local previous = tonumber(redis.call('GET', previous_key) or '0')
+local weighted = previous * ((window - elapsed) / window) + current
+
+if weighted >= limit then return 0 end
+redis.call('INCR', current_key)
+redis.call('EXPIRE', current_key, window * 2)
+return 1
+`;
+
+export async function allow(identity: string, limit: number, windowSeconds: number): Promise<boolean> {
+  const now = Math.floor(Date.now() / 1000);
+  const windowStart = now - (now % windowSeconds);
+  const keys = [`rl:${identity}:${windowStart}`, `rl:${identity}:${windowStart - windowSeconds}`];
+  const allowed = await redis.eval(SLIDING_WINDOW, 2, ...keys, limit, windowSeconds, now - windowStart);
+  return allowed === 1;
+}
+
+// Express middleware: 100 requests a minute per API key, or per IP address for anonymous calls.
+app.use(async (req, res, next) => {
+  const identity = req.header('X-Api-Key') ?? req.ip;
+  let ok = true;
+  try {
+    ok = await allow(identity, 100, 60);
+  } catch {
+    ok = true; // fail open for general traffic if Redis is unavailable
+  }
+  if (ok) return next();
+  res.set('Retry-After', '60').status(429).json({ error: 'Too many requests' });
+});
+```
+
+A coarse limit in Nginx absorbs floods before they reach the application:
+
+```nginx
+limit_req_zone $binary_remote_addr zone=per_ip:10m rate=20r/s;
+
+server {
+  location /api/ {
+    limit_req zone=per_ip burst=40 nodelay;
+    limit_req_status 429;
+    proxy_pass http://app;
+  }
+}
+```
+
+If the application sits behind a proxy or load balancer, make sure `req.ip` is the client's address (in Express, configure `trust proxy`). Otherwise every user shares one limit.
+
+## Verification
+
+- **Load-test one identity** past its limit: it receives 429 responses with `Retry-After`, and other identities are unaffected.
+- **Check bursts** against what legitimate clients need, such as a dashboard that fires 20 requests on load.
+- **Count 429s per identity** and alert on sudden changes. A real customer hitting the limit is a reason to raise their limit, not to ignore it.
+- **Stop Redis in staging** and confirm general traffic still flows (fail open) while OTP requests are refused (fail closed).
+
+## Why
+
+Shared capacity needs a fairness rule, or the noisiest client decides the experience for everyone else. A rate limit turns unbounded demand into bounded demand, and a clear 429 turns an overload into a signal that clients can act on. Keying limits to identity reflects who you actually serve; enforcing them in one shared place means the number you configure is the number you get.
+
+## When Not To Use
+
+- **To fix an inefficient endpoint.** If normal traffic overloads it, make it cheaper or cache it.
+- **IP-only limits on authenticated APIs**, which punish users behind shared addresses while attackers rotate theirs.
+- **Internal service-to-service calls**, where backpressure, queues or concurrency limits fit better.
+- **Tight limits that clients aren't told about**, which turns rate limiting into mysterious failures.
+
+## Common Mistakes
+
+- **Per-server in-memory counters** behind a load balancer, so the real limit is the configured one multiplied by the number of servers.
+- **Using the proxy's address** as the client IP, so everyone shares one bucket.
+- **A check and an increment that aren't atomic**, letting concurrent requests exceed the limit.
+- **Returning 500 or 503 instead of 429**, which makes well-behaved clients retry harder.
+- **No `Retry-After`**, so clients retry immediately.
+- **Limiting logins by IP address only**, which misses credential stuffing spread across many addresses. Limit by account as well.

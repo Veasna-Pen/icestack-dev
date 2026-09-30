@@ -1,0 +1,92 @@
+---
+title: "Feature flags: deploy is not release"
+summary: "Ship code turned off, turn it on for a few users first, and switch it off in seconds if something goes wrong."
+minutes: 12
+related: [patterns/feature-flags]
+updated: "2026-09-30"
+contributors: [Veasna-Pen]
+---
+
+## The problem
+
+You rewrote the checkout page. The deploy goes out at 3 p.m., and every customer gets the new checkout at once. At 3:10, error reports come in from customers on an older Android browser. Rolling back means another full deploy, which takes 25 minutes, and it also removes two unrelated fixes that went out in the same release.
+
+## The idea
+
+A **feature flag** is an `if` around new code, whose value you can change **without deploying**:
+
+```ts
+if (flags.isOn('new-checkout', user)) renderNewCheckout();
+else renderOldCheckout();
+```
+
+This separates two things that usually happen together:
+
+- **Deploy**: the new code is on the servers, but switched off.
+- **Release**: you turn it on, for some users or all of them.
+
+That makes three things possible:
+
+1. **Gradual rollout**: turn it on for staff, then 5% of users, then 25%, then everyone, watching errors at each step.
+2. **Instant off switch**: if something breaks, turn the flag off. Seconds, not a 25-minute deploy.
+3. **Smaller deploys**: unfinished work can be merged and deployed behind a flag that is off.
+
+Flags have a cost: every flag doubles the paths through that code. **Remove a flag** once the feature is fully released, usually within a few weeks.
+
+## Example
+
+A simple percentage rollout. Hashing the user ID means each user always gets the same answer:
+
+```ts
+import { createHash } from 'node:crypto';
+
+function inRollout(flag: string, userId: string, percent: number): boolean {
+  const hash = createHash('sha256').update(`${flag}:${userId}`).digest();
+  return hash.readUInt32BE(0) % 100 < percent;
+}
+
+// flag settings live in the database or a flag service, not in code
+const { enabled, percent } = await flags.get('new-checkout'); // e.g. { enabled: true, percent: 5 }
+const useNewCheckout = enabled && inRollout('new-checkout', user.id, percent);
+```
+
+The rollout plan: staff only for a day, then 5%, then 25%, then 100%, checking checkout errors and conversion at each step. When the Android bug appears at 5%, you set `enabled: false`. Within seconds all users are back on the old checkout, and the two unrelated fixes stay live.
+
+<Tip title="Build or buy">
+A table of flags in your database is enough to start. Tools such as Unleash, Flagsmith, LaunchDarkly or your cloud provider's flag service add targeting rules, audit logs and dashboards when you need them.
+</Tip>
+
+## Try it
+
+1. Pick a small upcoming change and put it behind a flag that reads its value from the database or an environment setting you can change at runtime.
+2. Deploy it with the flag **off** and check that nothing changed.
+3. Turn it on for yourself only, then for a small percentage of users.
+4. Turn it off again and time how long it takes to take effect.
+5. Put a reminder in your tracker to remove the flag once it reaches 100%.
+
+## Check yourself
+
+**1. What is the difference between deploying and releasing?**
+
+<Answer>
+Deploying puts the code on the servers. Releasing makes it active for users. With a flag you deploy first, with the feature off, and release later, gradually and reversibly.
+</Answer>
+
+**2. Why hash the user ID instead of using `Math.random()` for a 5% rollout?**
+
+<Answer>
+A random number gives a different answer on every request, so the same user would switch between old and new checkout. A hash of the user ID gives each user a stable answer.
+</Answer>
+
+**3. Your codebase has 140 flags, most of them fully on for a year. What is the problem?**
+
+<Answer>
+Every flag is an extra code path to understand and test, and old flags can be switched by mistake. Once a feature is fully released, remove the flag and the old code.
+</Answer>
+
+## Key takeaways
+
+- A **feature flag** turns code on or off **without a deploy**.
+- **Deploy with the flag off**, then release gradually: staff, a small percentage, everyone.
+- Turning a flag off is your **fastest rollback**.
+- **Remove flags** once a feature is fully released.

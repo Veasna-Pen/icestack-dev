@@ -1,0 +1,133 @@
+---
+title: "Partitioning vs Sharding"
+question: "When should I partition large tables on a single server versus sharding data across multiple independent database nodes?"
+summary: "Table Partitioning splits massive tables into smaller physical chunks on the same database engine, speeding up query pruning and maintenance while preserving full ACID transactions. Database Sharding distributes rows across independent physical database clusters via a shard key, offering multi-terabyte horizontal scale at the expense of cross-shard joins and distributed transactions."
+tags: [database, postgresql, sharding, partitioning, scalability]
+related: [tradeoffs/horizontal-vs-vertical-scaling, problems/database-is-slow, problems/database-disk-full]
+order: 19
+updated: "2026-09-12"
+contributors: [veasna]
+---
+
+## Context
+
+When a transactional table in a relational database grows beyond 50 million rows (e.g. audit logs, order line items, IoT events, or chat messages), standard queries degrade. B-Tree indexes become too large to fit in RAM (`shared_buffers`), vacuuming locks the table, and disk maintenance becomes terrifying.
+
+Engineers have two primary mechanisms to break large datasets into manageable chunks:
+1. **Table Partitioning (Single Instance / Vertical):** A native database feature (PostgreSQL Declarative Partitioning, MySQL Partitions). A single logical table (e.g. `audit_logs`) is split into multiple underlying physical tables (e.g. `audit_logs_2026_01`, `audit_logs_2026_02`) on the *same database instance*. Queries automatically prune unneeded tables, while preserving native foreign keys, joins, and ACID transactions.
+2. **Database Sharding (Multi-Instance / Horizontal):** Rows are partitioned across *completely separate physical database servers* based on a shard key (e.g. `tenant_id` or `user_id`). Shard A lives on Database Server 1; Shard B lives on Database Server 2.
+
+Teams frequently assume they need "horizontal database sharding" for large tables, plunging into the nightmare of cross-shard joins, distributed two-phase commits, and re-sharding migrations when declarative table partitioning would have solved their query and storage issues instantly.
+
+## Symptoms
+
+- **Unpartitioned Table Failure Mode:** Deleting old records (`DELETE FROM logs WHERE created_at < NOW() - INTERVAL '90 days'`) locks the database for 3 hours, generates massive dead tuple bloat, and spikes autovacuum CPU to 100%.
+- **Premature Sharding Failure Mode:** Simple administrative queries (`SELECT COUNT(*) FROM users`) require custom application code querying 16 separate database servers over the network and aggregating the results in Node.js memory; transactions spanning two tenants require complex distributed sagas.
+
+<Callout type="warning" title="Table partitioning gives 90% of sharding's performance benefits with 0% of the distributed complexity">
+Dropping a partitioned table (`DROP TABLE logs_2025_01`) is an instantaneous O(1) filesystem operation that reclaims disk space in 10 ms without generating any transaction log bloat or table locks.
+</Callout>
+
+## Diagnose
+
+1. **Check table row count and disk size:** Run `\dt+` in PostgreSQL. Does the target table exceed 100 GB or 50 million rows?
+2. **Analyze query access patterns:** Do your queries filter strictly by time ranges (e.g. `WHERE created_at >= '2026-01-01'`) or strictly by tenant ID?
+3. **Assess hardware saturation:** Has your database server maxed out the largest available cloud instance (e.g. 128 vCPUs, 1 TB RAM, 64,000 IOPS)? (If no, you do not need horizontal sharding).
+4. **Evaluate cross-entity joins:** Do queries frequently `JOIN` the target table with users, products, or billing entities? (Cross-shard joins are excruciatingly slow).
+
+## Options
+
+1. **Range Partitioning (Single Node):** Partition by date ranges (e.g. by month or day). Ideal for time-series, event streams, and audit logs.
+2. **List / Hash Partitioning (Single Node):** Partition by discrete status codes or hash of `tenant_id` on the same database server.
+3. **Application-Level Sharding (Multi-Node):** The application code maintains connection pools to 10 databases and routes queries based on `hash(tenant_id) % num_shards`.
+4. **Distributed SQL Database (Citus / CockroachDB / Yugabyte):** Automated transparent sharding across multiple nodes with Raft consensus.
+
+## Trade-offs
+
+| Dimension | Table Partitioning (Single Node) | Database Sharding (Multi-Node) |
+| :--- | :--- | :--- |
+| **Physical Nodes** | Single database server | **Multiple independent servers** |
+| **Query Joins** | **Full native SQL `JOIN` support** | Cross-shard joins are slow or impossible |
+| **Transaction ACID Guarantees** | **100% native ACID** | Requires distributed 2PC or Sagas |
+| **Instant Data Purging** | **Instant (`DROP TABLE partition`)** | Requires per-shard deletion |
+| **Scalability Ceiling** | Limited by single node disk/CPU | **Theoretical Infinite Scale** |
+| **Operational & Code Complexity** | **Low (managed natively by SQL)** | Extremely High (re-sharding, routing) |
+
+## Decision
+
+- **Use Table Partitioning (Single Node) for:**
+  - Time-series data, audit logs, order history, and event streams that grow continuously.
+  - Tables where historical data older than 90 days must be regularly deleted (dropping a partition takes 0 ms and generates zero table bloat).
+  - High-traffic tables where queries almost always include a date filter (`WHERE created_at >= ...`), enabling partition pruning.
+- **Use Database Sharding (Multi-Node) only when:**
+  - Total write volume exceeds the maximum physical write throughput (IOPS) of a single server.
+  - Total active database storage exceeds 10–20 Terabytes.
+  - Multi-tenant B2B architectures where individual large enterprise customers legally require physical data isolation.
+- **Rule of Thumb:** Always exhaust Table Partitioning, Read Replicas, and hardware scale-up before even considering Database Sharding.
+
+## Implementation
+
+### Declarative Range Partitioning in PostgreSQL:
+
+```sql
+-- 1. Create the parent partitioned table
+CREATE TABLE audit_logs (
+  id UUID NOT NULL,
+  tenant_id UUID NOT NULL,
+  event_name VARCHAR(100) NOT NULL,
+  payload JSONB,
+  created_at TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (id, created_at) -- Partition key MUST be part of primary key
+) PARTITION BY RANGE (created_at);
+
+-- 2. Create physical monthly partitions
+CREATE TABLE audit_logs_2026_01 PARTITION OF audit_logs
+  FOR VALUES FROM ('2026-01-01 00:00:00+00') TO ('2026-02-01 00:00:00+00');
+
+CREATE TABLE audit_logs_2026_02 PARTITION OF audit_logs
+  FOR VALUES FROM ('2026-02-01 00:00:00+00') TO ('2026-03-01 00:00:00+00');
+
+CREATE TABLE audit_logs_2026_03 PARTITION OF audit_logs
+  FOR VALUES FROM ('2026-03-01 00:00:00+00') TO ('2026-04-01 00:00:00+00');
+
+-- 3. Application inserts normally into the parent table!
+-- Postgres automatically routes the row to the correct partition on disk.
+INSERT INTO audit_logs (id, tenant_id, event_name, created_at)
+VALUES (gen_random_uuid(), gen_random_uuid(), 'user.login', '2026-02-15 12:00:00+00');
+
+-- 4. Instant O(1) archival of old data (reclaims 50 GB in 10 ms without vacuuming!)
+DROP TABLE audit_logs_2026_01;
+```
+
+### Partition Pruning Query Optimization:
+
+```sql
+-- Postgres inspects only audit_logs_2026_02! 
+-- All other monthly partitions are completely skipped during index scanning.
+EXPLAIN ANALYZE
+SELECT * FROM audit_logs
+WHERE created_at >= '2026-02-01' AND created_at < '2026-02-10';
+```
+
+## Verification
+
+1. **Partition pruning verification:** Run `EXPLAIN ANALYZE` on a time-scoped query. Verify that the query plan shows `Subplans Removed` and scans only the single relevant partition table.
+2. **Instant disk reclamation test:** Verify that executing `DROP TABLE audit_logs_2026_01` completes in **< 20 ms** and immediately frees disk space without increasing PostgreSQL dead tuple counts.
+3. **Primary key uniqueness enforcement:** Confirm that composite primary key `(id, created_at)` prevents duplicate IDs within the partition boundary.
+
+## Why
+
+B-Tree indexes are effective only when the index and its hot working set fit entirely within RAM (`shared_buffers`). Once a single table grows so large that its indexes exceed memory, every query incurs physical disk reads, causing performance to drop off a cliff.
+
+Table Partitioning keeps individual partition indexes small enough to stay in memory. It provides the performance benefits of small tables while allowing the application to query a single unified entity.
+
+## When Not To Use
+
+- **Small tables (< 5 million rows):** Partitioning adds query planning overhead. If a table fits comfortably in RAM, partitioning makes queries slower.
+- **Queries that do not include the partition key:** If you partition by `created_at` but constantly query by `WHERE tenant_id = ?`, PostgreSQL must scan every single partition, defeating the purpose.
+
+## Common Mistakes
+
+- **Forgetting to automate partition creation:** If you fail to run a cron job to create `audit_logs_2026_04` before April arrives, inserts on April 1st will throw fatal SQL errors. (Use tools like `pg_partman` to automate partition creation).
+- **Sharding before reaching hardware limits:** Spending 12 months engineering distributed sharding when vertical scaling and table partitioning would have handled the company's traffic for the next 5 years.
+- **Partitioning by a high-cardinality key with thousands of partitions:** Creating 10,000 partitions on a single table exhausts PostgreSQL operating system file descriptors and degrades query planning performance. Keep partition counts under 100.

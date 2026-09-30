@@ -1,0 +1,168 @@
+---
+title: "Distributed Lock"
+question: "តើខ្ញុំអាចធានាថាមាន Instance តែមួយគត់ដែលដំណើរការ Task សំខាន់ឆ្លងកាត់ Cluster ម៉ាស៊ីនជាច្រើនដោយរបៀបណា?"
+summary: "សម្របសម្រួលការដំណើរការផ្តាច់មុខ (Mutually Exclusive) ឆ្លងកាត់ Server Nodes ឯករាជ្យជាច្រើន ដោយប្រើប្រាស់ External Lock Coordinator ដូចជា Redis SET NX PX ជាមួយ Lease TTL និង Fencing Token ឬ PostgreSQL Advisory Locks។"
+tags: [concurrency, distributed-systems, redis, locking, reliability]
+related: [patterns/idempotency, patterns/optimistic-locking, problems/database-deadlocks]
+order: 15
+updated: "2026-09-12"
+contributors: [veasna]
+translation: draft
+---
+
+## Context
+
+នៅក្នុងបរិយាកាស Cloud សម័យទំនើប កម្មវិធី Backend ដំណើរការលើ Containers ឬ Kubernetes Pods ជាច្រើនព្រមគ្នាពីក្រោយ Load Balancer។ នៅពេលដែលការងារកំណត់ម៉ោង (Scheduled Cron Job ដូចជា ការកាត់ប្រាក់ប្រចាំខែនៅម៉ោង ១២ យប់, ឬការផ្ញើ Email ប្រចាំថ្ងៃ) មកដល់ Pod ទាំង ៥ នឹងដំណើរការ Task នោះក្នុងវិនាទីតែមួយព្រមគ្នា។
+
+បើគ្មានការសម្របសម្រួលទេ Instance ទាំង ៥ នឹងដំណើរការការងារស្ទួនគ្នា៖ អតិថិជនត្រូវរងការកាត់ប្រាក់ ៥ ដង, លុយត្រូវដកស្ទួន, ឬជួបបញ្ហា Database Deadlock ដែលធ្វើឱ្យទិន្នន័យខូចខាត។
+
+ក្នុងកម្មវិធីម៉ាស៊ីនតែមួយ (Single Process) យើងអាចប្រើ In-Memory Mutex (`sync.Mutex` ក្នុង Go, `ReentrantLock` ក្នុង Java) ដើម្បីទប់ស្កាត់ការដំណើរការព្រមគ្នាបាន។ ប៉ុន្តែ In-Memory Lock មិនអាចការពារឆ្លងកាត់ម៉ាស៊ីនផ្សេងគ្នាបានឡើយ។ **Distributed Lock** សម្របសម្រួលការចាក់សោផ្តាច់មុខឆ្លងកាត់ Servers ជាច្រើន ដោយប្រើប្រាស់ Shared Store ខាងក្រៅដូចជា Redis, etcd, ឬ PostgreSQL Advisory Locks។
+
+## Symptoms
+
+- ការងារ Cron Job ឬការកាត់លុយដំណើរការច្រើនដងស្ទួនគ្នា ព្រោះតែ Web Container នីមួយៗដំណើរការវានៅម៉ោង ១២ យប់ព្រមគ្នា។
+- អតិថិជនទទួលបានវិក្កយបត្រស្ទួន ឬសារ SMS ស្ទួនៗពេលមាន Traffic ខ្ពស់។
+- Worker Pods ពីរចាប់ទាញយកការងារដែលមិនទាន់មានម្ចាស់មកធ្វើព្រមគ្នា បង្កជា Race Condition និងបំពាន Database Unique Constraint។
+- ការងារមួយគាំងស្លាប់ពាក់កណ្តាលទី បន្សល់ទុក Lock ជាប់គាំងរហូត ដែលរារាំងមិនឱ្យមានការដំណើរការការងារនោះនៅពេលក្រោយជារៀងរហូត។
+
+<Callout type="warning" title="ការចាក់សោដោយគ្មាន Lease Timeout (TTL) បង្កើត Deadlock ជាអចិន្ត្រៃយ៍">
+ប្រសិនបើ Server មួយទាញយក Distributed Lock បានជោគជ័យ ហើយស្រាប់តែ Server នោះគាំងស្លាប់ ឬដាច់ភ្លើង Lock នោះនឹងនៅជាប់រហូតគ្មានថ្ងៃរបូតឡើយ លុះត្រាតែមានការកំណត់ Hard TTL Lease ឱ្យវាផុតកំណត់ដោយស្វ័យប្រវត្តិ។
+</Callout>
+
+## Diagnose
+
+1. **ពិនិត្យមើលរចនាសម្ព័ន្ធ Server (Topology)៖** តើអ្នកកំពុងដំណើរការ App លើសពី ១ Replica ពីក្រោយ Load Balancer មែនទេ?
+2. **ពិនិត្យមើលរបៀបដែល Cron Job ដំណើរការ៖** តើ Cron Tasks ត្រូវបានកេះយ៉ាងដូចម្តេច? តើ Pod នីមួយៗដំណើរការ `node-cron` ឬ `cron` ក្នុង Process ផ្ទាល់ខ្លួនមែនទេ?
+3. **ពិនិត្យ Error Logs រកមើល Race Condition៖** ស្វែងរក Error `duplicate key value violates unique constraint` អំឡុងពេលដំណើរការ Batch ប្រចាំថ្ងៃ។
+4. **វាយតម្លៃរយៈពេល Lock៖** តើផ្នែកសំខាន់នោះត្រូវចំណាយពេលប៉ុន្មានដើម្បីដំណើរការចប់? តើវាប្រើពេល ៥០ មិល្លីវិនាទី ឬ ១០ នាទី?
+
+## Options
+
+1. **Redis Key ជាមួយ Lease TTL (`SET key token NX PX 30000`)៖** លឿនបំផុត, សាមញ្ញ, ចំណាយពេល < 1 ms។ មានសុវត្ថិភាពខ្ពស់នៅពេលភ្ជាប់ជាមួយ Unique Owner Token និងការដោះលែង Lock ដោយស្វ័យប្រវត្តិតាមរយៈ Lua Script។
+2. **PostgreSQL Advisory Locks (`pg_try_advisory_lock(key)`)៖** ប្រើប្រាស់ Database ដែលមានស្រាប់ដោយមិនបាច់ដំឡើង Redis បន្ថែម។ ដោះលែង Lock ដោយស្វ័យប្រវត្តិប្រសិនបើ Connection ត្រូវដាច់។
+3. **etcd / ZooKeeper Distributed Consensus៖** ផ្តល់នូវភាពស៊ីសង្វាក់រឹងមាំបំផុតជាមួយ Heartbeat Leases។ (ល្អសម្រាប់ Enterprise Orchestration ប៉ុន្តែពិបាកគ្រប់គ្រង Infrastructure)។
+4. **Idempotency Keys / DB Constraints៖** ជំនួសឱ្យការចាក់សោ ត្រូវប្រើប្រាស់ Unique Database Constraints ដើម្បីធ្វើឱ្យប្រតិបត្តិការនោះមានលក្ខណៈ Idempotent ពីធម្មជាតិ។
+
+## Trade-offs
+
+| យន្តការ Lock | Latency | ការសង្គ្រោះពេល Crash | បន្ទុក Infrastructure | កម្រិត Consensus |
+| :--- | :--- | :--- | :--- | :--- |
+| **Redis (SET NX PX)** | លឿនបំផុត (< 1 ms) | ស្វ័យប្រវត្តិតាមរយៈ TTL | ទាបបំផុត (បើមាន Redis) | Eventual / Failover edge cases |
+| **Postgres Advisory Lock** | លឿន (1–3 ms) | ស្វ័យប្រវត្តពេល Disconnect | សូន្យ (ប្រើ DB ដែលមានស្រាប់) | Strong ACID |
+| **etcd / ZooKeeper** | មធ្យម (5–10 ms) | Heartbeat Lease Expiry | ខ្ពស់ (ត្រូវការ Cluster ដាច់ដោយឡែក) | Strong CP Consensus (Raft) |
+| **In-Memory Mutex** | លឿនជាង Microsecond | ភ្លាមៗ | សូន្យ | **គ្មានប្រយោជន៍ឆ្លង Pods** |
+
+## Decision
+
+- **ប្រើ PostgreSQL Advisory Locks បើអ្នកមាន Postgres ហើយគ្មាន Redis៖** ដំណើរការ `SELECT pg_try_advisory_lock(123456)`។ វាមិនត្រូវការ Dependency ខាងក្រៅទេ ហើយដោះសោរដោយស្វ័យប្រវត្តិបើ App គាំង។
+- **ប្រើ Redis `SET NX PX` ជាមួយ Unique Token សម្រាប់ប្រព័ន្ធដែលមាន Throughput ខ្ពស់៖**
+  - បង្កើត Token ចៃដន្យ (UUID) ជានិច្ចនៅពេលចាក់សោ។
+  - ដោះលែង Lock លុះត្រាតែតម្លៃក្នុង Redis ត្រូវគ្នានឹង Token របស់យើងប៉ុណ្ណោះ ដោយប្រើប្រាស់ Lua Script អាតូមិក។ វិធីនេះការពារកុំឱ្យ Instance ដែលដំណើរការយឺត ទៅលុប Lock របស់អ្នកដទៃដែលទើបតែទទួលបាន Lock ក្រោយពេល TTL របស់យើងផុតកំណត់។
+- **ត្រូវកំណត់ Lease TTL ជានិច្ច៖** ហាមទាញយក Lock ដោយគ្មាន TTL ជាដាច់ខាត។ រយៈពេល TTL ត្រូវតែកំណត់ឱ្យវែងជាងរយៈពេលដំណើរការធម្មតាបន្តិច (ឧ. កំណត់ ៣០ វិនាទី សម្រាប់ការងារដែលប្រើពេល ៥ វិនាទី)។
+- **ប្រើ Fencing Token ដើម្បីការពារ Storage៖** បញ្ជូនលេខរាប់ Version កើនឡើងជាមួយ Lock ដើម្បីឱ្យ Database អាចច្រានចោលការសរសេរយឺតយ៉ាវពី Node ដែលផុតកំណត់ Lock ហើយ។
+
+## Implementation
+
+### ការបង្កើត Redis Distributed Lock កម្រិត Production ក្នុង TypeScript៖
+
+```typescript
+import { Redis } from 'ioredis';
+import { randomUUID } from 'crypto';
+
+export class DistributedLock {
+  constructor(private readonly redis: Redis) {}
+
+  /**
+   * ស្នើសុំទាញយក Distributed Lock
+   * @param lockKey ឈ្មោះ Resource ដែលត្រូវចាក់សោ
+   * @param ttlMs រយៈពេលកំណត់គិតជាមិល្លីវិនាទីមុនពេល Lock ផុតកំណត់ស្វ័យប្រវត្តិ
+   * @returns lockToken បើចាក់សោបានសម្រេច ឬ null បើមានគេចាក់សោរួចហើយ
+   */
+  async acquire(lockKey: string, ttlMs: number): Promise<string | null> {
+    const token = randomUUID();
+    // SET lockKey token NX (តែបើមិនទាន់មាន) PX ttlMs (ផុតកំណត់ក្នុង ttlMs)
+    const result = await this.redis.set(lockKey, token, 'PX', ttlMs, 'NX');
+    return result === 'OK' ? token : null;
+  }
+
+  /**
+   * ដោះលែង Distributed Lock ដោយសុវត្ថិភាពតាមរយៈ Lua Script
+   * លុប Key ចេញលុះត្រាតែ Token នៅតែត្រូវគ្នានឹង Token របស់យើងប៉ុណ្ណោះ!
+   */
+  async release(lockKey: string, token: string): Promise<boolean> {
+    const luaScript = `
+      if redis.call("get", KEYS[1]) == ARGV[1] then
+        return redis.call("del", KEYS[1])
+      else
+        return 0
+      end
+    `;
+
+    const result = await this.redis.eval(luaScript, 1, lockKey, token);
+    return result === 1;
+  }
+
+  /**
+   * ដំណើរការការងារសំខាន់ផ្តាច់មុខ ដោយមានស្វ័យប្រវត្តិនៃការចាក់សោ និងដោះសោ
+   */
+  async runExclusive<T>(
+    lockKey: string,
+    ttlMs: number,
+    task: () => Promise<T>
+  ): Promise<{ executed: boolean; result?: T }> {
+    const token = await this.acquire(lockKey, ttlMs);
+    if (!token) {
+      console.log(`[DistributedLock] Resource ${lockKey} កំពុងត្រូវបានចាក់សោដោយ Node ផ្សេង។ រំលងការដំណើរការ។`);
+      return { executed: false };
+    }
+
+    try {
+      const result = await task();
+      return { executed: true, result };
+    } finally {
+      await this.release(lockKey, token);
+    }
+  }
+}
+```
+
+### ឧទាហរណ៍ការប្រើប្រាស់សម្រាប់ដំណើរការកាត់ប្រាក់ប្រចាំខែនៅពាក់កណ្តាលអធ្រាត្រ៖
+
+```typescript
+const lock = new DistributedLock(new Redis(process.env.REDIS_URL!));
+
+export async function runMidnightBilling() {
+  // ចាក់សោរយៈពេល ៦០ វិនាទី។ បើមាន Pod ផ្សេងកំពុងដំណើរការហើយ រំលងដោយសុវត្ថិភាព។
+  const outcome = await lock.runExclusive('locks:billing:midnight', 60000, async () => {
+    console.log('ទទួលបានសិទ្ធិចាក់សោផ្តាច់មុខ! កំពុងដំណើរការកាត់ប្រាក់ប្រចាំខែ...');
+    await processSubscriptions();
+  });
+
+  if (!outcome.executed) {
+    console.log('មាន Pod ផ្សេងទៀតកំពុងដំណើរការរួចរាល់ហើយ។ រំលងដោយរលូន។');
+  }
+}
+```
+
+## Verification
+
+1. **ការធ្វើតេស្តប៉ះទង្គិចគ្នា (Collision Test)៖** បង្កើត Worker ចំនួន ៥ ឱ្យព្យាយាមដណ្តើម Lock តែមួយក្នុងមិល្លីវិនាទីតែមួយ។ ផ្ទៀងផ្ទាត់ថាមាន Worker តែ ១ គត់ដែលទទួលបាន Lock ខណៈដែល ៤ ទៀតទទួលបាន `null` ហើយរំលងការងារ។
+2. **ការធ្វើតេស្តសង្គ្រោះពេល Crash៖** ទាញយក Lock ដែលមាន TTL 3,000 ms រួចសាកល្បង Kill Process ភ្លាមៗ (`process.exit(1)`)។ ផ្ទៀងផ្ទាត់ថាក្រោយ 3,001 ms Node ផ្សេងទៀតអាចទាញយក Lock នោះបានដោយជោគជ័យដោយមិនបាច់មានមនុស្សជួយដោះសោឡើយ។
+3. **ការផ្ទៀងផ្ទាត់សុវត្ថិភាពនៃ Lua Release៖** ចាក់សោដោយកំណត់ TTL ខ្លី 500 ms។ ផ្អាកកូដគេង ១,០០០ ms (ទុកឱ្យ Lock ផុតកំណត់ ហើយមាន Node ថ្មីចូលមកកាន់កាប់)។ សាកល្បងដំណើរការដោះសោ។ ផ្ទៀងផ្ទាត់ថា Lua Script បដិសេធមិនលុប Lock របស់ម្ចាស់ថ្មីឡើយ។
+
+## Why
+
+នៅក្នុងប្រព័ន្ធ Distributed Systems ភាពឯករាជ្យនៃម៉ាស៊ីននីមួយៗមានន័យថា Memory មិនត្រូវបានចែករំលែកឡើយ។ នៅពេលព្រឹត្តិការណ៍ Scheduled Timer កើតឡើងលើ Containers ច្រើន ភាពច្របូកច្របល់នឹងកើតមានឡើងជាមិនខានបើគ្មានអាជ្ញាកណ្តាលខាងក្រៅ។
+
+Distributed Lock បម្រើការជាអាជ្ញាកណ្តាលនោះ។ តាមរយៈការរួមបញ្ចូលគ្នារវាង Atomic Compare-and-Swap (`SET NX`) ជាមួយ Time-based Leases វាផ្តល់នូវការសម្របសម្រួលប្រកបដោយសុវត្ថិភាព ការពារការដំណើរការស្ទួន និងធានាថាការគាំងម៉ាស៊ីនមិនធ្វើឱ្យប្រព័ន្ធជាប់គាំងរហូតឡើយ។
+
+## When Not To Use
+
+- **ប្រតិបត្តិការសរសេរដែលមានចំនួនច្រើនលើសលុប (រាប់ពាន់ដងក្នុងមួយវិនាទី)៖** ការទាញយក Distributed Lock លើរាល់ Order ឬ Chat Message របស់អ្នកប្រើប្រាស់នឹងធ្វើឱ្យ Redis ស្ទះ។ ត្រូវប្រើ Optimistic Concurrency (`WHERE version = 1`) ឬ Database Row-level Locking (`FOR UPDATE`) ជំនួសវិញ។
+- **ការងារដែលស៊ីពេលរាប់ម៉ោង៖** Distributed Lock ត្រូវបានរចនាឡើងសម្រាប់តែការងារខ្លីៗ (ពីរបីវិនាទីទៅពីរបីនាទី) ប៉ុណ្ណោះ។ សម្រាប់ការងារវែង ត្រូវប្រើ Workflow Engine (Temporal) ឬ Job Queue ដែលមាន Durable Lease។
+
+## Common Mistakes
+
+- **ដោះលែង Lock ដោយប្រើពាក្យបញ្ជា `DEL` ធម្មតា៖** ប្រសិនបើការងារដំណើរការយូរជាង TTL នោះ Lock នឹងផុតកំណត់ ហើយ Node ផ្សេងទាញយកបាន។ ការប្រើ `DEL` នឹងទៅលុប Lock របស់ Node ទីពីរនោះចោល! ត្រូវប្រើ Lua Script ជាមួយ Unique Token ជានិច្ច។
+- **ភ្លេចកំណត់ TTL៖** ការបង្កើត Lock ដោយគ្មានអាយុកាលកំណត់ មានន័យថាបើសិនជា Server គាំងស្លាប់តែមួយលើក ធនធាននោះនឹងជាប់គាំងរហូតគ្មានថ្ងៃដោះរួចឡើយ។
+- **មិនបានគិតដល់បញ្ហា Garbage Collection (GC Pause)៖** ក្នុង Java ឬ Node.js ការផ្អាករបស់ GC យូរអាចធ្វើឱ្យ App គាំងស្ងៀមរហូតដល់ផុតកំណត់ TTL ដែលអនុញ្ញាតឱ្យ Node ផ្សេងចូលមកដំណើរការជាន់គ្នា។

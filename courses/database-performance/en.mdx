@@ -1,0 +1,23 @@
+---
+title: "Database performance basics"
+summary: "Find out why a query is slow and fix the four causes behind most slow apps: no measurement, missing indexes, N+1 queries and deep pagination."
+level: beginner
+order: 2
+outcomes:
+  - "Find the queries that cost the most time, instead of guessing"
+  - "Read a query plan and add the index it needs"
+  - "Spot and remove N+1 queries in ORM code"
+  - "Page through large tables without slowing down"
+prerequisites:
+  - "You can write basic SQL: SELECT, WHERE, ORDER BY, JOIN"
+  - "You have a PostgreSQL or MySQL database to practise on"
+related: [problems/database-is-slow, problems/n-plus-one-queries, problems/pagination-performance, tradeoffs/pagination-offset-vs-keyset]
+updated: "2026-09-29"
+contributors: [Veasna-Pen]
+---
+
+Most slow applications are slow in the database, and most slow databases have one of a few causes. The good news: they are easy to find once you know where to look, and the fixes are usually small.
+
+This course follows the order you would use at work. First you **measure** to find the query that matters. Then you learn what an **index** does and how to read a query plan. Then you fix the most common ORM mistake, **N+1 queries**, and finish with **pagination** that stays fast on page 1,000.
+
+The examples use PostgreSQL. Every idea works the same in MySQL; only some commands and tool names differ.

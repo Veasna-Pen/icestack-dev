@@ -1,0 +1,138 @@
+---
+title: "តើខ្ញុំគួរប្រើ Redis ដែរឬទេ?"
+question: "នៅពេលណាដែលខ្ញុំគួរប្រើ Redis?"
+summary: "ប្រើនៅពេលអ្នកមានបញ្ហាដែលបានវាស់វែងច្បាស់ ហើយ store ក្នុង memory ដែលចែករំលែកគ្នា និងមាន expiry អាចដោះស្រាយបានល្អជាង database របស់អ្នក៖ hot reads, rate limits, sessions និង locks រយៈពេលខ្លី។ មិនមែនជាប្រភពទិន្នន័យពិតទីពីរ ហើយក៏មិនមែនជាផ្លូវវាងពី query យឺតដែរ។"
+tags: [redis, caching, architecture]
+related: [patterns/caching, patterns/rate-limiting, problems/database-is-slow, problems/should-i-use-kafka]
+order: 1
+updated: "2026-09-11"
+translation: draft
+---
+
+## Context
+
+Redis ត្រូវបានលើកឡើងស្ទើរតែគ្រប់ការពិភាក្សាអំពីស្ថាបត្យកម្ម ហើយជាញឹកញាប់មុនពេលដែលនរណាម្នាក់បានកំណត់បញ្ហាច្បាស់លាស់ផង។ វាគឺជា key-value store ក្នុង memory ដែលមាន data types ច្រើនប្រភេទ (strings, hashes, sorted sets, streams) មាន atomic operations និង expiry សម្រាប់ key នីមួយៗ។ វាលឿនណាស់ ក្រោមមួយមិល្លីវិនាទីនៅក្នុងបណ្តាញតែមួយ ព្រោះវារក្សាទុកទិន្នន័យទាំងអស់នៅក្នុង RAM។ លក្ខណៈដដែលនេះហើយ ជាប្រភពនៃ trade-offs ភាគច្រើនរបស់វា។
+
+ស្ថានភាពទូទៅ៖ web app មួយដែលប្រើ relational database តែមួយ មាន app servers ពីរបី និងក្រុមអ្នកអភិវឌ្ឍពីពីរទៅដប់នាក់ ដែលកំពុងឆ្ងល់ថា តើ «ការបន្ថែម Redis» គឺជាជំហានបន្ទាប់ឬទេ។
+
+## Symptoms
+
+ហេតុផលដែលមនុស្សនឹកឃើញដល់ Redis ពីខ្លាំងបំផុត៖
+
+- Read ដែលចំណាយខ្លាំងមួយ ត្រូវបានហៅរាប់ពាន់ដងក្នុងមួយនាទី ហើយចម្លើយកម្រផ្លាស់ប្តូរ។
+- អ្នកត្រូវការ state ដែល **ចែករំលែករវាង app servers**៖ sessions, rate-limit counters ឬ lock។
+- អ្នកត្រូវការ **expiry** ដែលមានស្រាប់៖ លេខកូដប្រើម្តង បញ្ជី «ទើបមើលថ្មីៗ» ឬ token បណ្តោះអាសន្ន។
+- Library សម្រាប់ background jobs ត្រូវការ broker (Sidekiq, BullMQ, Laravel queues)។
+- «Database យឺត»។ នេះជាហេតុផលខ្សោយបំផុត។ សូមអាន [ហេតុអ្វីបានជា database របស់ខ្ញុំយឺត?](../database-is-slow) ជាមុនសិន។
+
+## Diagnose
+
+មុននឹងបន្ថែម infrastructure ថ្មី សូមឆ្លើយសំណួរទាំងនេះដោយផ្អែកលើទិន្នន័យ៖
+
+1. **តើអ្វីពិតប្រាកដដែលយឺត ឬខ្វះ?** ដាក់ឈ្មោះ endpoint និងលេខ៖ p95, CPU ឬ error rate។
+2. **តើ database ពិតជាចំណុចកកស្ទះមែនទេ?** ពិនិត្យ `pg_stat_statements` ឬ slow query log។ Index ដែលខ្វះអាចជួសជុលបានក្នុងមួយម៉ោង; ចំណែក cache ដែលដាក់ពីមុខវា គឺជាការចំណាយជាអចិន្ត្រៃយ៍។
+3. **តើទិន្នន័យផ្លាស់ប្តូរញឹកញាប់ប៉ុណ្ណា ហើយវាអាចហួសសម័យបានប៉ុណ្ណា?** តម្លៃទំនិញដែលអាចយឺត 30 វិនាទី គឺជាបេក្ខភាពល្អសម្រាប់ cache។ សមតុល្យគណនី ជាធម្មតាមិនមែនទេ។
+4. **តើ state ត្រូវចែករំលែកឬទេ?** Process តែមួយអាចប្រើ `Map` ក្នុង memory បាន។ Servers ពីរ ឬច្រើនជាងនេះ ត្រូវការអ្វីមួយនៅខាងក្រៅ process។
+5. **តើមានអ្វីកើតឡើងនៅពេល Redis គាំង?** ប្រសិនបើចម្លើយគឺ «គេហទំព័រគាំងដែរ» នោះ Redis បានក្លាយជា critical dependency ហើយត្រូវតែដំណើរការវាឱ្យសមស្របនឹងតួនាទីនោះ។
+
+## Options
+
+1. **មិនបន្ថែមអ្វីថ្មី។** ជួសជុល query បន្ថែម index ឬប្រើ HTTP caching (`Cache-Control`, CDN)។
+2. **In-process cache។** LRU map នៅក្នុង app server នីមួយៗ៖ គ្មាន network hop គ្មាន service ថ្មី ប៉ុន្តែ server នីមួយៗមានច្បាប់ចម្លងផ្ទាល់ខ្លួន។
+3. **Database ដែលអ្នកមានស្រាប់។** Postgres អាចផ្ទុក sessions, rate-limit counters (`UPDATE … RETURNING`) និង job queues (`FOR UPDATE SKIP LOCKED`) បានយ៉ាងល្អនៅកម្រិតទំហំមធ្យម។
+4. **Redis** ប្រភេទ managed ឬ self-hosted។ State ដែលចែករំលែក លឿន មាន expiry និង atomic operations។
+5. **Memcached។** សាមញ្ញជាង និង multi-threaded ប៉ុន្តែមានតែ strings ធម្មតា ហើយគ្មាន persistence។
+
+## Trade-offs
+
+| | In-process cache | Postgres | Redis |
+| :--- | :--- | :--- | :--- |
+| Read latency | ~0.01 ms | 1–5 ms | ~0.3 ms |
+| ចែករំលែករវាង servers | ទេ | បាន | បាន |
+| Expiry ស្រាប់ | អាស្រ័យលើ library | ត្រូវសម្អាតដោយខ្លួនឯង | មាន សម្រាប់ key នីមួយៗ |
+| ដែនកំណត់ទំហំ | Memory របស់ app | Disk | RAM ដែលថ្លៃ |
+| Durability | គ្មាន | ពេញលេញ | ជាជម្រើស (RDB/AOF); failover អាចបាត់ writes ថ្មីៗ |
+| របស់ថ្មីដែលត្រូវដំណើរការ | ទេ | ទេ | មាន៖ memory, eviction, failover, upgrades |
+
+Redis សមនឹងកន្លែងរបស់វា នៅពេលអ្នកត្រូវការ **ចែករំលែក + លឿន + មាន expiry** ព្រមគ្នា។ ការចំណាយរបស់វាគឺ កន្លែងទីពីរដែលទិន្នន័យរស់នៅ (ហើយអាចមិនស៊ីគ្នាជាមួយ database) memory ដែលត្រូវកំណត់ទំហំ និងតាមដាន និងមធ្យោបាយថ្មីមួយទៀតដែលធ្វើឱ្យគេហទំព័រគាំង។
+
+## Decision
+
+- **ប្រើ Redis** សម្រាប់ state ដែលចែករំលែក មានអាយុខ្លី ហើយបាត់បង់ ឬបង្កើតឡើងវិញបានដោយមិនខាតច្រើន៖ cache entries, sessions, rate limits, locks និង queues ដែលអ្នកដំណើរការតាម library ដែលផ្អែកលើ Redis រួចហើយ។
+- **កុំប្រើវា** ដើម្បីជៀសវាងការជួសជុល query យឺត ឬជាកន្លែងតែមួយគត់សម្រាប់ទិន្នន័យដែលអ្នកមិនអាចបង្កើតឡើងវិញបាន។
+- **ចាប់ផ្តើមតូច៖** managed instance មួយ កំណត់ `maxmemory` ជ្រើសរើស eviction policy ដោយចេតនា ហើយសរសេរកូដ app ឱ្យនៅតែដំណើរការ (យឺតជាងមុន) នៅពេល Redis មិនអាចប្រើបាន។
+
+ពិនិត្យការសម្រេចចិត្តនេះឡើងវិញ ប្រសិនបើ memory របស់ Redis កើនលឿនជាងទិន្នន័យរបស់អ្នក ឬប្រសិនបើអ្នករកឃើញថាខ្លួនកំពុងសរសេរទៅ Redis និង database ក្នុង request តែមួយ ហើយសង្ឃឹមថាវាទាំងពីរនឹងស៊ីគ្នា។
+
+## Implementation
+
+Cache-aside read ជាមួយ TTL ខ្លី ក្នុង Node.js ដោយប្រើ `ioredis`។ Database នៅតែជាប្រភពទិន្នន័យពិត; Redis គ្រាន់តែចងចាំចម្លើយថ្មីៗប៉ុណ្ណោះ។
+
+```ts
+import Redis from 'ioredis';
+
+const redis = new Redis(process.env.REDIS_URL!, {
+  maxRetriesPerRequest: 1,   // fail fast: the database is the fallback
+  enableOfflineQueue: false  // don't queue commands while disconnected
+});
+
+const TTL_SECONDS = 60;
+
+export async function getProduct(id: string) {
+  const key = `product:v1:${id}`;
+
+  try {
+    const cached = await redis.get(key);
+    if (cached) return JSON.parse(cached);
+  } catch {
+    // Redis is down or slow: serve from the database instead of failing the request.
+  }
+
+  const product = await db.product.findUnique({ where: { id } });
+
+  if (product) {
+    // Fire and forget; a failed cache write must not fail the read.
+    redis.set(key, JSON.stringify(product), 'EX', TTL_SECONDS).catch(() => {});
+  }
+  return product;
+}
+```
+
+ការកំណត់ពីរនៅខាង server ដែលសំខាន់បំផុតសម្រាប់ cache៖
+
+```text
+maxmemory 512mb
+maxmemory-policy allkeys-lru   # when full, evict the least recently used key
+```
+
+សម្រាប់ queue ឬ session store ដែល eviction អាចធ្វើឱ្យបាត់ការងារដោយស្ងាត់ៗ សូមប្រើ `maxmemory-policy noeviction` ហើយដាក់ alert លើ memory ជំនួសវិញ។
+
+## Verification
+
+- **លេខដើមបានប្រសើរឡើង។** p95 របស់ endpoint និងពេលវេលា database សម្រាប់ query នោះបានធ្លាក់ចុះទាំងពីរ។
+- **Hit ratio ល្អ។** ពី `INFO stats`៖ `keyspace_hits / (keyspace_hits + keyspace_misses)`។ ទាបជាងប្រហែល 80% សម្រាប់ cache ជាធម្មតាមានន័យថា TTL ខ្លីពេក ឬ keys លម្អិតពេក។
+- **Memory មានដែនកំណត់។** `INFO memory` បង្ហាញ `used_memory` ស្ថិតស្ថេរក្រោម `maxmemory` ហើយ `evicted_keys` មិនកើនឡើងខុសពីការរំពឹងទុក។
+- **អាចរស់រានពីការខូច។** បញ្ឈប់ Redis នៅក្នុង staging។ Requests គួរតែយឺតជាងមុន មិនមែនបរាជ័យទេ។
+
+## Why
+
+Redis លឿនព្រោះវាដោះដូរ durability និងទំហំផ្ទុក ដើម្បីបានល្បឿន៖ ទិន្នន័យរស់នៅក្នុង RAM លើ primary តែមួយ។ វាល្អឥតខ្ចោះសម្រាប់ទិន្នន័យដែលការបាត់បង់វាចំណាយត្រឹមតែការគណនាឡើងវិញ ហើយគ្រោះថ្នាក់សម្រាប់ទិន្នន័យដែលការបាត់បង់វាចំណាយជាលុយ។
+
+សំណួរ «តើខ្ញុំគួរប្រើ Redis ដែរឬទេ?» ភាគច្រើនពិតជាសំណួរ «តើទិន្នន័យនេះដូច cache ឬដូចសៀវភៅបញ្ជីគណនេយ្យ (ledger) ជាង?»។ ឆ្លើយសំណួរនោះជាមុនសិន ហើយការសម្រេចចិត្តដែលនៅសល់នឹងមកតាមក្រោយ។
+
+## When Not To Use
+
+- **ដើម្បីបិទបាំង query យឺត។** ជួសជុល query; សូមមើល [ហេតុអ្វីបានជា database របស់ខ្ញុំយឺត?](../database-is-slow)។
+- **ជា primary store សម្រាប់ទិន្នន័យសំខាន់** លុះត្រាតែអ្នកបានកំណត់ persistence និង replication ដោយចេតនា ហើយដឹងថា failover អាចធ្វើឱ្យបាត់អ្វីខ្លះ។
+- **សម្រាប់ទិន្នន័យដែលធំជាង RAM ដែលអ្នកអាចបង់ថ្លៃបាន** ឬទិន្នន័យដែលអ្នកត្រូវ query ដោយវិធីផ្សេងក្រៅពី key។
+- **ជាមួយ app server តែមួយ និង traffic មធ្យម** ដែល in-process cache អាចធ្វើការងារនេះបាន ដោយគ្មាន service ថ្មី។
+- **សម្រាប់ event streams ដែលត្រូវរក្សាទុក និង replay បាន ហើយចែករំលែករវាងក្រុមផ្សេងៗ។** នោះជាការងាររបស់ Kafka ច្រើនជាង; សូមមើល [តើខ្ញុំគួរប្រើ Kafka ដែរឬទេ?](../should-i-use-kafka)។
+
+## Common Mistakes
+
+- **គ្មាន `maxmemory`។** Redis នឹងធំឡើងៗ រហូតដល់ operating system សម្លាប់វា។
+- **គ្មាន TTL លើ cache keys** ដូច្នេះទិន្នន័យចាស់នៅជារៀងរហូត ហើយ memory មានតែកើនឡើង។
+- **ចាត់ទុក Redis ថាតែងតែដំណើរការ** ដូច្នេះការរអាក់រអួលបន្តិចរបស់ Redis ក្លាយជា outage ពេញលេញ។
+- **Cache stampede៖** key ដែលពេញនិយមមួយផុតកំណត់ ហើយ requests រាប់រយវាយលុក database ក្នុងពេលតែមួយ។ បន្ថែម jitter ទៅលើ TTL ឬអនុញ្ញាតឱ្យ request តែមួយបំពេញ key ឡើងវិញ; សូមមើល [Caching](../../patterns/caching)។
+- **`KEYS *` នៅក្នុង production។** វារារាំង server ពេលវាកំពុងដំណើរការ។ សូមប្រើ `SCAN`។
+- **Keys គ្មាន version។** នៅពេលទម្រង់ទិន្នន័យក្នុង cache ផ្លាស់ប្តូរ entries ចាស់នឹងធ្វើឱ្យកូដថ្មីខូច។ ដាក់ version ក្នុង key (`product:v2:…`)។

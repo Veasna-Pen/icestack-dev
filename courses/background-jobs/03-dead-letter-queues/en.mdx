@@ -1,0 +1,84 @@
+---
+title: "When a job keeps failing: dead-letter queues"
+summary: "Move jobs that fail every retry out of the way, keep them for inspection, and replay them once they are fixed."
+minutes: 10
+related: [patterns/dead-letter-queue, problems/webhook-delivery-failures]
+updated: "2026-09-30"
+contributors: [Veasna-Pen]
+---
+
+## The problem
+
+A CRM sync job fails for one user because their phone number has letters in it. It retries 5 times, and every attempt fails the same way. Meanwhile, a bug in another release makes a few hundred jobs fail with the same error.
+
+Some queue setups retry these forever and slow everything behind them. Others silently delete them, and nobody notices that 300 customers never reached the CRM.
+
+## The idea
+
+Not every failure is temporary. A **poison message** is a job that will fail no matter how often you retry it: bad data, a bug, a record that no longer exists.
+
+A **dead-letter queue** (DLQ) is a separate place for jobs that used up all their retries. It does three things:
+
+1. **Unblocks the main queue.** The failing job stops taking worker time.
+2. **Keeps the job and its error**, so a person can see what went wrong.
+3. **Allows a replay.** After you fix the data or deploy a fix, move the jobs back and they run again.
+
+A DLQ is only useful if someone looks at it. Add an **alert** when it is not empty, or when it grows.
+
+## Example
+
+In BullMQ, a job that runs out of attempts ends up in the **failed** set, which works as the dead-letter queue. Listen for it and alert:
+
+```ts
+const worker = new Worker('crm', syncContact, { connection: redis });
+
+worker.on('failed', (job, error) => {
+  if (job && job.attemptsMade >= (job.opts.attempts ?? 1)) {
+    logger.error({ jobId: job.id, data: job.data, error: error.message }, 'job moved to dead letters');
+    metrics.increment('jobs.dead_lettered', { queue: 'crm' });
+  }
+});
+```
+
+After fixing the bug, replay the failed jobs:
+
+```ts
+const failed = await crmQueue.getFailed(0, 500);
+for (const job of failed) await job.retry();
+```
+
+Skip retries for errors that can never succeed. Throwing BullMQ's `UnrecoverableError` for "invalid phone number" sends the job straight to the failed set instead of wasting four more attempts.
+
+## Try it
+
+1. Make a job that always fails for one specific input.
+2. Add it to the queue with `attempts: 3` and watch it end up in the failed set (BullMQ's dashboard, `bull-board`, or `getFailed()`).
+3. Add a log line or metric when a job fails for good.
+4. Fix the job so the input works, then replay it and check that it succeeds.
+
+## Check yourself
+
+**1. What is the difference between a transient failure and a poison message?**
+
+<Answer>
+A transient failure, such as a timeout or a service restart, may succeed on the next try. A poison message fails every time, because of bad data or a bug, so retrying it only wastes time.
+</Answer>
+
+**2. Your DLQ has held 2,000 jobs for three weeks. What went wrong?**
+
+<Answer>
+Nobody was watching it. A dead-letter queue needs an alert and an owner; otherwise it is just a slower way of losing jobs.
+</Answer>
+
+**3. You fixed the bug. Why is replaying the dead-lettered jobs safe?**
+
+<Answer>
+Because the jobs are idempotent, as in the last lesson. Any job that had partly succeeded before failing checks what is already done and doesn't repeat it.
+</Answer>
+
+## Key takeaways
+
+- Some jobs will **never** succeed; don't retry them forever.
+- A **dead-letter queue** keeps them out of the way, with their error, ready to **replay**.
+- Fail fast on errors you know are permanent.
+- **Alert** on dead letters, or they will be forgotten.

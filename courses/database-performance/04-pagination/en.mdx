@@ -1,0 +1,92 @@
+---
+title: "Paging through large tables"
+summary: "See why OFFSET gets slower with every page, and switch to keyset pagination that stays fast on page 1,000."
+minutes: 12
+related: [problems/pagination-performance, tradeoffs/pagination-offset-vs-keyset]
+updated: "2026-09-29"
+contributors: [Veasna-Pen]
+---
+
+## The problem
+
+The admin panel lists events, 50 per page, newest first. Page 1 loads in **5 ms**. An export job walks through every page, and by page 20,000 each request takes **4 seconds**. The query is the same every time; only the page number changes.
+
+## The idea
+
+The usual way to paginate is `LIMIT` and `OFFSET`:
+
+```sql
+SELECT * FROM events ORDER BY created_at DESC LIMIT 50 OFFSET 1000000;
+```
+
+`OFFSET 1000000` does not jump to row one million. The database has to **read one million rows and throw them away** before it returns 50. The deeper the page, the more work.
+
+**Keyset pagination** (also called cursor pagination) remembers **where the last page ended** and asks for the rows after it:
+
+```sql
+SELECT * FROM events
+WHERE created_at < '2026-09-01 10:15:00'   -- the last row you already showed
+ORDER BY created_at DESC
+LIMIT 50;
+```
+
+With an index on `created_at`, the database jumps straight to that point and reads just 50 rows, whether it is page 2 or page 20,000.
+
+The trade-off: you can go to the **next** page, but not jump to page 7,431. That is fine for infinite scroll, feeds, APIs and exports. For a small admin table where people click page numbers, OFFSET is still fine.
+
+## Example
+
+Two rows can share the same `created_at`, so add the unique `id` as a tie-breaker, and index both columns:
+
+```sql
+CREATE INDEX CONCURRENTLY idx_events_created_id ON events (created_at DESC, id DESC);
+
+SELECT id, created_at, type
+FROM events
+WHERE (created_at, id) < ('2026-09-01 10:15:00', 98231)
+ORDER BY created_at DESC, id DESC
+LIMIT 50;
+```
+
+The API returns the last row's `created_at` and `id` as a **cursor**. The client sends it back to get the next page:
+
+```text
+GET /events?limit=50                                → items + nextCursor
+GET /events?limit=50&cursor=2026-09-01T10:15:00_98231 → the next 50
+```
+
+Page 20,000 now takes about **5 ms**, the same as page 1.
+
+## Try it
+
+1. Find a list endpoint or export in your project that uses `OFFSET`.
+2. Time page 1 and a deep page, for example `OFFSET 500000`, with `EXPLAIN ANALYZE`.
+3. Rewrite it with a `WHERE (sort_column, id) <` condition and a matching index.
+4. Time the deep page again. It should be about as fast as page 1.
+
+## Check yourself
+
+**1. Why does `OFFSET 100000` get slower as the table grows, even with an index?**
+
+<Answer>
+The database still has to step past 100,000 rows before it can return any. The index keeps them in order, but it cannot skip counting them.
+</Answer>
+
+**2. Why add `id` to the cursor instead of using only `created_at`?**
+
+<Answer>
+Several rows can have the same `created_at`. With only the timestamp, rows that share it could be skipped or shown twice at a page boundary. The unique `id` makes every position in the order unique.
+</Answer>
+
+**3. A product manager wants "jump to page 50" on a list of 300 customers. Keyset or OFFSET?**
+
+<Answer>
+OFFSET. With 300 rows, skipping is cheap, and OFFSET gives page numbers for free. Keyset is for large tables and next-page navigation.
+</Answer>
+
+## Key takeaways
+
+- `OFFSET N` **reads and discards N rows**, so deep pages get slower.
+- **Keyset pagination** continues from the last row seen, so every page costs the same.
+- Use a **unique tie-breaker** (`id`) and an index on the sort columns.
+- OFFSET is fine for small tables where users need page numbers.

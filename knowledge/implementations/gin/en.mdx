@@ -1,0 +1,246 @@
+---
+title: "Gin (Go)"
+question: "How do I implement context deadlines, pgxpool connection tuning, and rate limiting in Gin?"
+summary: "Context deadlines, pgxpool connection tuning, Gin middleware rate limiting, Redis caching, and graceful shutdown in the Gin web framework."
+tags: [gin, golang, pgx, redis, implementation]
+related: [patterns/retry, patterns/idempotency, patterns/caching, patterns/rate-limiting]
+order: 13
+updated: "2026-09-12"
+contributors: [veasna]
+---
+
+Production patterns for Gin with Go 1.22+. Focuses on strict context propagation, pgxpool configuration for PostgreSQL, atomic transactional idempotency, in-memory rate-limiting middleware, and graceful shutdown.
+
+## Timeouts first
+
+Gin provides the request context via `c.Request.Context()`. Always derive a context with a strict deadline for external network and database operations:
+
+```go
+package main
+
+import (
+	"context"
+	"net/http"
+	"time"
+
+	"github.com/gin-gonic/gin"
+)
+
+func getExchangeRates(c *gin.Context) {
+	// Enforce 2-second timeout on outbound call derived from client request context
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 2*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.example.com/rates", nil)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create request"})
+		return
+	}
+
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			c.JSON(http.StatusGatewayTimeout, gin.H{"error": "Upstream rates service timed out"})
+			return
+		}
+		c.JSON(http.StatusBadGateway, gin.H{"error": "Upstream connection failed"})
+		return
+	}
+	defer res.Body.Close()
+
+	c.DataFromReader(res.StatusCode, res.ContentLength, res.Header.Get("Content-Type"), res.Body, nil)
+}
+```
+
+## Database connection pool (`pgxpool`)
+
+Configure a robust connection pool with statement timeouts in `pgxpool`:
+
+```go
+package main
+
+import (
+	"context"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+func initDatabasePool(databaseURL string) (*pgxpool.Pool, error) {
+	config, err := pgxpool.ParseConfig(databaseURL)
+	if err != nil {
+		return nil, err
+	}
+
+	config.MaxConns = 25
+	config.MinConns = 5
+	config.MaxConnLifetime = 1 * time.Hour
+	config.MaxConnIdleTime = 15 * time.Minute
+	config.HealthCheckPeriod = 1 * time.Minute
+
+	// Enforce statement timeout at connection level
+	config.ConnConfig.RuntimeParams["statement_timeout"] = "5000" // 5000ms
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	return pgxpool.NewWithConfig(ctx, config)
+}
+```
+
+## Idempotency keys with transactions
+
+Claim the key within an atomic SQL transaction:
+
+```go
+func createOrderHandler(pool *pgxpool.Pool) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		key := c.GetHeader("Idempotency-Key")
+		if key == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Idempotency-Key header is required"})
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+		defer cancel()
+
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Transaction initiation failed"})
+			return
+		}
+		defer tx.Rollback(ctx)
+
+		// Claim key with ON CONFLICT DO NOTHING
+		var claimedKey string
+		err = tx.QueryRow(ctx,
+			"INSERT INTO idempotency_keys (key) VALUES ($1) ON CONFLICT DO NOTHING RETURNING key",
+			key).Scan(&claimedKey)
+
+		if err != nil {
+			// Key already exists, retrieve previous response
+			var cachedResponse []byte
+			rowErr := tx.QueryRow(ctx, "SELECT response FROM idempotency_keys WHERE key = $1", key).Scan(&cachedResponse)
+			if rowErr == nil && len(cachedResponse) > 0 {
+				c.Data(http.StatusOK, "application/json", cachedResponse)
+				return
+			}
+			c.JSON(http.StatusConflict, gin.H{"error": "Request currently in progress"})
+			return
+		}
+
+		// Insert business record
+		var orderID string
+		err = tx.QueryRow(ctx,
+			"INSERT INTO orders (customer_id, total_cents) VALUES ($1, $2) RETURNING id",
+			"cust_123", 4500).Scan(&orderID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create order"})
+			return
+		}
+
+		respData := []byte(`{"order_id":"` + orderID + `","status":"created"}`)
+		_, _ = tx.Exec(ctx, "UPDATE idempotency_keys SET response = $1 WHERE key = $2", respData, key)
+
+		if err := tx.Commit(ctx); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Transaction commit failed"})
+			return
+		}
+
+		c.Data(http.StatusCreated, "application/json", respData)
+	}
+}
+```
+
+## Rate limiting middleware
+
+Gin middleware using a token-bucket rate limiter:
+
+```go
+package main
+
+import (
+	"net/http"
+	"sync"
+
+	"github.com/gin-gonic/gin"
+	"golang.org/x/time/rate"
+)
+
+type IPRateLimiter struct {
+	mu      sync.RWMutex
+	visitors map[string]*rate.Limiter
+}
+
+func (i *IPRateLimiter) GetLimiter(ip string) *rate.Limiter {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
+	limiter, exists := i.visitors[ip]
+	if !exists {
+		limiter = rate.NewLimiter(10, 20) // 10 tokens/sec, burst 20
+		i.visitors[ip] = limiter
+	}
+	return limiter
+}
+
+func RateLimitMiddleware(limiter *IPRateLimiter) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		clientIP := c.ClientIP()
+		if !limiter.GetLimiter(clientIP).Allow() {
+			c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{"error": "Rate limit exceeded"})
+			return
+		}
+		c.Next()
+	}
+}
+```
+
+## Graceful shutdown
+
+Stop accepting new HTTP connections and wait for in-flight requests to complete before closing database pools:
+
+```go
+package main
+
+import (
+	"context"
+	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/gin-gonic/gin"
+)
+
+func runServer(router *gin.Engine) {
+	srv := &http.Server{
+		Addr:         ":8080",
+		Handler:      router,
+		ReadTimeout:  5 * time.Second,
+		WriteTimeout: 10 * time.Second,
+		IdleTimeout:  120 * time.Second,
+	}
+
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("listen: %s\n", err)
+		}
+	}()
+
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
+	log.Println("Shutting down server...")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := srv.Shutdown(ctx); err != nil {
+		log.Fatal("Server forced to shutdown:", err)
+	}
+	log.Println("Server exiting gracefully")
+}
+```

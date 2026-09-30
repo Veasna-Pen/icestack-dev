@@ -1,0 +1,214 @@
+---
+title: "Leader Election"
+question: "តើខ្ញុំអាចបោះឆ្នោតជ្រើសរើស Coordinator Node តែមួយគត់ក្នុងចំណោមម៉ាស៊ីនដូចៗគ្នា (Cluster) ដើម្បីគ្រប់គ្រងការងារដែលត្រូវរត់តែម្តង (Singleton Tasks) ដោយរបៀបណា?"
+summary: "សម្របសម្រួលម៉ាស៊ីនចម្លងដូចៗគ្នា (Replicas) ក្នុង Cluster ដើម្បីឱ្យមាន Node តែមួយគត់ត្រូវបានជ្រើសតាំងជា 'មេ (Leader)' សម្រាប់ដំណើរការការងារឯកត្តជន (Cron Schedulers, Cluster Orchestration) ខណៈដែល Node ដទៃទៀត (Followers) ត្រៀមខ្លួនជំនួសភ្លាមៗនៅពេលមានអាសន្ន (Failover)។"
+tags: [concurrency, distributed-systems, leader-election, consensus, clustering]
+related: [patterns/distributed-lock, patterns/graceful-shutdown, patterns/bulkhead]
+order: 20
+updated: "2026-09-12"
+contributors: [veasna]
+translation: draft
+---
+
+## Context
+
+ដើម្បីសម្រេចបាននូវ High Availability និងកាត់បន្ថយ Downtime ឱ្យនៅសូន្យ កម្មវិធីត្រូវបានដាក់ពង្រាយជាច្រើន Replicas ដូចៗគ្នា (ឧ. ពី ៣ ទៅ ១០ Pods ពីក្រោយ Kubernetes Service)។
+
+ទោះជាយ៉ាងណា ការងារមួយចំនួនក្នុងប្រព័ន្ធ Software គឺជាការងារដែល **ត្រូវដំណើរការតែមួយគត់ (Singleton Tasks)**៖
+- ការកំណត់កាលវិភាគ និងបញ្ជូនការងារ Cron Jobs ដែលកើតឡើងជាប្រចាំ។
+- ការរៀបចំ Partition ឡើងវិញ (Rebalancing) ឆ្លងកាត់ Kafka Consumers។
+- ការគ្រប់គ្រងសមាជិកភាព Cluster និង State Machine Coordination។
+- ការតាមដានដំណើរការរបស់ Batch Workers និងការត្រួតពិនិត្យសុខភាព (Heartbeats)។
+
+ប្រសិនបើ Pod ទាំង ៥ ព្យាយាមរត់ Cron Job ព្រមគ្នា ការងារស្ទួនៗនឹងកើតឡើង។ បើអ្នកដាក់ពង្រាយតែ ១ Pod ដើម្បីកុំឱ្យស្ទួន Pod នោះនឹងក្លាយជា Single Point of Failure (SPOF)៖ បើវា Restart ឬគាំងស្លាប់ ប្រព័ន្ធ Cron ទាំងមូលនឹងស្លាប់ទៅជាមួយដែរ។
+
+**Leader Election Pattern** ដោះស្រាយបញ្ហានេះយ៉ាងអស្ចារ្យ។ គ្រប់ Node ទាំងអស់ចូលរួមក្នុងការបោះឆ្នោត។ មាន Node តែមួយគត់ដែលឈ្នះការបោះឆ្នោតជា "Leader" ហើយទទួលបន្ទុកដំណើរការការងារ Singleton នោះ។ Node ផ្សេងទៀត (Followers) ឈររង់ចាំជាកម្លាំងបម្រុង (Hot Spares) ដោយតាមដាន Lease របស់ Leader ជាប់ជានិច្ច។ ប្រសិនបើ Leader គាំងស្លាប់ Follower មួយនឹងត្រូវបានដំឡើងជា Leader ថ្មីក្នុងរយៈពេលតែពីរបីវិនាទីប៉ុណ្ណោះ។
+
+## Symptoms
+
+- ប្រព័ន្ធ Scheduler ត្រូវបង្ខំចិត្តដាក់ពង្រាយតែ `replicas: 1` ក្នុង Kubernetes ព្រោះខ្លាចដំណើរការ Cron ស្ទួនគ្នា ប៉ុន្តែរាល់ពេល Upgrade កម្មវិធី ប្រព័ន្ធត្រូវបាត់បង់ការងារកាត់ប្រាក់អស់ ១០ នាទី។
+- Worker Pods ជាច្រើនព្យាយាមធ្វើ Cluster Rebalancing ឬ Polling ព្រមគ្នា ដែលធ្វើឱ្យខូច Connection Database និងធ្វើឱ្យខូចទិន្នន័យ។
+- អំឡុងពេល Deploy Pod ចាស់ និង Pod ថ្មីដំណើរការត្រួតស៊ីគ្នា ៣០ វិនាទី ដែលបាញ់ចេញនូវការកាត់ប្រាក់ខែ ឬការបន្តកុងត្រាស្ទួនពីរដង។
+- Leader ដែលគាំងស្លាប់បន្សល់ទុកប្រព័ន្ធទាំងមូលឱ្យកកស្ទះ ព្រោះ Followers គ្មានវិធីស្វ័យប្រវត្តិដើម្បីដឹងថាមេបានស្លាប់បាត់ទៅហើយនោះទេ។
+
+<Callout type="warning" title="Leader Election ទាមទារការបាញ់ Heartbeat ជាប្រចាំ">
+Leader មិនកាន់កាប់តំណែងជារៀងរហូតឡើយ។ វាត្រូវតែបន្តកិច្ចសន្យា Lease ដែលមានកំណត់ម៉ោងជាប្រចាំ។ ប្រសិនបើ Network យឺត ឬ GC Pause រារាំងមិនឱ្យបន្តកិច្ចសន្យាបាន Lease នឹងផុតកំណត់ ហើយ Followers នឹងបោះឆ្នោតជ្រើសរើស Leader ថ្មីភ្លាម។
+</Callout>
+
+## Diagnose
+
+1. **ពិនិត្យមើលការងារដែលត្រូវរត់តែមួយ (Singleton Workloads)៖** តើការងារណាខ្លះក្នុងប្រព័ន្ធរបស់អ្នកដែលទាមទារឱ្យមានម៉ាស៊ីនតែមួយគត់ដំណើរការ?
+2. **ពិនិត្យចំនួន Replica ក្នុង Kubernetes៖** តើអ្នកមាន Deployment ណាខ្លះដែលដាក់ `replicas: 1` ដោយសារតែការភ័យខ្លាចការដំណើរការការងារស្ទួនមែនទេ?
+3. **ពិនិត្យរយៈពេល Failover៖** នៅពេលដែល Scheduler Pod ត្រូវ Restart តើប្រព័ន្ធត្រូវអវត្តមានអ្នកគ្រប់គ្រងរយៈពេលប៉ុន្មានទើប Pod ថ្មីអាចចាប់ផ្តើមដំណើរការបាន?
+4. **វាយតម្លៃហានិភ័យ Split-Brain៖** ប្រសិនបើបណ្តាញ Network ដាច់មួយភ្លែត តើអាចមានករណីដែល Nodes ពីរគិតថាខ្លួនឯងជា Leader ព្រមគ្នាមែនទេ?
+
+## Options
+
+1. **Kubernetes Lease API (`coordination.k8s.io/v1`)៖** ធនធានដើមរបស់ Kubernetes ដែលប្រើប្រាស់ដោយ Controller-managers។ Pods អាចទាញយក និងបន្ត Lease តាមរយៈ Kubernetes API Server ដោយមិនចាំបាច់មាន Infrastructure បន្ថែមឡើយ។
+2. **Redis-based Leader Election៖** Nodes ទាំងអស់ប្រជែងគ្នាទាញយក Key ក្នុង Redis ដោយប្រើ `SET leader_key node_id NX PX 5000`។ Leader ត្រូវបន្តអាយុ Lease តាមរយៈ Heartbeat ជាប្រចាំ។ (លឿន, ស្រាល, Failover ក្រោម ១ វិនាទី)។
+3. **ប្រព័ន្ធ Distributed Consensus (etcd, Consul, ZooKeeper)៖** ផ្តល់នូវភាពស៊ីសង្វាក់កម្រិតខ្ពស់បំផុតតាម Raft ឬ Paxos ជាមួយ Ephemeral Keys។ (ស្តង់ដារមាសសម្រាប់ការការពារកុំឱ្យមាន Split-Brain ដាច់ខាត)។
+4. **Database Row Lease (PostgreSQL)៖** តារាង `leader_leases` ក្នុង Database ដោយប្រើ `UPDATE leader_leases SET owner = 'node-1', expires_at = NOW() + INTERVAL '10s' WHERE expires_at < NOW()`។
+
+## Trade-offs
+
+| យុទ្ធសាស្ត្រ | រយៈពេល Failover | សុវត្ថិភាពពី Split-Brain | បន្ទុកប្រតិបត្តិការ | ករណីប្រើប្រាស់ល្អបំផុត |
+| :--- | :--- | :--- | :--- | :--- |
+| **Kubernetes Lease** | ៥ ដល់ ១៥ វិនាទី | ខ្ពស់ខ្លាំង (ផ្អែកលើ etcd) | សូន្យ (មានស្រាប់ក្នុង K8s) | Kubernetes Operators, Controllers |
+| **Redis Lease** | ១ ដល់ ៣ វិនាទី | មធ្យម (ករណី Failover) | ទាបបំផុត (បើមាន Redis) | Web Backend Cron Jobs |
+| **etcd / Consul** | ១ ដល់ ២ វិនាទី | អតិបរមា (Raft Consensus) | ខ្ពស់ (ត្រូវការ Cluster ដាច់ដោយឡែក) | Distributed DBs, Service Mesh |
+| **PostgreSQL Lease** | ៣ ដល់ ១០ វិនាទី | ខ្ពស់ (ACID) | សូន្យ (ប្រើ DB ដែលមានស្រាប់) | Monoliths លើ Relational DB |
+
+## Decision
+
+- **ប្រើប្រាស់ Kubernetes Lease API សម្រាប់កម្មវិធីក្នុង K8s៖** ប្រសិនបើប្រព័ន្ធដំណើរការលើ Kubernetes ត្រូវប្រើ Native `Lease` Object។ វាមិនត្រូវការ Redis ឬ Database បន្ថែមទេ ហើយត្រូវបានគ្រប់គ្រងដោយ K8s Control Plane ដោយផ្ទាល់។
+- **ប្រើប្រាស់ Redis Lease ជាមួយ Heartbeats សម្រាប់ Backend ទូទៅ៖** ក្នុង Node.js ឬ Go ត្រូវទាញយកភាពជាមេតាម `SET NX PX` ហើយដំណើរការ Background Timer ដើម្បីបន្ត Lease រៀងរាល់ TTL / 3 វិនាទីម្តង។
+- **សរសេរកូដលាលែងពីតំណែង (Resignation Handler) ជានិច្ច៖** នៅពេលដែល Leader ទទួលបានសញ្ញា `SIGTERM` ឬ `SIGINT` វាត្រូវតែលុប Key ចេញពី Redis ភ្លាមៗ ដើម្បីឱ្យ Follower អាចឡើងកាន់តំណែងជា Leader បានភ្លាមៗក្នុងពេល < 100 ms ដោយមិនបាច់រង់ចាំ TTL ផុតកំណត់ឡើយ។
+- **ការពារ Split-Brain ដោយប្រើ Fencing Tokens៖** បង្កើតលេខ Epoch កើនឡើងរាល់ពេលមាន Leader ថ្មី។ Database និង Storage ខាងក្រោមត្រូវច្រានចោលពាក្យបញ្ជាពី Leader ចាស់ៗណាដែលមាន Epoch Token ហួសសម័យ។
+
+## Implementation
+
+### ការបង្កើត Redis Leader Election Coordinator ក្នុង TypeScript៖
+
+```typescript
+import { Redis } from 'ioredis';
+import { randomUUID } from 'crypto';
+
+export class LeaderElection {
+  private readonly nodeId = `${process.env.HOSTNAME || 'node'}-${randomUUID().substring(0, 8)}`;
+  private isLeader = false;
+  private heartbeatTimer: NodeJS.Timeout | null = null;
+  private electionTimer: NodeJS.Timeout | null = null;
+
+  constructor(
+    private readonly redis: Redis,
+    private readonly leaseKey: string,
+    private readonly leaseTtlMs = 6000 // Lease រយៈពេល ៦ វិនាទី
+  ) {}
+
+  start(onElected: () => void, onDemoted: () => void) {
+    // ព្យាយាមបោះឆ្នោត ឬបន្ត Lease រៀងរាល់ ២ វិនាទីម្តង
+    this.electionTimer = setInterval(async () => {
+      await this.tryAcquireOrRenew(onElected, onDemoted);
+    }, 2000);
+
+    // ពិនិត្យភ្លាមៗនៅពេលចាប់ផ្តើម
+    this.tryAcquireOrRenew(onElected, onDemoted);
+  }
+
+  private async tryAcquireOrRenew(onElected: () => void, onDemoted: () => void) {
+    try {
+      if (this.isLeader) {
+        // ប្រសិនបើជា Leader: បន្តកិច្ចសន្យា Lease ដោយប្រើ Lua Script
+        const renewScript = `
+          if redis.call("get", KEYS[1]) == ARGV[1] then
+            return redis.call("pexpire", KEYS[1], ARGV[2])
+          else
+            return 0
+          end
+        `;
+        const renewed = await this.redis.eval(renewScript, 1, this.leaseKey, this.nodeId, this.leaseTtlMs);
+        if (renewed !== 1) {
+          // បាត់បង់តំណែង Leader ដោយសារខកខាន Heartbeat!
+          console.warn(`[LeaderElection:${this.nodeId}] បានបាត់បង់តំណែង Leader! ធ្លាក់មកជា Follower។`);
+          this.isLeader = false;
+          onDemoted();
+        }
+      } else {
+        // ប្រសិនបើជា Follower: ព្យាយាមដណ្តើម Lease ដែលទំនេរ
+        const acquired = await this.redis.set(this.leaseKey, this.nodeId, 'PX', this.leaseTtlMs, 'NX');
+        if (acquired === 'OK') {
+          console.log(`[LeaderElection:${this.nodeId}] ឈ្នះការបោះឆ្នោត! ឡើងកាន់តំណែងជា LEADER។`);
+          this.isLeader = true;
+          onElected();
+        }
+      }
+    } catch (err) {
+      console.error(`[LeaderElection:${this.nodeId}] មានបញ្ហាក្នុង Election Loop:`, (err as Error).message);
+    }
+  }
+
+  async stop(onDemoted: () => void) {
+    if (this.electionTimer) clearInterval(this.electionTimer);
+    if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
+
+    if (this.isLeader) {
+      // លាលែងពីតំណែង Leader ដោយស្ម័គ្រចិត្តភ្លាមៗនៅពេលបិទម៉ាស៊ីន
+      console.log(`[LeaderElection:${this.nodeId}] កំពុងលាលែងពីតំណែង Leader ដោយរលូន...`);
+      const resignScript = `
+        if redis.call("get", KEYS[1]) == ARGV[1] then
+          return redis.call("del", KEYS[1])
+        else
+          return 0
+        end
+      `;
+      await this.redis.eval(resignScript, 1, this.leaseKey, this.nodeId);
+      this.isLeader = false;
+      onDemoted();
+    }
+  }
+
+  checkIsLeader(): boolean {
+    return this.isLeader;
+  }
+}
+```
+
+### ការប្រើប្រាស់សម្រាប់ដំណើរការ Cron Dispatcher ក្នុង Cluster៖
+
+```typescript
+const election = new LeaderElection(new Redis(process.env.REDIS_URL!), 'cluster:cron:leader', 6000);
+
+let cronJobHandle: any = null;
+
+election.start(
+  // onElected
+  () => {
+    console.log('ម៉ាស៊ីននេះបានក្លាយជា LEADER សកម្មហើយ។ ចាប់ផ្តើមដំណើរការ Cron Dispatcher...');
+    cronJobHandle = setInterval(() => {
+      console.log('កំពុងបញ្ជូនការងារដែលបានកំណត់ម៉ោងនៅម៉ោង', new Date().toISOString());
+    }, 10000);
+  },
+  // onDemoted
+  () => {
+    console.log('ម៉ាស៊ីននេះបានធ្លាក់មកជា FOLLOWER វិញហើយ។ បញ្ឈប់ Cron Dispatcher...');
+    if (cronJobHandle) {
+      clearInterval(cronJobHandle);
+      cronJobHandle = null;
+    }
+  }
+);
+
+// លាលែងដោយស្អាតស្អំនៅពេលទទួល SIGTERM
+process.on('SIGTERM', async () => {
+  await election.stop(() => {
+    if (cronJobHandle) clearInterval(cronJobHandle);
+  });
+  process.exit(0);
+});
+```
+
+## Verification
+
+1. **ការធ្វើតេស្តបោះឆ្នោតដំបូង៖** បើកដំណើរការ ៣ Nodes ដូចគ្នា។ ផ្ទៀងផ្ទាត់ថាមានតែ ១ Node គត់ដែលកត់ត្រា `ឈ្នះការបោះឆ្នោត` ខណៈដែល ២ ទៀតស្ថិតក្នុងស្ថានភាពជា Follower។
+2. **ការធ្វើតេស្ត Failover ដោយស្វ័យប្រវត្តិ៖** បាញ់សម្លាប់ Leader ភ្លាមៗ (`kill -9`)។ ផ្ទៀងផ្ទាត់ថាក្នុងរង្វង់ ៦ វិនាទី (រយៈពេល Lease TTL) Follower ណាមួយក្នុងចំណោម ២ ទៀតនឹងដឹងពីការផុតកំណត់ ហើយដំឡើងខ្លួនជា Leader ថ្មីដើម្បីបន្តការងារ Cron។
+3. **ការធ្វើតេស្តលាលែងដោយរលូន (Graceful Resignation)៖** បញ្ជូនសញ្ញា `SIGTERM` ទៅកាន់ Leader។ ផ្ទៀងផ្ទាត់ថាវាលុប Key ភ្លាមៗ ហើយ Leader ថ្មីឡើងកាន់តំណែងក្នុងពេល **< 500 ms**។
+4. **ការធ្វើតេស្ត Network Partition៖** ផ្តាច់ Network រវាង Leader និង Redis។ ផ្ទៀងផ្ទាត់ថា Leader ចាស់ទម្លាក់ខ្លួនឯងជា Follower ភ្លាមៗនៅពេលខកខានការបន្ត Heartbeat។
+
+## Why
+
+ប្រព័ន្ធដែលមានភាពធន់ខ្ពស់ (High Availability) ទាមទារឱ្យមានម៉ាស៊ីនបម្រុងទុកជាច្រើន។ ប៉ុន្តែការសម្របសម្រួលទាមទារឱ្យមានអ្នកធ្វើសេចក្តីសម្រេចចិត្តតែមួយគត់។
+
+បើគ្មាន Leader Election ទេ ក្រុមវិស្វករនឹងត្រូវជាប់គាំងរវាងជម្រើសដ៏អាក្រក់ពីរ៖ ទីមួយ ដំណើរការម៉ាស៊ីនតែមួយដែលងាយនឹងដាច់ពេលមានបញ្ហា ឬទីពីរ ដំណើរការម៉ាស៊ីនច្រើនដែលច្រឡំកាត់លុយអតិថិជនពីរដង។
+
+Leader Election Pattern ផ្តល់ឱ្យប្រព័ន្ធនូវចំណុចល្អប្រសើរបំផុតទាំងពីរ៖ មានម៉ាស៊ីនបម្រុងទុកជាប្រចាំ និងមានស្វ័យប្រវត្តិនៃការប្តូរតួនាទីលឿនក្រោមមួយវិនាទី។
+
+## When Not To Use
+
+- **Stateless HTTP APIs៖** Web Routes ធម្មតា (ការបង្ហាញទំព័រ HTML, API អានទិន្នន័យ) មិនត្រូវការ Leader ឡើយ; គ្រប់ Pods ទាំងអស់អាចឆ្លើយតបសំណើរបស់អ្នកប្រើប្រាស់ព្រមគ្នាពីក្រោយ Load Balancer។
+- **Kafka Partitioned Consumers៖** Kafka Consumer Group មានប្រព័ន្ធ Rebalancing និង Partition Assignment ដោយស្វ័យប្រវត្តិរួចទៅហើយ មិនចាំបាច់សរសេរ Leader Election ដោយដៃឡើយ។
+
+## Common Mistakes
+
+- **Lease TTL វែងពេកដោយគ្មានកូដ Resignation៖** កំណត់ TTL ៦០ វិនាទីដោយគ្មាន Handler សម្រាប់ `SIGTERM` មានន័យថារាល់ពេល Deploy ប្រព័ន្ធ Cron នឹងគាំងស្ងាត់ឈឹងរយៈពេល ៦០ វិនាទី។
+- **មិនអើពើនឹង Callback ពេលបាត់បង់តំណែង (Demotion)៖** ប្រសិនបើ Leader ដាច់ Network ជាមួយ Redis វាត្រូវតែបញ្ឈប់ការងារ Singleton ភ្លាមៗ; ការបន្តធ្វើការងារទាំងដែលបាត់បង់តំណែងនឹងបង្កជាបញ្ហា Split-Brain។
+- **កំណត់រយៈពេល Heartbeat ស្មើនឹង TTL៖** បើ Lease TTL កំណត់ ៥ វិនាទី ហើយ Heartbeat រត់រៀងរាល់ ៥ វិនាទីដែរនោះ ភាពរអាក់រអួល Network បន្តិចបន្តួចនឹងធ្វើឱ្យបាត់បង់តំណែង។ ត្រូវកំណត់ Heartbeat នៅត្រឹម TTL / 3 (ឧ. រៀងរាល់ 1.5 វិនាទី)។

@@ -1,0 +1,159 @@
+---
+title: "ហេតុអ្វីបានជា file upload ជួប timeout?"
+question: "ហេតុអ្វីបានជាការ Upload ឯកសារធំៗ Timeout និងធ្វើឱ្យអស់ Memory លើ Server?"
+summary: "ការបញ្ជូនឯកសារធំៗតាមរយៈ application server នឹង buffer ទិន្នន័យរាប់រយ MB ក្នុង RAM, ដណ្តើម worker threads, និងបណ្តាលឱ្យ proxy timeout។ ផ្ទេរការ upload ដោយផ្ទាល់ទៅកាន់ cloud storage ដោយប្រើ Presigned S3/GCS URLs។"
+tags: [uploads, s3, storage, performance, nodejs, architecture]
+related: [problems/memory-leak-in-production, problems/slow-first-request]
+order: 18
+updated: "2026-09-12"
+contributors: [veasna]
+translation: draft
+---
+
+## Context
+
+កម្មវិធី web ឬ mobile មួយអនុញ្ញាតឱ្យអ្នកប្រើប្រាស់ upload មេឌៀផ្សេងៗ៖ រូបភាព profile, វិក្កយបត្រ PDF, និងវីដេអូទំហំ 500 MB។
+
+ការសរសេរកូដដំបូង ទទួលការ upload តាមរយៈទម្រង់ធម្មតា `multipart/form-data` ក្នុង Node.js/Express ដោយប្រើ `multer`។ Controller រក្សាទុកឯកសារក្នុង memory ឬក្នុង disk បណ្តោះអាសន្ន (`/tmp`) រួចទើប upload បន្តទៅកាន់ AWS S3 bucket៖
+
+```text
+Client (ទូរស័ព្ទ/Web) ──[Upload 200 MB]──> Node.js Server ──[Upload 200 MB]──> AWS S3
+```
+
+នៅពេលមាន traffic តិច អ្វីៗដំណើរការធម្មតា។ ប៉ុន្តែនៅពេលមានអ្នកប្រើប្រាស់ច្រើននាក់ upload វីដេអូធំៗព្រមគ្នាក្នុងពេលតែមួយលើបណ្តាញទូរស័ព្ទ 3G/4G ដែលយឺត កម្មវិធីស្រាប់តែគាំងដោយសារ Out-Of-Memory ហើយ reverse proxy ក៏កាត់ផ្តាច់ connection ជាមួយកំហុស HTTP 504 Gateway Timeout។
+
+## Symptoms
+
+- Container របស់ application ឡើង memory ដល់កម្រិតកំណត់ រួច restart ខ្លួនឯង (`OOMKilled`) នៅពេលមានមនុស្សច្រើននាក់ upload ឯកសារព្រមគ្នា។
+- អ្នកប្រើប្រាស់ទូរស័ព្ទជួបប្រទះការ upload បរាជ័យជាប់រហូត ក្រោយពេលរង់ចាំ ៦០ វិនាទី (Nginx `client_body_timeout` ឬ Cloudflare 100-second timeout)។
+- Worker threads របស់ web server ជាប់គាំងរាប់នាទីក្នុងការរង់ចាំ stream ទិន្នន័យពី socket ដែលធ្វើឱ្យប៉ះពាល់ដល់ API requests ដទៃទៀត។
+- Disk បណ្តោះអាសន្ន `/tmp` របស់ server ត្រូវពេញណែន ដែលបណ្តាលឱ្យ container គាំង។
+
+<Callout type="warning" title="Application Server មិនគួរធ្វើជា Proxy សម្រាប់ឯកសារមេឌៀធំៗឡើយ">
+ការបញ្ជូនឯកសារធំៗឆ្លងកាត់ application server ធ្វើឱ្យខាតបង់កម្លាំង CPU, ស៊ី RAM របស់ container, បង្កើនការចំណាយ network bandwidth ទ្វេដង និងបង្ខំឱ្យ server ត្រូវទ្រាំទ្រនឹងល្បឿនអ៊ីនធឺណិតយឺតៗរបស់អ្នកប្រើប្រាស់។
+</Callout>
+
+## Diagnose
+
+1. **គណនាបន្ទុកនៃការធ្វើ Proxy លើ Server៖** ប្រសិនបើអ្នកប្រើប្រាស់ ២០ នាក់ upload ឯកសារ 100 MB លើបណ្តាញទូរស័ព្ទដែលមានល្បឿន 1 MB/s៖
+   - ការ upload នីមួយៗស៊ីពេល ១០០ វិនាទី។
+   - Application server របស់អ្នកត្រូវបើក socket ចំនួន ២០ ចោល និងត្រូវ buffer ទិន្នន័យរហូតដល់ 20 × 100 MB = 2 GB ក្នុង RAM ឬ `/tmp` រយៈពេល ១០០ វិនាទី!
+2. **ពិនិត្យមើល Reverse Proxy Timeouts៖** ពិនិត្យការកំណត់ Nginx, Cloudflare ឬ AWS ALB៖
+   - Cloudflare កំណត់ request body ត្រឹម 100 MB លើគម្រោង free/pro និងកំណត់ HTTP timeout ១០០ វិនាទី។
+   - Nginx កំណត់ `client_max_body_size` ត្រឹម 1 MB តាមលំនាំដើម។
+
+## Options
+
+1. **ដំឡើង Proxy Timeouts និង RAM របស់ Server។** ដំឡើង container ដល់ 4 GB និងដាក់ timeout ១០ នាទី។ (ចំណាយច្រើន មិនរឹងមាំ និងនៅតែបរាជ័យពេលអ៊ីនធឺណិតខ្សោយ)។
+2. **Stream ផ្ទាល់ពី Request ទៅ S3 ដោយគ្មាន Buffer។** Stream តាមរយៈ `busboy` ឬ PassThrough streams។ (ប្រសើរជាងមុនលើ memory ប៉ុន្តែនៅតែជាប់ connection របស់ server រាប់នាទីដដែល)។
+3. **Presigned Direct-to-S3 Uploads។** Frontend ស្នើសុំ URL បណ្តោះអាសន្នពី backend; រួច browser ធ្វើការ upload ឯកសារនោះផ្ទាល់ទៅកាន់ S3/Cloud Storage តែម្តង។
+4. **Resumable Multipart Direct Uploads (TUS Protocol)។** Upload ឯកសារជាកង់ៗ (chunks 5 MB) ផ្ទាល់ទៅកាន់ cloud storage ដោយអាច pause/resume បាន។
+
+## Trade-offs
+
+| យុទ្ធសាស្ត្រ | RAM របស់ Server | Bandwidth របស់ Server | ដែនកំណត់ Timeout របស់ Client | កម្លាំងអនុវត្ត |
+| :--- | :--- | :--- | :--- | :--- |
+| **Server Proxy (Multer)** | **ខ្ពស់ (ប្រឈមនឹងការគាំង)** | **ទ្វេដង (ចូល + ចេញ)** | កំណត់ដោយ proxy (60s) | ទាប |
+| **Streaming Proxy** | ទាប | ទ្វេដង (ចូល + ចេញ) | កំណត់ដោយ proxy (60s) | មធ្យម |
+| **Presigned URL ផ្ទាល់** | **សូន្យ (០ MB)** | **សូន្យ (០ MB)** | គ្មានដែនកំណត់ (S3 native) | **ទាប ទៅ មធ្យម** |
+| **Multipart / TUS ផ្ទាល់** | **សូន្យ (០ MB)** | **សូន្យ (០ MB)** | គ្មានដែនកំណត់ + Resume បាន | មធ្យម |
+
+## Decision
+
+ជ្រើសរើស **Direct-to-Storage Presigned URLs**៖
+
+1. Client បញ្ជូន `POST /api/uploads/presign` ជាមួយឈ្មោះឯកសារ និង MIME type មកកាន់ backend។
+2. Backend បង្កើត S3 Presigned URL ដែលមានសុពលភាពរយៈពេលខ្លី (ឧ. ១៥ នាទី) រួចឆ្លើយតបទៅវិញក្នុងរយៈពេលត្រឹមតែ ១៥ ms។
+3. Client ធ្វើការ upload ឯកសារដោយផ្ទាល់ពី Browser/Mobile App ទៅកាន់ AWS S3 តាមរយៈ HTTP `PUT` request។
+4. នៅពេល upload ចប់ client ផ្ញើសារ `POST /api/uploads/complete` ដើម្បីឱ្យ backend កត់ត្រា metadata ក្នុង database។
+5. **លទ្ធផល៖** Application server របស់អ្នកមិនបានប៉ះពាល់ទិន្នន័យឯកសារសូម្បីតែមួយ byte!
+
+## Implementation
+
+### 1. Backend បង្កើត S3 Presigned URL (Node.js)៖
+
+```typescript
+import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
+import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
+import { randomUUID } from 'crypto';
+
+const s3 = new S3Client({ region: process.env.AWS_REGION });
+
+export async function createPresignedUploadUrl(userId: string, filename: string, mimeType: string) {
+  // ផ្ទៀងផ្ទាត់ប្រភេទឯកសារដែលអនុញ្ញាត
+  const ALLOWED_TYPES = ['image/jpeg', 'image/png', 'video/mp4', 'application/pdf'];
+  if (!ALLOWED_TYPES.includes(mimeType)) {
+    throw new Error('ប្រភេទឯកសារមិនត្រូវបានគាំទ្រ');
+  }
+
+  const fileKey = `uploads/${userId}/${randomUUID()}-${filename}`;
+
+  const command = new PutObjectCommand({
+    Bucket: process.env.AWS_S3_BUCKET,
+    Key: fileKey,
+    ContentType: mimeType,
+  });
+
+  // URL មានសុពលភាពត្រឹម ១៥ នាទី
+  const uploadUrl = await getSignedUrl(s3, command, { expiresIn: 900 });
+
+  return { uploadUrl, fileKey };
+}
+```
+
+### 2. Frontend ធ្វើការ Upload ផ្ទាល់ទៅកាន់ S3 (Browser JavaScript)៖
+
+```javascript
+async function uploadFile(file) {
+  // 1. ស្នើសុំ presigned URL ពី backend (ស៊ីពេល ១០ ms)
+  const res = await fetch('/api/uploads/presign', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ filename: file.name, mimeType: file.type }),
+  });
+  const { uploadUrl, fileKey } = await res.json();
+
+  // 2. Upload ឯកសារផ្ទាល់ពី browser ទៅកាន់ S3 តាមរយៈ HTTP PUT
+  // គ្មានបន្ទុកណាមួយធ្លាក់លើ backend ឡើយ!
+  const uploadRes = await fetch(uploadUrl, {
+    method: 'PUT',
+    headers: { 'Content-Type': file.type },
+    body: file, // Stream ផ្ទាល់ពី disk ទៅ S3
+  });
+
+  if (!uploadRes.ok) {
+    throw new Error('ការ upload ទៅ S3 បរាជ័យ');
+  }
+
+  // 3. ប្រាប់ backend ថា upload បានជោគជ័យ
+  await fetch('/api/uploads/complete', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ fileKey }),
+  });
+
+  console.log('Upload ជោគជ័យ! File key:', fileKey);
+}
+```
+
+## Verification
+
+1. **គ្មានការប្រែប្រួល Memory លើ Backend៖** Upload ឯកសារទំហំ 2 GB ខណៈពេលកំពុងតាមដាន memory របស់ Node.js container។ ការប្រើប្រាស់ memory ត្រូវតែនៅថេរដដែលដោយគ្មានការកើនឡើងសូម្បីតែបន្តិច។
+2. **ការផ្ទៀងផ្ទាត់លើ Network Tab៖** ពិនិត្យមើលផ្ទាំង Network ក្នុង browser។ Destination host នៃ request ឯកសារធំត្រូវតែបង្ហាញថាជា `*.s3.amazonaws.com` មិនមែនជា API domain របស់ backend ឡើយ។
+3. **ការកំណត់ S3 Bucket CORS៖** ផ្ទៀងផ្ទាត់ថា S3 bucket អនុញ្ញាត `PUT` និង `OPTIONS` ចេញពី frontend domain របស់អ្នក។
+
+## Why
+
+Cloud object storage (AWS S3, Google Cloud Storage, Cloudflare R2) ត្រូវបានវិស្វកម្មឡើងយ៉ាងពិសេសដើម្បីទ្រាំទ្ររាល់ការ stream ឯកសារធំៗរាប់លានក្នុងពេលតែមួយលើបណ្តាញសកល។
+
+Application servers ត្រូវបានរចនាឡើងសម្រាប់ការគណនា logic លឿនៗ និង query database ជាមួយ latency ទាប។ ការយក server ទៅធ្វើជា proxy បញ្ជូនឯកសារ គឺជាការខ្ជះខ្ជាយធនធានថ្លៃៗលើកិច្ចការដែល storage ខាងក្រៅអាចធ្វើបានយ៉ាងល្អក្នុងតម្លៃថោកបំផុត។
+
+## When Not To Use
+
+- **ការកែច្នៃរូបភាពក្នុង Memory មុនពេលរក្សាទុក៖** ប្រសិនបើអ្នកត្រូវកាត់បន្ថយទំហំរូបភាព avatar តូចៗ (< 2 MB) នោះការដំណើរការលើ server គឺអាចទទួលយកបាន។ ប៉ុន្តែបើល្អបំផុត គួរឱ្យ browser កាត់បន្ថយទំហំរូបភាពជាមុន ឬប្រើ AWS Lambda ដែលដំណើរការដោយស្វ័យប្រវត្តិតាមរយៈ S3 event។
+
+## Common Mistakes
+
+- **ភ្លេចកំណត់ CORS លើ S3 Bucket។** ការ upload ផ្ទាល់នឹងបរាជ័យលើ browser ប្រសិនបើ S3 bucket មិនបានអនុញ្ញាត `PUT` និង `OPTIONS` ពី web domain របស់អ្នក។
+- **កំណត់រយៈពេល URL យូរជ្រុល។** Presigned URL គួរតែផុតកំណត់ក្នុងរយៈពេលខ្លី (១០–១៥ នាទី) ដើម្បីការពារកុំឱ្យគេយក URL នោះទៅប្រើប្រាស់ផ្តេសផ្តាស។
+- **អនុញ្ញាតគ្រប់ Content-Type តាមចិត្ត។** ត្រូវ validate MIME type នៅលើ backend ជានិច្ចមុនពេលចុះហត្ថលេខាលើ URL ដើម្បីកុំឱ្យជនទុច្ចរិតអាច upload មេរោគ ឬ file អាក្រក់បាន។

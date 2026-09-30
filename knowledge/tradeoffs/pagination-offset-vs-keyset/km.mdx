@@ -1,0 +1,156 @@
+---
+title: "Offset vs Keyset Pagination"
+question: "តើនៅពេលណាដែលខ្ញុំគួរតែបោះបង់ OFFSET Pagination ចោល ហើយប្តូរមកប្រើប្រាស់ Keyset / Cursor Pagination វិញ?"
+summary: "Offset Pagination (OFFSET 100000) ត្រូវអានទិន្នន័យរាប់លានជួរចោលនៅលើទំព័រជ្រៅៗ និងជួបបញ្ហាទិន្នន័យរំកិលស្ទួននៅពេលមានទិន្នន័យថ្មីត្រូវបានបញ្ចូល។ Keyset Pagination (WHERE id > last_seen) ប្រើប្រាស់ B-Tree Index Seek ដែលរក្សាល្បឿនលឿនថេរ O(1) ជានិច្ច និងមានស្ថិរភាពខ្ពស់លើ Infinite Scroll។"
+tags: [database, pagination, performance, sql, api-design]
+related: [problems/pagination-performance, problems/database-is-slow, patterns/caching]
+order: 7
+updated: "2026-09-12"
+contributors: [veasna]
+translation: draft
+---
+
+## Context
+
+នៅពេលបង្ហាញបញ្ជីទិន្នន័យតាមរយៈ API (ដូចជា ទំនិញក្នុងហាង, ប្រវត្តិប្រតិបត្តិការ, ឬ Activity Feed) ការបែងចែកទំព័រ (Pagination) គឺជារឿងចាំបាច់បំផុត ដើម្បីការពារកុំឱ្យ Query ត្រឡប់ទិន្នន័យរាប់លានជួរក្នុង HTTP Response តែមួយ។
+
+អ្នកអភិវឌ្ឍន៍ភាគច្រើនចាប់ផ្តើមជាមួយ **Offset Pagination**៖ `SELECT * FROM items ORDER BY created_at DESC LIMIT 20 OFFSET 40`។ វិធីនេះស្របគ្នាយ៉ាងល្អជាមួយ UI ដែលមានប៊ូតុងលេខទំព័រ (`[1] [2] [3] ... [45]`)។
+
+ប៉ុន្តែនៅពេលដែល Database រីកធំលើសពីរាប់ម៉ឺនជួរ Offset Pagination នឹងចាប់ផ្តើមគាំង។ Database មិនអាចហោះរំលងទៅកាន់ជួរទី ១០០,០០០ ភ្លាមៗបានឡើយ; ម៉ាស៊ីនត្រូវអានទិន្នន័យ ១០០,០០០ ជួរចេញពី Disk ចូលក្នុង Memory រួចបោះវាចោល។ លើសពីនេះ ប្រសិនបើមានទិន្នន័យថ្មីត្រូវបាន Insert អំឡុងពេលអ្នកប្រើប្រាស់កំពុងចុចប្តូរទំព័រ ជួរទិន្នន័យនឹងរំកិលទីតាំង ដែលនាំឱ្យឃើញទិន្នន័យស្ទួន ឬបាត់ទិន្នន័យមួយចំនួន។
+
+**Keyset Pagination** (ឬ Cursor-Based Pagination) ជំនួស Offset ដោយការប្រៀបធៀបតម្លៃ Index ផ្ទាល់៖ `SELECT * FROM items WHERE (created_at, id) < ($last_seen_time, $last_seen_id) ORDER BY created_at DESC, id DESC LIMIT 20`។
+
+## Symptoms
+
+- CPU របស់ Database ឡើងដល់ 100% នៅពេល Web Crawlers, Bots ស្វែងរក, ឬអ្នកប្រើប្រាស់ព្យាយាមបើកមើលទំព័រជ្រៅៗ (`?page=5000`)។
+- អ្នកប្រើប្រាស់ត្អូញត្អែរថាឃើញទំនិញដដែលៗពីរដងនៅពេលពួកគេកំពុង Scroll មើល Feed។
+- អ្នកប្រើប្រាស់រកមិនឃើញទិន្នន័យមួយចំនួន ព្រោះទិន្នន័យនោះត្រូវបានរុញទៅទំព័របន្ទាប់មុនពេលពួកគេចុចទៅដល់។
+- ទំព័រទី ១ ចំណាយពេលត្រឹមតែ 5 ms ប៉ុន្តែទំព័រទី ៥០០ ចំណាយពេលរហូតដល់ 4,500 ms សម្រាប់ Query ដដែល។
+
+<Callout type="warning" title="OFFSET N គឺជាការ Scan តារាងទាំងមូល (Full-table scan) បែប O(N) បង្កប់ខ្លួន">
+Database Engine ត្រូវតែអាន និងរាប់ឱ្យគ្រប់ N ជួរសិន មុនពេលវាអាចប្រគល់ទំព័រដែលស្នើសុំ។ សម្រាប់ OFFSET 1,000,000 ដាតាបេសត្រូវអាន ១,០០០,០២០ ជួរ រួចបោះចោល ១,០០០,០០០ ជួរដំបូង។
+</Callout>
+
+## Diagnose
+
+1. **ពិនិត្យមើល Query Execution Plan៖** ដំណើរការ `EXPLAIN ANALYZE SELECT * FROM orders ORDER BY id LIMIT 20 OFFSET 50000`។ តើវាបង្ហាញការអាន Disk Buffers ខ្ពស់ និងស៊ីពេលរាប់វិនាទីដែរឬទេ?
+2. **ពិនិត្យទម្រង់នៃការប្រើប្រាស់ API៖** តើ Client របស់អ្នកជាទម្រង់ Infinite Scroll (Mobile App, បណ្តាញសង្គម) ឬជាប្រព័ន្ធដែលតម្រូវឱ្យចុចលោតទៅទំព័រទី ២៥?
+3. **ពិនិត្យអត្រាបន្ថែមទិន្នន័យ (Data Churn)៖** តើតារាងនោះមានការ Insert, Update, ឬ Delete ញឹកញាប់ដែរឬទេ?
+4. **កំណត់សកម្មភាពរបស់ Bot៖** តើមាន Scraping Bots កំពុងរត់តាមលេខទំព័រពី `?page=1` ដល់ `?page=50000` ដែលធ្វើឱ្យអស់ Database Connection Pool មែនទេ?
+
+## Options
+
+1. **Offset-Based Pagination (`LIMIT size OFFSET (page - 1) * size`)៖** សាមញ្ញ, Stateless, អាចចុចលោតទៅលេខទំព័រណាមួយក៏បានភ្លាមៗ។ (ដំណើរការយឺតយ៉ាងធ្ងន់ធ្ងរនៅលើទំព័រជ្រៅៗ)។
+2. **Keyset / Cursor Pagination (`WHERE id > cursor LIMIT size`)៖** ប្រើប្រាស់ Index Seek លឿនបំផុត, ចំណាយពេលថេរ O(1) មិនថាទំព័រជ្រៅប៉ុណ្ណា, គ្មានបញ្ហារំកិលទិន្នន័យឡើយ។ (មិនអាចលោតរំលងទៅកាន់លេខទំព័រចៃដន្យបានឡើយ)។
+3. **Hybrid Capped Offset៖** អនុញ្ញាតឱ្យប្រើ Offset ប៉ុន្តែកំណត់ពិដានរឹងមាំ (ឧ. អតិបរមាត្រឹមទំព័រទី ៥០ ឬ Offset ១,០០០)។ បើចង់មើលលើសពីនេះ តម្រូវឱ្យ User ប្រើ Filter (កាលបរិច្ឆេទ, ប្រភេទ)។
+4. **Deferred Join Optimization៖** ប្រសិនបើត្រូវតែប្រើ Offset ចាំបាច់ ត្រូវធ្វើ Offset លើ Subquery Primary Key ដែលមាន Index ជាមុនសិន រួចទើប Join ត្រឡប់មកតារាងមេដើម្បីទាញយកទិន្នន័យជួរឈរផ្សេងទៀត។
+
+## Trade-offs
+
+| លក្ខណៈវិនិច្ឆ័យ | Offset Pagination | Keyset / Cursor Pagination |
+| :--- | :--- | :--- |
+| **ល្បឿនលើទំព័រទី ១** | លឿន (< 10 ms) | លឿន (< 10 ms) |
+| **ល្បឿនលើទំព័រជ្រៅៗ** | **អន់ខ្លាំង (O(N) Scan ស៊ីពេលរាប់វិនាទី)** | **ភ្លាមៗ (O(1) Index Seek < 5 ms)** |
+| **ស្ថិរភាពទិន្នន័យ (Inserts/Deletes)** | ខ្សោយ (ឃើញស្ទួន ឬរំលងទិន្នន័យ) | **ល្អឥតខ្ចោះ (Anchor មិនរំកិល)** |
+| **ការលោតទៅលេខទំព័រជាក់លាក់** | គាំទ្រ (`page=14`) | មិនគាំទ្រ (ដើរទៅមុខតាមលំដាប់) |
+| **ការបង្ហាញចំនួនសរុប (Total Count)** | គាំទ្រ (`SELECT COUNT(*)`) | ថ្លៃដើមខ្ពស់ / មិនបាច់បង្ហាញ |
+| **ភាពស្មុគស្មាញនៃការសរសេរកូដ** | សាមញ្ញបំផុត | មធ្យម (ត្រូវការ Composite Index និង Cursor) |
+
+## Decision
+
+- **ជ្រើសរើស Keyset Pagination សម្រាប់៖**
+  - ប្រព័ន្ធ Feed ដែលប្រើ Infinite Scroll (ទូរស័ព្ទដៃ, បណ្តាញសង្គម, ប្រវត្តិ Activity Logs)។
+  - API ដែលមានទំហំធំ, Pipeline នាំចេញទិន្នន័យ, និងប្រព័ន្ធ Webhook។
+  - តារាងទិន្នន័យធំៗដែលមានលើសពី ១០០,០០០ ជួរឡើងទៅ។
+- **ជ្រើសរើស Offset Pagination សម្រាប់៖**
+  - ប្រព័ន្ធគ្រប់គ្រងផ្ទៃក្នុង (Admin Dashboard) ដែលទិន្នន័យមានទំហំតូច (ក្រោម ១០,០០០ ជួរ) ហើយ Admin ត្រូវការចុចទៅកាន់ទំព័រទី ១២។
+  - ទិន្នន័យដែលកម្រនឹងមានការបញ្ចូល ឬលុបចេញ។
+- **ត្រូវកំណត់ពិដាន (Cap) លើ Offset ជានិច្ច៖** ប្រសិនបើបើកឱ្យប្រើ Offset ជាសាធារណៈ ត្រូវបដិសេធសំណើណាដែលមាន `offset > 2000` ដោយប្រគល់ HTTP 400 Bad Request រួចណែនាំឱ្យគេប្រើប្រាស់ប្រព័ន្ធ Filter ជំនួសវិញ។
+
+## Implementation
+
+### 1. Keyset Pagination SQL Query ជាមួយ Composite Tie-Breaker៖
+
+```sql
+-- បង្កើត Composite Index ដើម្បីឱ្យការស្វែងរក Index Seek ដំណើរការ O(1)
+CREATE INDEX idx_orders_created_id ON orders (created_at DESC, id DESC);
+
+-- ទំព័រទី ១ (សំណើដំបូង)
+SELECT id, customer_id, total_cents, created_at
+FROM orders
+ORDER BY created_at DESC, id DESC
+LIMIT 20;
+
+-- ទំព័រទី ២ (សំណើបន្តដោយប្រើ created_at និង id នៃទំនិញទី ២០)
+SELECT id, customer_id, total_cents, created_at
+FROM orders
+WHERE (created_at, id) < ('2026-09-12 10:00:00+00', '0191eb58-0000-7000-8000-000000000014')
+ORDER BY created_at DESC, id DESC
+LIMIT 20;
+```
+
+### 2. TypeScript Cursor Serialization និង API Handler៖
+
+```typescript
+export interface PageCursor {
+  createdAt: string;
+  id: string;
+}
+
+export function encodeCursor(cursor: PageCursor): string {
+  return Buffer.from(JSON.stringify(cursor)).toString('base64url');
+}
+
+export function decodeCursor(cursorStr: string): PageCursor {
+  return JSON.parse(Buffer.from(cursorStr, 'base64url').toString('utf8'));
+}
+
+export async function getOrders(cursorParam?: string, limit = 20) {
+  let query = 'SELECT id, total_cents, created_at FROM orders';
+  const params: any[] = [];
+
+  if (cursorParam) {
+    const cursor = decodeCursor(cursorParam);
+    query += ' WHERE (created_at, id) < ($1, $2)';
+    params.push(cursor.createdAt, cursor.id);
+  }
+
+  query += ` ORDER BY created_at DESC, id DESC LIMIT ${limit + 1}`;
+  const { rows } = await db.query(query, params);
+
+  const hasNextPage = rows.length > limit;
+  const items = rows.slice(0, limit);
+
+  const nextCursor = hasNextPage && items.length > 0
+    ? encodeCursor({
+        createdAt: items[items.length - 1].created_at.toISOString(),
+        id: items[items.length - 1].id,
+      })
+    : null;
+
+  return { items, nextCursor, hasNextPage };
+}
+```
+
+## Verification
+
+1. **ការវាស់ស្ទង់ Latency លើទំព័រជ្រៅៗ៖** លើតារាងដែលមាន ៥,០០០,០០០ ជួរ ប្រៀបធៀប `OFFSET 1000000 LIMIT 20` ធៀបនឹង Keyset Query។ Keyset Pagination ត្រូវតែបញ្ចប់ក្នុងពេល **< 5 ms** ខណៈដែល Offset ប្រើពេលលើសពី ២,៥០០ ms។
+2. **ផ្ទៀងផ្ទាត់ Index Scan៖** ដំណើរការ `EXPLAIN (ANALYZE, BUFFERS)` លើ Keyset Query។ ធានាថា Query Plan ដំណើរការ `Index Scan` ដោយប៉ះពាល់តែ ២១ ជួរប៉ុណ្ណោះ។
+3. **ការធ្វើតេស្តភាពស៊ាំនឹងការរំកិលទិន្នន័យ (Drift Test)៖** ទាញយកទំព័រទី ១។ បញ្ចូល ៥ ជួរថ្មីទៅក្នុង Database។ ទាញយកទំព័រទី ២ ដោយប្រើ Cursor។ ផ្ទៀងផ្ទាត់ថាទំព័រទី ២ មិនមានទិន្នន័យស្ទួនពីទំព័រទី ១ សូម្បីតែមួយ។
+
+## Why
+
+B-Tree Index គឺជាដើមឈើស្វែងរកដែលមានលំដាប់លំដោយរៀបរយ។ នៅពេលដំណើរការ `WHERE (created_at, id) < (...)` ម៉ាស៊ីន Database រុករកតាមមែកឈើ (ជម្រៅ ៣ ទៅ ៤ កម្រិត) ទៅកាន់ជួរគោលដៅភ្លាមៗក្នុងពេលប៉ុន្មានមីក្រូវិនាទី រួចអានបន្ត ២០ ជួរទៅមុខ។
+
+ផ្ទុយទៅវិញ ជាមួយ `OFFSET N` ដាតាបេសមិនអាចហោះទៅជួរទី $N$ ភ្លាមៗបានទេ ព្រោះ B-Tree មិនបានកត់ត្រាលេខរៀងជួរឡើយ។ ម៉ាស៊ីនត្រូវបង្ខំចិត្តអានរាប់ជួរទិន្នន័យម្តងមួយៗតាំងពីលេខ ១ ដល់ $N$ ដែលធ្វើឱ្យខាតបង់ Disk I/O និង CPU យ៉ាងសម្បើម។
+
+## When Not To Use
+
+- **តារាងទិន្នន័យតូចៗ (ក្រោម ៥០០ ជួរ)៖** សម្រាប់តារាង Reference តូចៗ (ប្រទេស, តួនាទី, ប្រភេទ) Offset Pagination គឺលឿនគ្រប់គ្រាន់ និងស្រួលសរសេរកូដ។
+- **តម្រូវការប៊ូតុងលេខទំព័រដាច់ខាត៖** ប្រសិនបើ UI តម្រូវឱ្យមានប៊ូតុង `ទំព័រទី 1`, `ទំព័រទី 2`, `ទំព័រទី 15` នោះ Keyset Pagination មិនអាចឆ្លើយតបបានឡើយ។
+
+## Common Mistakes
+
+- **Keyset លើជួរឈរដែលមិន Unique ដោយគ្មាន Tie-Breaker៖** ការធ្វើ Pagination លើតែ `created_at` តែមួយមុខ នឹងធ្វើឱ្យរំលងទិន្នន័យ ប្រសិនបើមានទិន្នន័យច្រើនជួរមាន Timestamp ដូចគ្នាបេះបិទ។ ត្រូវដាក់ជួរឈរ Unique ដូចជា `id` ជា Tie-Breaker ទីពីរជានិច្ច។
+- **ខ្វះ Composite Index ត្រូវគ្នា៖** សរសេរ `WHERE (created_at, id) < (...)` តែគ្មាន Index `(created_at, id)` នឹងបង្ខំឱ្យ Database ធ្វើ Table Scan ដដែល។
+- **បង្ហាញ Internal ID ចំៗលើ API URL៖** ការបង្ហាញ ID ឬ Timestamp ផ្ទាល់អនុញ្ញាតឱ្យ User អាចកែសម្រួល Cursor បាន; ត្រូវ Encode Cursor ឱ្យទៅជា Base64url Token។

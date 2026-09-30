@@ -1,0 +1,19 @@
+{
+  "breadcrumb": "Breadcrumb",
+  "updated": "Updated",
+  "by": "By",
+  "fallbackNotice": "This page has not been written in English yet. You are reading the Khmer version.",
+  "fallbackAction": "Write the English version on GitHub",
+  "draftNotice": "This translation is a draft waiting for review by a Khmer reader. Technical terms are kept in English.",
+  "draftAction": "Help review it on GitHub",
+  "readInEnglish": "Read in English",
+  "related": "Related",
+  "facedThis": "Faced this in production?",
+  "facedThisBody": "Add your lesson, an option we missed, or a mistake worth warning about. Every page is a Markdown file on GitHub that anyone can improve.",
+  "discuss": "Discuss on GitHub",
+  "moreInCollection": "More in this collection",
+  "previous": "Previous",
+  "next": "Next",
+  "notTranslated": "Not translated yet",
+  "linkToSection": "Link to this section"
+}

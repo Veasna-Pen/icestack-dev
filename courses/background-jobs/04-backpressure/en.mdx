@@ -1,0 +1,91 @@
+---
+title: "When work arrives faster than you can do it"
+summary: "Measure queue growth and job age, and choose what to do when producers outrun workers: add capacity, slow down, or drop work."
+minutes: 12
+related: [problems/unbounded-queue-backpressure, patterns/rate-limiting, problems/should-i-use-kafka]
+updated: "2026-09-30"
+contributors: [Veasna-Pen]
+---
+
+## The problem
+
+A marketing campaign sends 200,000 users to your site in an hour. Each sign-up adds three jobs. Your workers finish **40 jobs a second**, but jobs arrive at **160 a second**.
+
+The API stays fast, so nothing looks wrong. But the queue grows by 120 jobs every second. After the hour, about 430,000 jobs are waiting: welcome emails arrive **three hours late**, Redis is running low on memory, and password-reset emails are stuck behind all of them.
+
+## The idea
+
+A queue hides overload: it absorbs a burst, which is good, but a queue that grows **all the time** is a problem building up silently.
+
+Watch two numbers:
+
+- **Queue depth**: how many jobs are waiting. Useful, but a big number might be fine.
+- **Age of the oldest job**: how long the next job has been waiting. This is what users feel. "Emails are 3 hours late" is the real alert.
+
+When producers outrun workers, you have three options. Pick on purpose:
+
+| Option | How | Good when |
+| --- | --- | --- |
+| **Add capacity** | More workers, higher concurrency | The limit is your workers, not a downstream service |
+| **Slow producers** (backpressure) | Rate-limit or reject new work, return `429` or "try later" | The work can wait at its source |
+| **Drop or defer work** | Skip low-value jobs, or run them at night | Some jobs matter much less than others |
+
+And **separate urgent work from bulk work**: give password resets their own queue, so they never wait behind a campaign.
+
+## Example
+
+Separate queues, so urgent jobs have their own workers:
+
+```ts
+const critical = new Queue('critical', { connection: redis }); // password resets, receipts
+const bulk = new Queue('bulk', { connection: redis }); // newsletters, CRM sync
+
+new Worker('critical', runJob, { connection: redis, concurrency: 20 });
+new Worker('bulk', runJob, { connection: redis, concurrency: 5 });
+```
+
+Measure the age of the oldest waiting job and alert on it:
+
+```ts
+setInterval(async () => {
+  const [oldest] = await bulk.getWaiting(0, 0);
+  const ageSeconds = oldest ? (Date.now() - oldest.timestamp) / 1000 : 0;
+  metrics.gauge('queue.oldest_job_age_seconds', ageSeconds, { queue: 'bulk' });
+}, 15_000);
+```
+
+Alert when the critical queue's oldest job is older than 1 minute, and the bulk queue's older than 1 hour. During the campaign, password resets keep arriving in seconds while the newsletter catches up overnight.
+
+## Try it
+
+1. For one queue you run, find out how fast jobs arrive and how fast workers finish them at peak.
+2. Add a metric for the age of the oldest waiting job.
+3. Decide the maximum acceptable delay for that queue, and alert on it.
+4. If urgent and bulk jobs share a queue, split them.
+
+## Check yourself
+
+**1. Jobs arrive at 100 per second and workers finish 80 per second. How much does the queue grow in an hour?**
+
+<Answer>
+20 jobs per second × 3,600 seconds = 72,000 jobs an hour, and it keeps growing until arrivals drop below 80 per second or you add capacity.
+</Answer>
+
+**2. Why is the age of the oldest job a better alert than queue depth?**
+
+<Answer>
+It measures what users experience: how late the work is. 10,000 tiny jobs might clear in seconds, while 50 slow ones might already be hours late.
+</Answer>
+
+**3. Your workers spend most of their time waiting on an email provider that allows 50 sends a second. Will more workers help?**
+
+<Answer>
+No. The bottleneck is the provider's limit, so more workers only hit the limit harder. Slow the producers, spread the work out, or send low-priority emails later.
+</Answer>
+
+## Key takeaways
+
+- A queue that **grows all the time** is overload you can't see yet.
+- Alert on the **age of the oldest job**, not only on depth.
+- Choose on purpose: **add capacity, slow producers, or drop and defer work**.
+- Keep **urgent work in its own queue**.

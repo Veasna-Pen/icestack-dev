@@ -1,0 +1,37 @@
+{
+  "switchLanguage": "Switch to English",
+  "switchToLight": "Switch to Light theme",
+  "switchToDark": "Switch to Dark theme",
+  "menu": {
+    "learn": "រៀន",
+    "knowledge": "ចំណេះដឹង",
+    "community": "សហគមន៍",
+    "explore": "ស្វែងរក",
+    "startCourse": "ចាប់ផ្តើមវគ្គសិក្សា",
+    "methodPath": "ផ្លូវនៃវិធីសាស្ត្រ",
+    "howToThinkRole": "គិតឱ្យល្អិតល្អន់ មួយជំហានម្តងៗ",
+    "commonQuestions": "សំណួរដែលគេសួរញឹកញាប់",
+    "contribute": "ចូលរួម",
+    "helpTranslate": "ជួយបកប្រែ",
+    "translateLabel_other": "ទំព័រត្រូវការភាសាខ្មែរ",
+    "translateCta": "ជ្រើសរើសមួយដើម្បីបកប្រែ",
+    "items": {
+      "guide": {
+        "title": "មគ្គុទ្ទេសក៍សម្រាប់អ្នកចូលរួម",
+        "description": "សរសេរ មើលជាមុន និងដាក់ស្នើទំព័រ"
+      },
+      "pageTemplate": {
+        "title": "Template ទំព័រ",
+        "description": "ចំណងជើងដែលទំព័រនីមួយៗឆ្លងកាត់"
+      },
+      "lessonTemplate": {
+        "title": "Template មេរៀន",
+        "description": "ប្រាំមួយជំហាននៃមេរៀននីមួយៗ"
+      },
+      "propose": {
+        "title": "ស្នើប្រធានបទ",
+        "description": "បើក issue មុនពេលអ្នកសរសេរ"
+      }
+    }
+  }
+}

@@ -1,0 +1,155 @@
+---
+title: "Sidecar"
+question: "តើខ្ញុំអាចបន្ថែមមុខងារហេដ្ឋារចនាសម្ព័ន្ធទូទៅ (mTLS, Logging, Proxies, Metrics) ទៅក្នុង Application យ៉ាងដូចម្តេចដោយមិនបាច់ប៉ះពាល់ Business Logic ឬ Language Runtimes?"
+summary: "ដាក់ពង្រាយ Helper Container បន្ទាប់បន្សំមួយទៀតនៅក្បែរ Application Container ចម្បងក្នុង Pod ឬ Host តែមួយ។ Sidecar ចែករំលែកបណ្តាញ Network Namespace (localhost) និង Storage Volumes ជាមួយគ្នា ដែលជួយដកបន្ទុកការងារ Telemetry, សុវត្ថិភាព, ឬ Proxy Routing ចេញពីកូដកម្មវិធីទាំងស្រុង។"
+tags: [architecture, kubernetes, sidecar, containers, cloud-native]
+related: [patterns/api-gateway, patterns/circuit-breaker, patterns/health-check]
+order: 19
+updated: "2026-09-12"
+contributors: [veasna]
+translation: draft
+---
+
+## Context
+
+នៅក្នុងក្រុមហ៊ុនដែលមាន Microservices ប្រើប្រាស់ភាសា Programming ចម្រុះគ្នា (Node.js, Go, Python, Java, Rust) ក្រុម Platform Engineers ត្រូវកំណត់ស្តង់ដារប្រតិបត្តិការទូទាំងក្រុមហ៊ុន៖ ការការពារសុវត្ថិភាពតាម mTLS, Distributed Tracing Headers, ការប្រមូល Log ទៅកាន់ Elasticsearch ឬ Loki, និងការបញ្ជូន Metrics ទៅ Prometheus។
+
+ការសរសេរមុខងារទាំងនេះចូលក្នុងកូដ Application ដោយផ្ទាល់ គឺជាការឈឺក្បាលយ៉ាងខ្លាំង។ ក្រុមការងារនីមួយៗត្រូវដំឡើង, កំណត់ Config, និងថែទាំ SDK ចំនួន ៥ ផ្សេងៗគ្នា។ ប្រសិនបើមានបញ្ហាចន្លោះប្រហោងសុវត្ថិភាព (Vulnerability) ក្នុងបណ្ណាល័យ OpenSSL ឬ TLS នោះគ្រប់ Service ទាំងអស់ក្នុងក្រុមហ៊ុនត្រូវបង្ខំចិត្ត Update កូដ, ធ្វើតេស្តឡើងវិញ, និង Deploy ឡើងវិញទាំងអស់។
+
+**Sidecar Pattern** ដោះស្រាយបញ្ហានេះដោយដាក់ Process ឬ Container ជំនួយមួយទៀតនៅក្បែរ Application Container ចម្បង។ ដូចគ្នានឹងរ៉ឺម៉កកង់បីដែលភ្ជាប់នៅចំហៀងម៉ូតូ (Sidecar) ដែរ Container ជំនួយនេះចែករំលែក Lifecycle, Storage Disk, និង Network Namespace (`localhost`) ជាមួយកម្មវិធីចម្បង ដោយមិនចាំបាច់កែប្រែកូដរបស់កម្មវិធីសូម្បីតែមួយជួរ។
+
+## Symptoms
+
+- កូដកម្មវិធីពោរពេញទៅដោយ Boilerplate រាប់រយជួរសម្រាប់ការរៀបចំទម្រង់ Log, ការចាប់ Tracing Headers, និងការទាញយក TLS Certificates។
+- ក្រុមការងារចំណាយពេលរាប់សប្តាហ៍ដើម្បីសរសេរកូដ Rate-limiting, Retry, ឬ Encryption ដដែលៗឡើងវិញក្នុងភាសា Programming ៤ ផ្សេងគ្នា។
+- ការ Update បំណះសុវត្ថិភាពលើ TLS ឬ Logging Agent តម្រូវឱ្យ Rebuild និង Deploy កូដ Application រាប់សិបឡើងវិញទាំងអស់។
+- កម្មវិធីចម្បងគាំងដំណើរការដោយសារតែ Log Forwarder ឬ Telemetry Exporter ដំណើរការយឺតរហូតដល់អស់ RAM ក្នុង Process តែមួយ។
+
+<Callout type="warning" title="ការចែករំលែក Localhost អាចបង្កើតបញ្ហាជាន់ Port គ្នា">
+ដោយសារតែ Application ចម្បង និង Sidecar ប្រើប្រាស់ Loopback Network (`localhost`) រួមគ្នា ការកំណត់ Port អាចប៉ះទង្គិចគ្នាបាន។ ប្រសិនបើ App និង Sidecar ព្យាយាមបើក Port 8080 ព្រមគ្នា Pod នោះនឹងមិនអាច Start បានឡើយ។
+</Callout>
+
+## Diagnose
+
+1. **ពិនិត្យមើលកូដបណ្ណាល័យស្ទួនៗ (Library Duplication)៖** តើក្រុម Go, Python, និង Node.js របស់អ្នកកំពុងថែទាំ Library ផ្ទាល់ខ្លួនដាច់ដោយឡែកសម្រាប់ Logging, Tracing, និង mTLS មែនទេ?
+2. **ពិនិត្យចំនួន Container ក្នុង Pod៖** ពិនិត្យមើល Kubernetes Deployments។ តើអ្នកកំពុងដំណើរការ Single-container Pods ដែលដាក់បញ្ចូល Telemetry Logic ទាំងអស់ក្នុង Process តែមួយមែនទេ?
+3. **វាស់ស្ទង់ពេលវេលាថែទាំ៖** តើវិស្វករត្រូវចំណាយពេលប៉ុន្មានម៉ោងក្នុងការ Update បណ្ណាល័យ TLS លើគ្រប់ Service ទាំងអស់កាលពីលើកមុន?
+4. **ពិនិត្យការប្រើប្រាស់ Memory របស់ Process៖** តើ Node.js Event Loop ត្រូវចំណាយ CPU ២០% គ្រាន់តែដើម្បីរៀបចំ និងបញ្ជូន Log តាម HTTPS មែនទេ?
+
+## Options
+
+1. **In-Process Shared Libraries (SDKs)៖** ដំឡើង Library តាមភាសានីមួយៗ (OpenTelemetry SDK, Datadog Tracer) ចូលក្នុងកូដ App។ (ចងភ្ជាប់ស្អិតរមួត អាស្រ័យលើភាសាកូដ)។
+2. **Host / DaemonSet Agent៖** ដំណើរការ Agent តែមួយគត់លើ Node នីមួយៗរបស់ Kubernetes (ដូចជា Datadog DaemonSet)។ (សន្សំសំចៃធនធាន ប៉ុន្តែមិនអាចស្ទាក់ចាប់ Network ក្នុងកម្រិត Pod នីមួយៗបានឡើយ)។
+3. **Container Sidecar (ដាក់ក្នុង Pod តែមួយ)៖** ដំណើរការ Envoy, Fluentbit, ឬ Vault Agent ជា Container ទីពីរក្នុង Pod តែមួយ។ (មិនប្រកាន់ភាសាកូដ, ញែក Resource ដាច់ដោយឡែក, Update បានដោយឯករាជ្យ)។
+4. **Service Mesh (Istio, Linkerd)៖** ការចាក់បញ្ចូល Sidecar ដោយស្វ័យប្រវត្តិដើម្បីស្ទាក់ចាប់ Network ទាំងអស់តាមរយៈ iptables។
+
+## Trade-offs
+
+| យុទ្ធសាស្ត្រ | ភាពឯករាជ្យពីភាសាកូដ | ប្រសិទ្ធភាពធនធាន | កម្រិតចងភ្ជាប់ (Coupling) | ភាពរហ័សរហួនពេល Update |
+| :--- | :--- | :--- | :--- | :--- |
+| **In-Process SDK** | គ្មាន (សរសេរតាមភាសានីមួយៗ) | ខ្ពស់ (Process តែមួយ) | ខ្ពស់ (Compile ជាប់កូដ) | ខ្សោយ (ត្រូវ Deploy ទាំងអស់ឡើងវិញ) |
+| **Node DaemonSet** | ខ្ពស់ | អតិបរមា (១ Agent ក្នុង ១ Node) | ទាប | ល្អ |
+| **Container Sidecar** | **ពេញលេញ (Polyglot)** | មធ្យម (Container តូចៗ) | **សូន្យ (ទាក់ទងតាម localhost)** | **ភ្លាមៗ (Update តែ Image Sidecar)** |
+| **Service Mesh** | ពេញលេញ | ទាបជាង (Envoy ក្នុងគ្រប់ Pod) | សូន្យ | ស្មុគស្មាញក្នុងការគ្រប់គ្រង |
+
+## Decision
+
+- **ប្រើ Sidecars សម្រាប់មុខងារហេដ្ឋារចនាសម្ព័ន្ធទូទៅ៖**
+  - *Network Proxies:* Envoy ឬ Linkerd សម្រាប់ការ Encrypt តាម mTLS, Circuit Breaking, និង Traffic Shadowing។
+  - *Log Collection:* Fluentbit ឬ Vector ដែលអាន Log ចេញពី Shared `/var/log` Memory Volume រួចបញ្ជូនទៅកាន់ Loki/Elasticsearch។
+  - *Secret Management:* HashiCorp Vault Agent sidecar ដែលទាញយក Database Credentials បណ្តោះអាសន្ន និងបង្កើតជា File កំណត់រចនាសម្ព័ន្ធក្នុងម៉ាស៊ីន។
+- **ទាក់ទងគ្នាតាមតែ `localhost` ឬ Shared Volumes ប៉ុណ្ណោះ៖** Application Container គួរទាក់ទងជាមួយ Sidecar តាមរយៈ `http://localhost:<sidecar-port>` ឬសរសេរឯកសារចូល Shared Volume។
+- **កំណត់ Resource Limits ដាច់ដោយឡែកជានិច្ច៖** ត្រូវកំណត់កម្រិត CPU និង RAM ជាក់លាក់សម្រាប់ Sidecar ដើម្បីកុំឱ្យបញ្ហាកកស្ទះ Log ទៅទាញទម្លាក់ API ស្នូលរបស់អាជីវកម្ម។
+- **រៀបចំលំដាប់លំដោយ Startup និង Shutdown៖** ធានាថា Sidecar ចាប់ផ្តើមដំណើរការ *មុន* App Container និងបិទបញ្ចប់ *ក្រោយ* ពេលដែល App បានបញ្ចប់ការបញ្ជូន In-flight Requests រួចរាល់។
+
+## Implementation
+
+### ការកំណត់ Kubernetes Pod ដែលមាន Fluentbit Log Shipper និង Envoy Proxy ជា Sidecars៖
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: order-service
+spec:
+  replicas: 3
+  template:
+    spec:
+      volumes:
+        # Shared In-memory Volume សម្រាប់កត់ត្រា Log
+        - name: shared-logs
+          emptyDir: {}
+
+      containers:
+        # ១. Application Container ចម្បង (Business Logic សុទ្ធ)
+        - name: order-api
+          image: order-api:v1.2.0
+          ports:
+            - containerPort: 8080
+          volumeMounts:
+            - name: shared-logs
+              mountPath: /var/log/app
+          env:
+            # កម្មវិធីគ្រាន់តែកត់ត្រា Log ចូលក្នុង File មូលដ្ឋាន ទុកឱ្យ Sidecar ជាអ្នកបញ្ជូន
+            - name: LOG_PATH
+              value: /var/log/app/orders.log
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "1000m"
+              memory: "1024Mi"
+
+        # ២. Sidecar Container: Fluentbit Log Collector
+        # មិនប្រកាន់ភាសាកូដ បញ្ជូន Log ទៅកាន់ Cloud ដោយស្វ័យប្រវត្តិ
+        - name: log-shipper-sidecar
+          image: fluent/fluent-bit:2.2
+          volumeMounts:
+            - name: shared-logs
+              mountPath: /var/log/app
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "100m"
+              memory: "128Mi"
+
+        # ៣. Sidecar Container: Envoy Local Proxy (mTLS & Outbound Retries)
+        - name: envoy-sidecar
+          image: envoyproxy/envoy:v1.28-latest
+          ports:
+            - containerPort: 15001
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "200m"
+              memory: "256Mi"
+```
+
+## Verification
+
+1. **ការធ្វើតេស្ត Localhost Connectivity៖** ពីខាងក្នុង App Container ដំណើរការ `curl http://localhost:15001/ready`។ ផ្ទៀងផ្ទាត់ថា Envoy Sidecar អាចទាក់ទងបានតាម Loopback Network។
+2. **ផ្ទៀងផ្ទាត់ការញែកបន្ទុក Logging៖** បញ្ចេញ Log ចំនួនច្រើនក្នុងពេលតែមួយ។ ពិនិត្យមើលថា CPU របស់ App Container នៅតែថេរ ខណៈដែល Fluentbit Sidecar ទទួលបន្ទុកអាន File និងបញ្ជូនតាម Network។
+3. **ការធ្វើតេស្ត Upgrade Sidecar ដោយឯករាជ្យ៖** ផ្លាស់ប្តូរ Version របស់ Image `log-shipper-sidecar` ក្នុង Kubernetes Manifest។ ពិនិត្យមើលថា Kubernetes ធ្វើ Rolling Update ដោយមិនចាំបាច់ប៉ះពាល់កូដកម្មវិធីឡើយ។
+4. **ផ្ទៀងផ្ទាត់ Shared Volume៖** បង្កើត File តេស្ត `/var/log/app/test.txt` ពី App Container រួចផ្ទៀងផ្ទាត់ថាវាអាចមើលឃើញភ្លាមៗពីក្នុង Sidecar Container។
+
+## Why
+
+ការបែងចែកទំនួលខុសត្រូវ (Separation of Concerns) គឺជាច្បាប់គ្រឹះនៃ Software ដែលមានគុណភាពខ្ពស់។ ការច្របល់បញ្ហាហេដ្ឋារចនាសម្ព័ន្ធ (ការ Encrypt, ការ Parse Log, Tracing) ជាមួយ Domain Logic ស្នូល គឺជាការបំពានច្បាប់នេះ និងទាញក្រុមការងារឱ្យជាប់គាំងក្នុងការថែទាំតាមភាសានីមួយៗ។
+
+Sidecar Pattern លើកកម្ពស់ហេដ្ឋារចនាសម្ព័ន្ធឱ្យក្លាយជាប្លុកម៉ូឌុលឯករាជ្យពីភាសាកូដ។ Developer អាចផ្តោតអារម្មណ៍ពេញលេញលើការបង្កើតមុខងារអាជីវកម្មក្នុងភាសាដែលស័ក្តិសមបំផុត ខណៈដែល Platform Engineers អាច Deploy, ការពារសុវត្ថិភាព, និងតាមដានកម្មវិធីប្រកបដោយស្តង់ដារតែមួយទូទាំងក្រុមហ៊ុន។
+
+## When Not To Use
+
+- **ការដាក់ពង្រាយលើ Single Server Monolith៖** ប្រសិនបើអ្នកដំណើរការ App លើ Virtual Machine តែមួយ (EC2/VPS) ដោយមិនប្រើប្រាស់ Containers ឬ Kubernetes ការប្រើ Sidecar បង្កើតតែភាពស្មុគស្មាញលើសពី Systemd Service ធម្មតា។
+- **ប្រព័ន្ធដែលទាមទារ Latency កម្រិត Microsecond (< 100 µs)៖** ការដាក់ Envoy Sidecar បន្ថែម Network Hop តាម Loopback (ប្រហែល 0.3–0.8 ms)។ បើជាប្រព័ន្ធជួញដូរភាគហ៊ុនល្បឿនលឿនខ្លាំង ការប្រើ In-Process Library គឺចាំបាច់។
+
+## Common Mistakes
+
+- **មិនកំណត់ Resource Limits លើ Sidecar៖** ទុកឱ្យ Logging Sidecar ស៊ី RAM គ្មានដែនកំណត់ បណ្តាលឱ្យ Kubernetes សម្លាប់ Pod ទាំងមូល (រួមទាំង App Container ល្អៗផងដែរ)។
+- **បិទ Pod មុនកំណត់ (Premature Termination)៖** ប្រសិនបើ Kubernetes សម្លាប់ Envoy Proxy Sidecar មុនពេល App បញ្ចប់ In-flight Requests នោះ Request របស់អ្នកប្រើប្រាស់នឹងដាច់ភ្លាមៗដោយសារ Connection Refused។
+- **ការជាន់គ្នាលើ Port Namespace៖** ភ្លេចថារាល់ Container ទាំងអស់ក្នុង Pod ចែករំលែក `localhost` ជាមួយគ្នា ដែលបង្កជា Port Conflict រវាង App និង Sidecar។

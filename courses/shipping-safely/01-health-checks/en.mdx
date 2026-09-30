@@ -1,0 +1,99 @@
+---
+title: "Health checks: is this instance ready?"
+summary: "Tell the load balancer when an instance can take traffic, and when it should be restarted, with two small endpoints."
+minutes: 10
+related: [patterns/health-check, problems/slow-first-request]
+updated: "2026-09-30"
+contributors: [Veasna-Pen]
+---
+
+## The problem
+
+Every deploy, for about 20 seconds, some users get `502 Bad Gateway` errors. The new containers have started, so the load balancer sends them traffic, but the app inside is still connecting to the database and warming up.
+
+Another time, an instance got stuck: the process was running but every request hung. The platform kept sending it traffic for an hour, because as far as it knew, the container was "up".
+
+## The idea
+
+A **health check** is an endpoint the platform calls every few seconds to ask about your app. There are two different questions, and they need two different checks:
+
+| Check | Question | If it fails |
+| --- | --- | --- |
+| **Readiness** | Can this instance serve requests **right now**? | Stop sending it traffic, but keep it running |
+| **Liveness** | Is this process **stuck** beyond repair? | Restart it |
+
+Readiness should check what a request needs: for example, that the database connection works. It fails during start-up, and again during shutdown.
+
+Liveness should be **simple**: can the process answer at all? Don't check the database in liveness. If the database has a short outage, every instance would fail liveness and be restarted at once, turning a small problem into a big one.
+
+## Example
+
+Two endpoints in an Express app:
+
+```ts
+let ready = false;
+
+app.get('/livez', (_req, res) => res.sendStatus(200)); // the process answers: it's alive
+
+app.get('/readyz', async (_req, res) => {
+  if (!ready) return res.sendStatus(503);
+  try {
+    await db.$queryRaw`SELECT 1`; // can we reach what requests need?
+    res.sendStatus(200);
+  } catch {
+    res.sendStatus(503);
+  }
+});
+
+await db.$connect();
+await warmCaches();
+ready = true; // only now accept traffic
+```
+
+And in Kubernetes:
+
+```yaml
+readinessProbe:
+  httpGet: { path: /readyz, port: 3000 }
+  periodSeconds: 5
+livenessProbe:
+  httpGet: { path: /livez, port: 3000 }
+  periodSeconds: 10
+  failureThreshold: 3
+```
+
+New instances now only get traffic once `/readyz` answers `200`, so the 502s during deploys disappear. A stuck process fails `/livez` three times and is restarted.
+
+## Try it
+
+1. Add `/readyz` and `/livez` to an app you run.
+2. Make `/readyz` return `503` until start-up work (database connection, cache warm-up) is done.
+3. Configure your platform to use them: Kubernetes probes, an ECS or load-balancer health check, or Docker's `HEALTHCHECK`.
+4. Deploy and watch: new instances should only receive traffic after they report ready.
+
+## Check yourself
+
+**1. Why shouldn't the liveness check query the database?**
+
+<Answer>
+If the database is briefly unavailable, every instance fails liveness together and gets restarted, even though restarting doesn't fix the database. Liveness should only fail when the process itself is broken.
+</Answer>
+
+**2. An app takes 30 seconds to load a machine-learning model at start-up. Which check covers that?**
+
+<Answer>
+Readiness. It returns `503` until the model is loaded, so no traffic arrives early. Liveness should pass during that time, or give it a longer start-up allowance, so the platform doesn't restart the app while it loads.
+</Answer>
+
+**3. Your `/readyz` returns `200` as soon as the HTTP server starts. What is the risk?**
+
+<Answer>
+Traffic arrives before the app can actually handle it, for example before it is connected to the database, so the first requests fail. Readiness should reflect what a real request needs.
+</Answer>
+
+## Key takeaways
+
+- **Readiness**: can I take traffic now? Failing it removes the instance from the load balancer.
+- **Liveness**: am I stuck? Failing it restarts the process.
+- Keep liveness **simple**; put dependency checks in readiness.
+- Only report ready **after** start-up work is done.

@@ -1,0 +1,157 @@
+---
+title: "Push vs Pull Metrics"
+question: "តើនៅពេលណាដែល Application គួរតែរុញ (Push) Metrics ទៅកាន់ Collector ហើយនៅពេលណាដែល Prometheus គួរតែទាញយក (Pull / Scrape) ចេញពី Endpoint?"
+summary: "Push Monitoring (Datadog, CloudWatch, StatsD) រុញទិន្នន័យផ្ទាល់ចេញពី Instance ទៅកាន់ Collector ដែលស័ក្តិសមបំផុតសម្រាប់ Serverless Functions, Batch Jobs, និង Edge Devices។ រីឯ Pull Monitoring (Prometheus) ចូលទៅទាញយកទិន្នន័យតាមកាលវិភាគពី Endpoint /metrics ដែលមានសមត្ថភាពដឹងពីការស្លាប់របស់ម៉ាស៊ីនដោយស្វ័យប្រវត្តិ (Liveness Detection) និងគ្រប់គ្រងកម្រិតនៃការទាញយកទិន្នន័យបានពេញលេញ។"
+tags: [observability, monitoring, devops, prometheus, datadog, metrics]
+related: [patterns/health-check, tradeoffs/serverless-vs-containers, patterns/sidecar]
+order: 18
+updated: "2026-09-12"
+contributors: [veasna]
+translation: draft
+---
+
+## Context
+
+នៅក្នុងបរិយាកាស Production ក្រុមវិស្វករត្រូវតាមដានសកម្មភាពរបស់កម្មវិធីក្នុងពេលជាក់ស្តែង៖ ចំនួនសំណើក្នុងមួយវិនាទី, p99 Latency, ចំនួន Error, ការប្រើប្រាស់ Memory, និង Business KPIs។
+
+មានទម្រង់ចម្បងពីរក្នុងការប្រមូលផ្តុំទិន្នន័យតាមដាន (Metrics)៖
+1. **Push-Based Monitoring៖** កម្មវិធីបញ្ជូនកញ្ចប់ទិន្នន័យ Metrics ដោយផ្ទាល់តាមរយៈ UDP ឬ HTTPS ទៅកាន់ Collector កណ្តាល ឬ SaaS Agent (ដូចជា AWS CloudWatch, Datadog Agent, StatsD, InfluxDB)។ កម្មវិធីជាអ្នកសម្រេចចិត្តថា *ពេលណា* និង *ញឹកញាប់ប៉ុណ្ណា* ក្នុងការផ្ញើទិន្នន័យ។
+2. **Pull-Based Monitoring៖** កម្មវិធីបើកចំហរ HTTP Endpoint ស្តង់ដារមួយ (ជាទូទៅគឺ `GET /metrics`)។ Server តាមដានកណ្តាល (ដូចជា Prometheus, VictoriaMetrics) ភ្ជាប់ចូលទៅកាន់ Instance នីមួយៗជាប្រចាំ (ឧ. រៀងរាល់ ១៥ វិនាទីម្តង) ដើម្បីទាញយក (Scrape) លេខរាប់ និងទិន្នន័យបច្ចុប្បន្ន។
+
+ការជ្រើសរើសខុស នឹងបង្កើតជាចំណុចងងឹត (Blind Spots)៖ ប្រព័ន្ធ Push អាចគាំងស្លាប់ដោយអ្នកមិនដឹងខ្លួន ព្រោះគ្មានទិន្នន័យផ្ញើមក ខណៈដែលប្រព័ន្ធ Pull ពិបាកតាមដាន Serverless Functions ដែលដំណើរការត្រឹមតែពីរបីមិល្លីវិនាទី ឬឧបករណ៍ Edge ដែលនៅពីក្រោយ Firewall។
+
+## Symptoms
+
+- **រោគសញ្ញាបរាជ័យនៃ Pull៖** Serverless AWS Lambda Functions ដំណើរការតែ ៤០ ms ហើយបិទទៅវិញ មុនពេល Prometheus អាចមកដល់ទាន់ដើម្បីទាញយកទិន្នន័យ; ឧបករណ៍ទូរស័ព្ទដៃដែលនៅពីក្រោយ NAT មិនអាចឱ្យ Prometheus ភ្ជាប់ចូលពីក្រៅបានឡើយ។
+- **រោគសញ្ញាបរាជ័យនៃ Push៖** កូដគាំង Loop មួយបាញ់ទិន្នន័យ Metrics ចំនួន ១០,០០០,០០០ ក្នុងមួយនាទី ដែលធ្វើឱ្យគាំង Collector ក្នុងម៉ាស៊ីន និងអស់លុយថ្លៃ Datadog/CloudWatch រាប់ពាន់ដុល្លារក្នុងមួយខែ; Microservice មួយគាំងស្លាប់ទាំងស្រុង តែគ្មាន Alert ណារោទ៍ឡើយ ព្រោះប្រព័ន្ធយល់ច្រឡំថា "គ្មានទិន្នន័យផ្ញើមក" ស្មើនឹង "គ្មាន Traffic"។
+
+<Callout type="warning" title="ប្រព័ន្ធ Pull ដឹងពីការស្លាប់របស់ម៉ាស៊ីនដោយស្វ័យប្រវត្តិ; ប្រព័ន្ធ Push ទាមទារ Deadman Alerts">
+ក្នុងស្ថាបត្យកម្ម Pull ប្រសិនបើ Scraper មិនអាចភ្ជាប់ទៅកាន់ Target បានទេ វានឹងកត់ត្រា `up == 0` ភ្លាមៗ។ ក្នុងស្ថាបត្យកម្ម Push ប្រសិនបើម៉ាស៊ីនស្លាប់ វានឹងគ្រាន់តែឈប់ផ្ញើទិន្នន័យ ដែលមើលទៅដូចគ្នាបេះបិទនឹងម៉ាស៊ីនដែលកំពុងទំនេរគ្មានអ្នកប្រើ។
+</Callout>
+
+## Diagnose
+
+1. **ពិនិត្យមើលអាយុកាលនៃការងារ៖** តើការងាររបស់អ្នកជាសេវាកម្មដែលរត់ជាប់ ២៤/៧ (Kubernetes Pods, VMs) ឬជា Batch Task បណ្តោះអាសន្នដែលរត់ក្រោម ៣០ វិនាទី (AWS Lambda, Migration Scripts)?
+2. **ពិនិត្យលទ្ធភាពនៃការភ្ជាប់ Network៖** តើ Monitoring Server អាចភ្ជាប់ Inbound HTTP ចូលទៅកាន់ Pods បានទេ ឬតើ Pods ទាំងនោះស្ថិតនៅពីក្រោយ Private Firewall តឹងរ៉ឹង?
+3. **វាយតម្លៃហានិភ័យ High-Cardinality៖** តើ Developer ធ្លាប់ច្រឡំដាក់ User ID ឬ Email ចូលទៅក្នុង Metric Tags ដែលធ្វើឱ្យចំនួន Time-Series កើនឡើងរាប់លានដែរឬទេ?
+4. **វាយតម្លៃថវិកាប្រតិបត្តិការ៖** តើអ្នកកំពុងប្រើប្រាស់ Self-hosted Open Source (Prometheus/Grafana) ឬកំពុងបង់លុយតាមចំនួន Metrics ទៅឱ្យ SaaS (Datadog/New Relic)?
+
+## Options
+
+1. **ស្ថាបត្យកម្ម Pull-Based (Prometheus / OpenTelemetry)៖** Scrape `GET /metrics` តាមបណ្តាញ VPC ខាងក្នុង។ កំណត់អត្រាទាញយកទិន្នន័យនៅចំណុចកណ្តាល និងស្វែងរក Target តាម Kubernetes API។
+2. **ស្ថាបត្យកម្ម Push-Based (StatsD / CloudWatch)៖** បាញ់ទិន្នន័យ Metrics ចេញតាម UDP បែប Asynchronous Fire-and-forget។
+3. **Push តាមរយៈ Gateway កណ្តាល (Prometheus Pushgateway)៖** ការងារ Batch បណ្តោះអាសន្នរុញទិន្នន័យទៅកាន់ Gateway កណ្តាល រួចទុកឱ្យ Prometheus មក Scrape ពីទីនោះជាធម្មតា។
+4. **Agent Collector Hybrid (OpenTelemetry Collector / Vector)៖** កម្មវិធីរុញទិន្នន័យក្នុងម៉ាស៊ីនផ្ទាល់ទៅកាន់ Sidecar Agent តាមរយៈ `localhost` OTLP រួច Sidecar ជាអ្នកចម្រាញ់ និងបញ្ជូនបន្ត។
+
+## Trade-offs
+
+| លក្ខណៈវិនិច្ឆ័យ | Pull Monitoring (Prometheus) | Push Monitoring (Datadog / StatsD) |
+| :--- | :--- | :--- |
+| **ការដឹងពីម៉ាស៊ីនស្លាប់ (Liveness)** | **ស្វ័យប្រវត្តិ (`up == 0` ពេល Scrape មិនបាន)** | ទាមទារការកំណត់ Alert ពេលបាត់ទិន្នន័យ |
+| **ការងារបណ្តោះអាសន្ន (Lambda/Batch)**| ពិបាក (ត្រូវការ Pushgateway) | **មានស្រាប់ (បាញ់ទិន្នន័យមុនពេលបិទ)** |
+| **ការការពារកុំឱ្យជន់ជោរប្រព័ន្ធ** | **គ្រប់គ្រងពេញលេញ (Scraper ជាអ្នកកំណត់ល្បឿន)**| ប្រថុយប្រថាន (App អាចបាញ់ជន់ជោរ DB) |
+| **ការកំណត់ Network & Firewall** | ត្រូវការសិទ្ធិ Inbound ចូលទៅកាន់ Pods | **ងាយស្រួល (Outbound Connection សុទ្ធ)** |
+| **Service Discovery** | ចាំបាច់ (K8s API, Consul, DNS) | មិនត្រូវការ (ដឹងតែ IP របស់ Collector គឺចប់) |
+| **ការគ្រប់គ្រង High Cardinality** | ស៊ី RAM តាមចំនួន Unique Series | SaaS ជាអ្នករ៉ាប់រង (តែគិតលុយថ្លៃខ្លាំង) |
+
+## Decision
+
+- **ជ្រើសរើស Pull-Based Monitoring (Prometheus) សម្រាប់៖**
+  - Microservices និង Kubernetes Container Clusters ដែលដំណើរការជាប្រចាំ។
+  - ហេដ្ឋារចនាសម្ព័ន្ធ Server, Database Exporters (PostgreSQL, Redis), និង Ingress Proxies។
+  - ក្រុមការងារដែលចង់បានការចំណាយលើ Monitoring ថេរជាក់លាក់ដោយមិនខ្លាចបារម្ភពីរឿង Bill Shock។
+- **ជ្រើសរើស Push-Based Monitoring សម្រាប់៖**
+  - Serverless Functions បណ្តោះអាសន្ន (AWS Lambda, Cloudflare Workers)។
+  - Script បញ្ជាតាម Terminal, ការងារ Migration ប្រចាំយប់, និង CI/CD Pipelines។
+  - ឧបករណ៍ IoT, Mobile Native Apps, និង Edge Nodes ដែលនៅពីក្រោយ NAT។
+- **អនុវត្តទម្រង់ Local Agent Pattern (Hybrid)៖** ដំណើរការ OpenTelemetry Collector ឬ Datadog Agent ជា DaemonSet ឬ Sidecar។ កម្មវិធីបាញ់ទិន្នន័យទៅកាន់ `localhost` ល្បឿនលឿន រួចទុកឱ្យ Collector ទទួលបន្ទុក Batching, Rate-limiting, និងការបញ្ជូនបន្តទៅកាន់ប្រព័ន្ធកណ្តាល។
+
+## Implementation
+
+### 1. ការបើកចំហរ Endpoint Pull Metrics ក្នុង Express ជាមួយ `prom-client`៖
+
+```typescript
+import express from 'express';
+import client from 'prom-client';
+
+const app = express();
+
+// ប្រមូល Runtime Metrics លំនាំដើមរបស់ Node.js (Heap, Event Loop, CPU)
+client.collectDefaultMetrics();
+
+// បង្កើត Custom Metrics សម្រាប់តាមដាន HTTP Requests
+const httpRequestCounter = new client.Counter({
+  name: 'http_requests_total',
+  help: 'ចំនួនសរុបនៃសំណើ HTTP Requests',
+  labelNames: ['method', 'route', 'status_code'],
+});
+
+const httpDurationHistogram = new client.Histogram({
+  name: 'http_request_duration_seconds',
+  help: 'រយៈពេលដំណើរការ HTTP Request គិតជាវិនាទី',
+  labelNames: ['method', 'route', 'status_code'],
+  buckets: [0.01, 0.05, 0.1, 0.5, 1, 2.5],
+});
+
+// Middleware កត់ត្រាសំណើទាំងអស់
+app.use((req, res, next) => {
+  const start = Date.now();
+  res.on('finish', () => {
+    const duration = (Date.now() - start) / 1000;
+    httpRequestCounter.inc({ method: req.method, route: req.path, status_code: res.statusCode });
+    httpDurationHistogram.observe({ method: req.method, route: req.path, status_code: res.statusCode }, duration);
+  });
+  next();
+});
+
+// Endpoint ស្តង់ដារសម្រាប់ឱ្យ Prometheus ចូលមក Scrape
+app.get('/metrics', async (req, res) => {
+  res.set('Content-Type', client.register.contentType);
+  res.end(await client.register.metrics());
+});
+
+app.listen(3000, () => console.log('API កំពុងដំណើរការជាមួយ /metrics លើ Port 3000'));
+```
+
+### 2. ការកំណត់ Scrape Configuration ក្នុង Prometheus (`scrape_config.yaml`)៖
+
+```yaml
+scrape_configs:
+  - job_name: 'kubernetes-pods'
+    scrape_interval: 15s # Scrape រៀងរាល់ ១៥ វិនាទីម្តង
+    kubernetes_sd_configs:
+      - role: pod
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+        action: keep
+        regex: true
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+        action: replace
+        target_label: __metrics_path__
+        regex: (.+)
+```
+
+## Verification
+
+1. **ផ្ទៀងផ្ទាត់ Scrape Endpoint៖** ដំណើរការ `curl http://localhost:3000/metrics`។ ផ្ទៀងផ្ទាត់ថាទិន្នន័យឆ្លើយតបត្រូវតាមទម្រង់អត្ថបទស្តង់ដាររបស់ Prometheus ដែលមាន HELP និង TYPE ត្រឹមត្រូវ។
+2. **ការធ្វើតេស្តដឹងពីការស្លាប់របស់ម៉ាស៊ីន៖** បាញ់សម្លាប់ Pod ភ្លាមៗ (`kill -9`)។ ផ្ទៀងផ្ទាត់ថាក្នុងរង្វង់ ១៥ ដល់ ៣០ វិនាទី Prometheus កត់ត្រា `up == 0` និងបាញ់ Alert `InstanceDown` ភ្លាម។
+3. **ការទប់ស្កាត់ Cardinality Explosion៖** ធានាថាមិនមានការដាក់ទិន្នន័យចៃដន្យ (ដូចជា UUIDs ឬ Email) ចូលទៅក្នុង Label Names ឡើយ ដើម្បីការពារកុំឱ្យអស់ RAM របស់ Prometheus Server។
+
+## Why
+
+ការតាមដានប្រព័ន្ធ (Monitoring) គឺជាការប្រាស្រ័យទាក់ទងរវាងអ្នកមើលការខុសត្រូវ និងអ្នកដែលត្រូវគេតាមដាន៖
+- **Pull ផ្តល់អំណាចដល់អ្នកតាមដាន៖** ប្រព័ន្ធ Monitoring ជាអ្នកសម្រេចចិត្តថាតើខ្លួនអាចទទួលទិន្នន័យបានកម្រិតណា ការពារខ្លួនឯងកុំឱ្យស្ទះ និងដឹងភ្លាមៗនៅពេលម៉ាស៊ីនណាមួយស្ងាត់មាត់ឈប់ឆ្លើយតប។
+- **Push ផ្តល់អំណាចដល់អ្នកដែលត្រូវគេតាមដាន៖** កម្មវិធីអាចរាយការណ៍អំពីខ្លួនឯងនៅពេលណាដែលវាចង់ ដែលជួយឱ្យវាអាចរាយការណ៍បានទោះបីជាវាមានអាយុកាលរស់នៅត្រឹមតែពីរបីមិល្លីវិនាទីក៏ដោយ។
+
+ការផ្គូផ្គងទម្រង់ Monitoring ឱ្យត្រូវនឹងវដ្តជីវិតនៃការងារ ធានាថាអ្នកអាចតាមដានប្រព័ន្ធបានពេញលេញដោយមិនបង្កជា Outage ដល់ប្រព័ន្ធតាមដានខ្លួនឯងឡើយ។
+
+## When Not To Use
+
+- **Pull សម្រាប់ Serverless Lambda Functions៖** ការព្យាយាម Scrape ម៉ាស៊ីន Lambda ដែលបង្កកដំណើរការចោលរវាងសំណើ នឹងបណ្តាលឱ្យជួបបញ្ហា Connection Timeout។
+- **Push ដោយផ្ទាល់ចូល Database លើរាល់ Click របស់អ្នកប្រើប្រាស់៖** ការផ្ញើសំណើ HTTP ទៅកាន់ Metrics Database លើរាល់ពេលដែល User ចុចប៊ូតុង នឹងបន្ថែម Latency ដល់ User និងបង្កើតជាចំណុចបរាជ័យដែលមិនចាំបាច់។
+
+## Common Mistakes
+
+- **បញ្ហា High-cardinality Label Explosion៖** ការដាក់ `user_id` ជា Label ក្នុង Prometheus បង្កើតជា Time-series រាប់លានដាច់ដោយឡែកពីគ្នា ដែលនឹងធ្វើឱ្យ Prometheus គាំងដោយសារអស់ RAM (OOM)។
+- **យល់ច្រឡំថាភាពស្ងាត់ស្ងៀមគឺជាសុខភាពល្អក្នុងប្រព័ន្ធ Push៖** ការភ្លេចបង្កើត Deadman Alerts សម្រាប់ប្រព័ន្ធ Push; នៅពេល Agent គាំងស្លាប់ Dashboard បង្ហាញបន្ទាត់ត្រង់រាបស្មើដែលមើលទៅដូចគ្នានឹងប្រព័ន្ធដែលគ្មាន Error សោះ។
+- **កំណត់ Scrape Interval ញឹកញាប់ពេក៖** ការកំណត់ឱ្យ Scrape រៀងរាល់ ១ វិនាទីម្តងលើ ៥០០ Pods នឹងស៊ី CPU របស់ App អស់ ១៥% គ្រាន់តែដើម្បីរៀបចំ Text Metrics។ ត្រូវប្រើចន្លោះពេលស្តង់ដារ ១៥ ឬ ៣០ វិនាទីជានិច្ច។

@@ -1,0 +1,99 @@
+---
+title: "Queues and workers"
+summary: "Run background jobs on workers that retry failures and can safely process the same job twice."
+minutes: 12
+related: [tradeoffs/sync-vs-async, patterns/idempotency, patterns/transactional-outbox]
+updated: "2026-09-30"
+contributors: [Veasna-Pen]
+---
+
+## The problem
+
+You moved the welcome email into a background job. Now you need something to run it: a process that picks up jobs, retries the ones that fail, and doesn't send the same email three times when a worker restarts halfway through.
+
+## The idea
+
+A **queue** holds jobs in order until a worker takes them. A **worker** is a separate process that loops forever: take a job, run it, mark it done.
+
+Three rules keep this reliable:
+
+1. **A job is only removed when it succeeds.** If the worker crashes mid-job, the queue gives the job to another worker. This is called **at-least-once** delivery: every job runs, but some may run **twice**.
+2. **Failed jobs are retried with backoff**, just like network calls: wait a little, then longer.
+3. **Jobs must be safe to run twice** (idempotent). Record that the email was sent, and check before sending again.
+
+Workers run separately from your web server, so you can scale them on their own: more workers when the queue is busy, without touching the API.
+
+## Example
+
+Adding a job with BullMQ, with retries and exponential backoff:
+
+```ts
+import { Queue } from 'bullmq';
+
+const jobs = new Queue('emails', { connection: redis });
+
+await jobs.add(
+  'welcome-email',
+  { userId: user.id },
+  { attempts: 5, backoff: { type: 'exponential', delay: 2000 } } // 2 s, 4 s, 8 s…
+);
+```
+
+The worker, which checks first whether the work was already done:
+
+```ts
+import { Worker } from 'bullmq';
+
+new Worker(
+  'emails',
+  async job => {
+    const user = await db.user.findUnique({ where: { id: job.data.userId } });
+    if (!user || user.welcomeEmailSentAt) return; // already done: running twice is harmless
+
+    await email.sendWelcome(user);
+    await db.user.update({ where: { id: user.id }, data: { welcomeEmailSentAt: new Date() } });
+  },
+  { connection: redis, concurrency: 10 } // up to 10 jobs at once per worker process
+);
+```
+
+If the email provider is down, the job fails, waits 2, 4, 8 seconds and tries again. If the worker restarts after sending but before the job is marked done, the retry sees `welcomeEmailSentAt` and skips the second email.
+
+<Info title="Saving the record and the job together">
+If the database write succeeds but adding the job fails, the job is lost. When that matters, write the job into the database in the same transaction and publish it from there: the transactional outbox pattern.
+</Info>
+
+## Try it
+
+1. Start Redis (`docker run -p 6379:6379 redis:7`) and install your stack's queue library.
+2. Move one slow step from an endpoint into a job with `attempts` and `backoff`.
+3. Run a worker in a second terminal and call the endpoint. Watch the job run.
+4. Make the job throw on its first attempt and succeed on the second. Check that it retried.
+5. Kill the worker in the middle of a job and restart it. Does the job run again, and is that harmless?
+
+## Check yourself
+
+**1. What does at-least-once delivery mean for the code inside a job?**
+
+<Answer>
+The same job can run more than once, for example after a worker crash. The job must be idempotent: check whether the work was already done, or make it harmless to repeat.
+</Answer>
+
+**2. The API is quiet, but the email queue has 50,000 waiting jobs. What do you scale?**
+
+<Answer>
+The workers. They run separately from the API, so you can add worker processes, or raise their concurrency, without adding web servers.
+</Answer>
+
+**3. Why retry jobs with backoff instead of immediately?**
+
+<Answer>
+Most job failures come from another service being briefly down. Retrying at once usually fails again and adds load; waiting longer each time gives the service time to recover.
+</Answer>
+
+## Key takeaways
+
+- A **queue** holds jobs; **workers** take them, run them, and mark them done.
+- Delivery is **at least once**, so every job must be **safe to run twice**.
+- Give jobs **retries with backoff**.
+- Scale **workers separately** from the web servers.

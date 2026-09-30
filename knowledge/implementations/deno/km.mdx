@@ -1,0 +1,185 @@
+---
+title: "Deno"
+question: "តើត្រូវអនុវត្ត Fetch Deadlines, Deno KV Atomic Transactions, និង Background Queues ក្នុង Deno ដោយរបៀបណា?"
+summary: "Deno.serve Deadlines, Deno.kv Atomic Idempotency, Deno Queues សម្រាប់ការងារ Background, និង Rate Limiting ផ្អែកលើ KV ក្នុង TypeScript។"
+tags: [deno, typescript, denokv, queues, implementation]
+related: [patterns/retry, patterns/idempotency, patterns/caching, patterns/rate-limiting]
+order: 16
+updated: "2026-09-12"
+contributors: [veasna]
+translation: draft
+---
+
+ការអនុវត្ត Patterns ជាក់ស្តែងក្នុង Deno 2+ ដោយប្រើប្រាស់ Web APIs និង Primitives ដែលមានស្រាប់។ ផ្តោតលើការកាត់ផ្តាច់ Fetch តាម Deadline, Atomic Idempotency ជាមួយ Deno.kv, ការគ្រប់គ្រង Background Queues, និង Rate Limiting។
+
+## Timeouts first
+
+Deno គាំទ្រស្តង់ដារ Web APIs ពេញលេញ។ ប្រើប្រាស់ `AbortSignal.timeout` ដើម្បីកំណត់រយៈពេលផុតកំណត់លើសំណើ Network៖
+
+```ts
+Deno.serve({ port: 8000 }, async (req: Request) => {
+  const url = new URL(req.url);
+
+  if (url.pathname === "/rates") {
+    try {
+      const res = await fetch("https://api.example.com/rates", {
+        signal: AbortSignal.timeout(2000), // បោះបង់បើហួស ២ វិនាទី
+      });
+
+      if (!res.ok) {
+        return new Response(JSON.stringify({ error: `Upstream HTTP ${res.status}` }), {
+          status: 502,
+          headers: { "content-type": "application/json" },
+        });
+      }
+
+      const data = await res.json();
+      return Response.json(data);
+    } catch (err: any) {
+      if (err.name === "TimeoutError") {
+        return new Response(JSON.stringify({ error: "Rates API ផុតកំណត់ពេល ២ វិនាទី" }), {
+          status: 504,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      return new Response(JSON.stringify({ error: "Internal Server Error" }), { status: 500 });
+    }
+  }
+
+  return new Response("Not Found", { status: 404 });
+});
+```
+
+## Retry with exponential backoff and jitter
+
+អនុគមន៍ Retry សរសេរដោយ TypeScript សុទ្ធដោយមិនបាច់ដំឡើង Package ខាងក្រៅ៖
+
+```ts
+const TRANSIENT_STATUSES = new Set([408, 429, 500, 502, 503, 504]);
+
+export async function fetchWithRetry<T>(
+  url: string,
+  options: RequestInit = {},
+  maxAttempts = 3,
+  baseMs = 150
+): Promise<T> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      const res = await fetch(url, {
+        ...options,
+        signal: AbortSignal.timeout(2500),
+      });
+
+      if (TRANSIENT_STATUSES.has(res.status) && attempt < maxAttempts) {
+        throw new Error(`Transient status ${res.status}`);
+      }
+
+      if (!res.ok) {
+        throw new Error(`HTTP error ${res.status}`);
+      }
+
+      return (await res.json()) as T;
+    } catch (err: any) {
+      if (attempt >= maxAttempts || (err.name !== "TimeoutError" && !err.message.startsWith("Transient"))) {
+        throw err;
+      }
+
+      const delay = Math.random() * Math.min(2000, baseMs * 2 ** (attempt - 1));
+      await new Promise((resolve) => setTimeout(resolve, delay));
+    }
+  }
+}
+```
+
+## Idempotency ជាមួយ `Deno.kv` atomic transactions
+
+ប្រើប្រាស់ ACID Atomic Transactions របស់ Deno KV ដើម្បីគ្រប់គ្រង Idempotency Key៖
+
+```ts
+const kv = await Deno.openKv();
+
+export async function handleOrderCreation(req: Request): Promise<Response> {
+  const key = req.headers.get("Idempotency-Key");
+  if (!key) {
+    return Response.json({ error: "តម្រូវឱ្យមាន Idempotency-Key header" }, { status: 400 });
+  }
+
+  const idempotencyKey = ["idempotency", key];
+  const existing = await kv.get<{ status: number; body: unknown }>(idempotencyKey);
+
+  if (existing.value) {
+    return Response.json(existing.value.body, { status: existing.value.status });
+  }
+
+  // Atomically claim the key
+  const commit = await kv.atomic()
+    .check(existing)
+    .set(idempotencyKey, { status: 202, body: { pending: true } }, { expireIn: 86400000 })
+    .commit();
+
+  if (!commit.ok) {
+    return Response.json({ error: "មានការប្រជែងសំណើក្នុងពេលតែមួយ" }, { status: 409 });
+  }
+
+  const orderId = crypto.randomUUID();
+  const orderData = { orderId, totalCents: 4500, status: "completed" };
+
+  await kv.set(idempotencyKey, { status: 201, body: orderData }, { expireIn: 86400000 });
+
+  return Response.json(orderData, { status: 201 });
+}
+```
+
+## Rate limiting ជាមួយ `Deno.kv`
+
+Sliding window rate limiter ដែលដំណើរការលើ Deno KV៖
+
+```ts
+export async function checkRateLimit(clientId: string, limit = 60, windowMs = 60_000): Promise<boolean> {
+  const now = Date.now();
+  const windowKey = ["ratelimit", clientId, Math.floor(now / windowMs)];
+
+  const res = await kv.get<number>(windowKey);
+  const count = (res.value ?? 0) + 1;
+
+  if (count > limit) {
+    return false;
+  }
+
+  await kv.atomic()
+    .check(res)
+    .set(windowKey, count, { expireIn: windowMs * 2 })
+    .commit();
+
+  return true;
+}
+```
+
+## Background jobs ជាមួយ Deno Queues
+
+Deno KV មាន Message Queue ស្រាប់ដែលធានាថាមិនបាត់បង់ទិន្នន័យ៖
+
+```ts
+interface EmailNotification {
+  type: "ORDER_RECEIPT";
+  orderId: string;
+  email: string;
+}
+
+// បញ្ជូនចូល Queue:
+await kv.enqueue({
+  type: "ORDER_RECEIPT",
+  orderId: "order_123",
+  email: "buyer@example.com",
+} satisfies EmailNotification, {
+  delay: 1000,
+});
+
+// Worker ទទួលការងារ:
+kv.listenQueue(async (msg: unknown) => {
+  const notification = msg as EmailNotification;
+  if (notification.type === "ORDER_RECEIPT") {
+    console.log(`កំពុងផ្ញើវិក្កយបត្រសម្រាប់ Order ${notification.orderId}`);
+  }
+});
+```

@@ -1,0 +1,977 @@
+{
+  "eyebrow": "ផែនទីផ្លូវ",
+  "heading": "តើខ្ញុំគួរចាប់ផ្តើមពីណា?",
+  "lead": "ជ្រើសរើសតួនាទីដែលអ្នកចង់ក្លាយជា។ ផែនទីផ្លូវនីមួយៗមានប្រាំមួយដំណាក់កាលតាមលំដាប់៖ អ្វីដែលត្រូវរៀន ការសម្រេចចិត្តដំបូងដែលអ្នកនឹងជួប និងគម្រោងមួយដែលបញ្ជាក់ថាអ្នករួចរាល់ដើម្បីបន្តទៅមុខ។",
+  "principle": "ផែនទីផ្លូវគឺជាលំដាប់សម្រាប់ចាប់ផ្តើម មិនមែនជាបញ្ជីដែលត្រូវតែបញ្ចប់ទេ។ បង្កើតអ្វីមួយនៅគ្រប់ដំណាក់កាល — គម្រោងមួយដែលបានដាក់ឱ្យប្រើពិតប្រាកដ បង្រៀនអ្នកច្រើនជាងមេរៀនដប់។",
+  "stageCount_other": "{{count}} ដំណាក់កាល",
+  "open": "មើលផែនទីផ្លូវ",
+  "allRoadmaps": "ផែនទីផ្លូវទាំងអស់",
+  "outcome": "កន្លែងដែលអ្នកនឹងទៅដល់",
+  "start": "ចាប់ផ្តើមនៅទីនេះ",
+  "stageLabel": "ដំណាក់កាល {{number}}",
+  "learn": "ជំនាញដែលត្រូវរៀន",
+  "decide": "ការសម្រេចចិត្តដំបូងរបស់អ្នក",
+  "build": "បង្កើតដើម្បីបញ្ជាក់",
+  "related": "គិតឱ្យល្អិតល្អន់",
+  "showDetails": "ការសម្រេចចិត្ត និងគម្រោង",
+  "hideDetails": "លាក់ព័ត៌មានលម្អិត",
+  "markDone": "សម្គាល់ដំណាក់កាលថារួចរាល់",
+  "markNotDone": "សម្គាល់ដំណាក់កាលថាមិនទាន់រួច",
+  "otherRoadmaps": "ផែនទីផ្លូវផ្សេងទៀត",
+  "home": {
+    "eyebrow": "ទើបតែចាប់ផ្តើមផ្នែកវិស្វកម្ម?",
+    "title": "ចាប់ផ្តើមជាមួយផែនទីផ្លូវ",
+    "body": "ផ្លូវអាជីពប្រាំមួយសម្រាប់អ្នកចាប់ផ្តើម ដែលនីមួយៗមានប្រាំមួយដំណាក់កាល ភ្ជាប់ទៅនឹងការសម្រេចចិត្តដែលអ្នកនឹងជួបតាមផ្លូវ។",
+    "cta": "មើលផែនទីផ្លូវទាំងអស់"
+  },
+  "roles": {
+    "web-developer": {
+      "label": "Web Developer",
+      "summary": "បង្កើត និងដាក់ឱ្យប្រើគេហទំព័រពេញលេញ ចាប់ពីទំព័រក្នុងកម្មវិធីរុករក រហូតដល់ server នៅពីក្រោយ។",
+      "outcome": "កម្មវិធី full-stack ផ្ទាល់ខ្លួនមួយ ដែលដំណើរការលើ domain ពិត ហើយអ្នកអាចពន្យល់វាពីដើមដល់ចប់។",
+      "pace": "៩–១២ ខែ ប្រហែល ១០ ម៉ោងក្នុងមួយសប្តាហ៍",
+      "stages": {
+        "how-the-web-works": {
+          "title": "របៀបដែល web ដំណើរការ",
+          "goal": "យល់ពីអ្វីដែលកើតឡើងចាប់ពីការវាយ URL រហូតដល់ឃើញទំព័រ ដើម្បីកុំឱ្យឧបករណ៍ក្រោយៗមើលទៅដូចវេទមន្ត។",
+          "skills": [
+            {
+              "name": "DNS, TCP និង HTTP",
+              "note": "របៀបដែល request រក server ឃើញ ហើយទទួលបានចម្លើយ"
+            },
+            {
+              "name": "Status codes និង headers",
+              "note": "អ្វីដែល 200, 301, 404 និង 500 ប្រាប់អ្នក"
+            },
+            {
+              "name": "Browser DevTools",
+              "note": "Network tab បង្ហាញរាល់ request ដែលទំព័រមួយធ្វើ"
+            },
+            {
+              "name": "Command line និង Git",
+              "note": "រុករកឯកសារ និងរក្សាប្រវត្តិការងាររបស់អ្នក"
+            }
+          ],
+          "decision": "តើខ្ញុំត្រូវការ framework ឥឡូវនេះទេ?",
+          "advice": "ទេ។ Framework លាក់ផ្នែកដែលអ្នកកំពុងរៀននៅទីនេះ។ ជ្រើសរើសវានៅពេលអ្នកអាចប្រាប់បានថាវាជួយសង្គ្រោះអ្នកពីអ្វី។",
+          "project": "បើក Network tab លើគេហទំព័រដែលអ្នកប្រើរាល់ថ្ងៃ ហើយពន្យល់ request នីមួយៗដែលវាធ្វើពេល load។"
+        },
+        "html-css": {
+          "title": "HTML និង CSS",
+          "goal": "រៀបចំខ្លឹមសារឱ្យមានអត្ថន័យ និងរៀបប្លង់ឱ្យដំណើរការលើគ្រប់អេក្រង់។",
+          "skills": [
+            {
+              "name": "Semantic HTML",
+              "note": "Headings, lists និង forms ដែលមានអត្ថន័យ"
+            },
+            {
+              "name": "Flexbox និង Grid",
+              "note": "រៀបប្លង់ជួរដេក ជួរឈរ និងទំព័រទាំងមូល"
+            },
+            {
+              "name": "Responsive design",
+              "note": "ប្លង់តែមួយដែលដំណើរការពីទូរស័ព្ទដល់កុំព្យូទ័រ"
+            },
+            {
+              "name": "មូលដ្ឋាន accessibility",
+              "note": "Labels, contrast និងការប្រើក្តារចុច"
+            }
+          ],
+          "decision": "Tailwind ឬ CSS ធម្មតាមុន?",
+          "advice": "CSS ធម្មតាមុន រហូតដល់អ្នកអាចអានយល់ថា utility class ធ្វើអ្វី។ បន្ទាប់មកប្រើអ្វីដែលក្រុមរបស់អ្នកប្រើ។",
+          "project": "បង្កើត landing page ពិតមួយឡើងវិញពី screenshot ដែល responsive រហូតដល់ទំហំទូរស័ព្ទ។"
+        },
+        "javascript": {
+          "title": "JavaScript",
+          "goal": "ធ្វើឱ្យទំព័រមានអន្តរកម្ម និងទាក់ទងជាមួយសេវាផ្សេងៗ។",
+          "skills": [
+            {
+              "name": "មូលដ្ឋានភាសា",
+              "note": "Variables, functions, arrays និង objects"
+            },
+            {
+              "name": "DOM និង events",
+              "note": "ផ្លាស់ប្តូរទំព័រនៅពេលអ្នកប្រើធ្វើសកម្មភាព"
+            },
+            {
+              "name": "កូដ async",
+              "note": "fetch, Promises និង async/await"
+            },
+            {
+              "name": "Modules និង npm",
+              "note": "បំបែកកូដជាឯកសារ និងប្រើ packages"
+            }
+          ],
+          "decision": "JavaScript ឬ TypeScript មុន?",
+          "advice": "JavaScript មុន។ ប្តូរទៅ TypeScript នៅពេល bug ប្រភេទ type ធ្វើឱ្យអ្នកខាតពេលមួយរសៀល — អ្នកនឹងដឹងច្បាស់ថាវាមានប្រយោជន៍អ្វី។",
+          "project": "ទំព័រស្វែងរកដែលហៅ API សាធារណៈ ហើយដោះស្រាយស្ថានភាព loading, គ្មានទិន្នន័យ និង error។"
+        },
+        "frontend-framework": {
+          "title": "Frontend framework",
+          "goal": "បង្កើត interface ធំៗពី components ដោយមាន state និង routing។",
+          "skills": [
+            {
+              "name": "Components និង props",
+              "note": "ផ្នែក interface ដែលអាចប្រើឡើងវិញ"
+            },
+            {
+              "name": "State និង effects",
+              "note": "ទិន្នន័យដែលផ្លាស់ប្តូរ និងអ្វីដែលឆ្លើយតបនឹងវា"
+            },
+            {
+              "name": "Routing",
+              "note": "ទំព័រច្រើនក្នុងកម្មវិធីតែមួយ ជាមួយ URL ពិត"
+            },
+            {
+              "name": "Forms និង validation",
+              "note": "ប្រមូលទិន្នន័យ និងពន្យល់ថាអ្វីខុស"
+            }
+          ],
+          "decision": "React, Vue ឬ Svelte?",
+          "advice": "ជ្រើសរើសមួយដែលមានការផ្សាយការងារច្រើនបំផុតនៅកន្លែងដែលអ្នកចង់ធ្វើការ។ Components, state និង routing អាចយកទៅប្រើបានទាំងបី។",
+          "project": "កម្មវិធីច្រើនទំព័រដែលមាន routing, form មួយ និងទិន្នន័យពី API។"
+        },
+        "backend-and-data": {
+          "title": "Backend និង database",
+          "goal": "រក្សាទុកទិន្នន័យ បង្ហាញវាតាម API និងដឹងថានរណាកំពុងស្នើសុំ។",
+          "skills": [
+            {
+              "name": "ភាសា server មួយ",
+              "note": "Node.js ជាជំហានខ្លីបំផុតពី JavaScript"
+            },
+            {
+              "name": "REST APIs និង JSON",
+              "note": "Endpoints ដែលកម្មវិធីផ្សេងអាចហៅបាន"
+            },
+            {
+              "name": "SQL និង relations",
+              "note": "Tables, joins និងការរក្សាទិន្នន័យឱ្យស៊ីសង្វាក់"
+            },
+            {
+              "name": "Authentication និង CORS",
+              "note": "ដឹងថានរណាកំពុងហៅ និងពីកន្លែងណា"
+            }
+          ],
+          "decision": "Session cookies ឬ JWT?",
+          "advice": "សម្រាប់ web app តែមួយ session cookies សាមញ្ញ និងសុវត្ថិភាពជាង។ ប្រើ JWT នៅពេលសេវាច្រើនត្រូវផ្ទៀងផ្ទាត់អ្នកប្រើតែមួយ។",
+          "project": "API ដែលមាន sign-up, login និង create/read/update/delete ដោយប្រើ PostgreSQL។"
+        },
+        "ship-it": {
+          "title": "ដាក់ឱ្យប្រើ និងថែទាំ",
+          "goal": "ដាក់កម្មវិធីរបស់អ្នកលើអ៊ីនធឺណិត និងរក្សាឱ្យវាដំណើរការ។",
+          "skills": [
+            {
+              "name": "Hosting និង HTTPS",
+              "note": "Domains, certificates និងកន្លែងដែលកម្មវិធីដំណើរការ"
+            },
+            {
+              "name": "Environment variables",
+              "note": "រក្សា secrets និងការកំណត់ចេញពីកូដ"
+            },
+            {
+              "name": "Logs និង health checks",
+              "note": "ដឹងពេលមានអ្វីខូច និងមូលហេតុ"
+            },
+            {
+              "name": "Continuous integration",
+              "note": "Tests ដំណើរការដោយស្វ័យប្រវត្តិរាល់ពេល push"
+            }
+          ],
+          "decision": "Platform (PaaS) ឬ server ផ្ទាល់ខ្លួន?",
+          "advice": "Platform មុន។ ការដំណើរការ server ផ្ទាល់ខ្លួនបង្រៀនច្រើន ប៉ុន្តែវាជាគម្រោងទីពីរ — ដាក់គម្រោងទីមួយឱ្យប្រើសិន។",
+          "project": "ដាក់កម្មវិធី full-stack របស់អ្នកលើ domain ផ្ទាល់ខ្លួន ជាមួយ CI ដែលដំណើរការរាល់ពេល push។"
+        }
+      }
+    },
+    "frontend-developer": {
+      "label": "Frontend Developer",
+      "summary": "បង្កើត interface លឿន ងាយស្រួលប្រើសម្រាប់គ្រប់គ្នា ដែលមនុស្សចូលចិត្តប្រើ។",
+      "outcome": "Portfolio នៃ interfaces ដែលលឿន accessible និងមាន tests បង្កើតដោយ framework ទំនើប។",
+      "pace": "៦–៩ ខែ ប្រហែល ១០ ម៉ោងក្នុងមួយសប្តាហ៍",
+      "stages": {
+        "foundations": {
+          "title": "HTML, CSS និង accessibility",
+          "goal": "ស្ទាត់ជំនាញ platform ដែល framework គ្រប់មួយ compile ចុះមក។",
+          "skills": [
+            {
+              "name": "Semantic HTML",
+              "note": "រចនាសម្ព័ន្ធដែល browsers និង screen readers យល់"
+            },
+            {
+              "name": "Flexbox និង Grid",
+              "note": "ប្លង់ responsive ដោយគ្មាន hacks"
+            },
+            {
+              "name": "CSS custom properties",
+              "note": "Themes, dark mode និង design tokens"
+            },
+            {
+              "name": "ក្តារចុច និង screen readers",
+              "note": "សាកល្បងថាគ្រប់គ្នាអាចប្រើទំព័របាន"
+            }
+          ],
+          "decision": "ប្រើវិធី CSS មួយណា?",
+          "advice": "រៀន CSS ធម្មតាឱ្យស្ទាត់ បន្ទាប់មកប្រើជម្រើសរបស់ក្រុម។ CSS Modules, Tailwind និង CSS-in-JS សុទ្ធតែល្អនៅពេលមូលដ្ឋានរឹងមាំ។",
+          "project": "ទំព័រ responsive បី ដែលឆ្លងកាត់ការសាកល្បងដោយប្រើតែក្តារចុច និង screen reader។"
+        },
+        "javascript-deep": {
+          "title": "JavaScript ឱ្យស៊ីជម្រៅ",
+          "goal": "យល់ភាសានេះគ្រប់គ្រាន់ដើម្បី debug អ្វីដែល framework ធ្វើ។",
+          "skills": [
+            {
+              "name": "Scope និង closures",
+              "note": "ហេតុអ្វី function ចងចាំ variables របស់វា"
+            },
+            {
+              "name": "Event loop",
+              "note": "របៀបដែល Promises និង async/await ដំណើរការពិតៗ"
+            },
+            {
+              "name": "Modules និង bundlers",
+              "note": "របៀបដែល Vite បំប្លែងឯកសារទៅជាកម្មវិធីលឿន"
+            },
+            {
+              "name": "មូលដ្ឋាន TypeScript",
+              "note": "ចាប់កំហុសមុន browser ចាប់បាន"
+            }
+          ],
+          "decision": "ពេលណាគួរបន្ថែម TypeScript?",
+          "advice": "ភ្លាមៗនៅពេលគម្រោងមានឯកសារច្រើនជាងពីរបី។ ជំនួយពី editor តែម្យ៉ាងក៏សមនឹងការខិតខំហើយ។",
+          "project": "កម្មវិធី TypeScript តូចមួយដោយមិនប្រើ framework ដូចជា to-do list ដែលមាន filters និង local storage។"
+        },
+        "framework": {
+          "title": "Framework មួយ៖ React",
+          "goal": "បង្កើត interface ពី components និងគ្រប់គ្រង state ឱ្យអាចទស្សន៍ទាយបាន។",
+          "skills": [
+            {
+              "name": "Components និង JSX",
+              "note": "ពិពណ៌នា interface ជា function នៃទិន្នន័យ"
+            },
+            {
+              "name": "Hooks",
+              "note": "State, effects និង refs ក្នុង components"
+            },
+            {
+              "name": "Routing",
+              "note": "ទំព័រ តំណភ្ជាប់ និង state រក្សាទុកក្នុង URL"
+            },
+            {
+              "name": "Forms",
+              "note": "Controlled inputs និង validation"
+            }
+          ],
+          "decision": "State គួរនៅកន្លែងណា?",
+          "advice": "នៅក្នុង component ដែលប្រើវា។ លើកវាឡើងលើនៅពេល siblings ពីរត្រូវការវា បន្ថែម global store តែនៅពេលផ្នែកឆ្ងាយគ្នានៃកម្មវិធីត្រូវការវា។",
+          "project": "Dashboard មួយដែលមាន routes, filters រក្សាទុកក្នុង URL និង form ដែល validate។"
+        },
+        "data-fetching": {
+          "title": "ការទាក់ទងជាមួយ APIs",
+          "goal": "Load, cache និង update ទិន្នន័យពី server ដោយមិនធ្វើឱ្យ interface ខូច។",
+          "skills": [
+            {
+              "name": "ស្ថានភាព loading និង error",
+              "note": "កុំទុកឱ្យអ្នកប្រើមើលអេក្រង់ទទេ"
+            },
+            {
+              "name": "Caching និង refetching",
+              "note": "TanStack Query ឬ data libraries ស្រដៀងគ្នា"
+            },
+            {
+              "name": "Pagination",
+              "note": "ទំព័រ cursors និង infinite scroll"
+            },
+            {
+              "name": "CORS និង auth headers",
+              "note": "ហេតុអ្វី browser រារាំង requests មួយចំនួន"
+            }
+          ],
+          "decision": "Fetch ក្នុង effects ឬប្រើ data library?",
+          "advice": "សរសេរដោយដៃម្តងដើម្បីដឹងពីការលំបាក បន្ទាប់មកប្រើ data library។ វាដោះស្រាយ caching, retries និង race conditions ដែលអ្នកនឹងត្រូវសរសេរឡើងវិញ។",
+          "project": "បញ្ជីមួយដែលមាន pagination និងការស្វែងរក ដែល cache លទ្ធផល និងស្តារឡើងវិញពី request ដែលបរាជ័យ។"
+        },
+        "rendering-performance": {
+          "title": "Rendering និង performance",
+          "goal": "ធ្វើឱ្យទំព័រ load លឿន និងរលូននៅលើទូរស័ព្ទយឺត។",
+          "skills": [
+            {
+              "name": "CSR និង SSR",
+              "note": "កន្លែងដែល HTML ត្រូវបានបង្កើត និងហេតុអ្វីវាសំខាន់"
+            },
+            {
+              "name": "Core Web Vitals",
+              "note": "វាស់ការ load អន្តរកម្ម និង layout shift"
+            },
+            {
+              "name": "Code splitting",
+              "note": "ផ្ញើតែកូដដែលទំព័រត្រូវការ"
+            },
+            {
+              "name": "រូបភាព និង fonts",
+              "note": "ជាធម្មតាជាផ្នែកធ្ងន់បំផុតនៃទំព័រ"
+            }
+          ],
+          "decision": "តើខ្ញុំត្រូវការ server-side rendering ទេ?",
+          "advice": "តែនៅពេល load ដំបូង ឬចំណាត់ថ្នាក់ស្វែងរកមានសារៈសំខាន់សម្រាប់ទំព័រនោះ។ Dashboard ដែលនៅក្រោយ login ជាធម្មតាមិនត្រូវការវាទេ។",
+          "project": "យកកម្មវិធីដែលមានស្រាប់មួយ វាស់វា ហើយកាត់បន្ថយ largest contentful paint របស់វាពាក់កណ្តាល។"
+        },
+        "testing-shipping": {
+          "title": "Testing និងការដាក់ឱ្យប្រើ",
+          "goal": "ផ្លាស់ប្តូរកូដដោយទំនុកចិត្ត និងចេញផ្សាយវាដោយសុវត្ថិភាព។",
+          "skills": [
+            {
+              "name": "Unit tests",
+              "note": "Vitest ឬ Jest សម្រាប់តក្កវិជ្ជា និង helpers"
+            },
+            {
+              "name": "Component tests",
+              "note": "Testing Library តាមរបៀបដែលអ្នកប្រើឃើញ"
+            },
+            {
+              "name": "End-to-end tests",
+              "note": "Playwright បញ្ជា browser ពិត"
+            },
+            {
+              "name": "CI និង feature flags",
+              "note": "Merge ញឹកញាប់ ចេញផ្សាយពេលរួចរាល់"
+            }
+          ],
+          "decision": "តើខ្ញុំគួរ test អ្វីមុន?",
+          "advice": "ដំណើរការដែលរកប្រាក់ ឬអាចបាត់ទិន្នន័យ៖ sign-in, checkout, ការរក្សាទុក។ End-to-end test មួយនៅទីនោះល្អជាង snapshot tests មួយរយ។",
+          "project": "បន្ថែម CI ជាមួយ tests ទៅ dashboard របស់អ្នក ហើយចេញផ្សាយមុខងារមួយនៅក្រោយ flag។"
+        }
+      }
+    },
+    "backend-developer": {
+      "label": "Backend Developer",
+      "summary": "រចនា APIs ទិន្នន័យ និងសេវាដែលកម្មវិធីនានាដំណើរការលើ។",
+      "outcome": "API ដែលរួចរាល់សម្រាប់ production ជាមួយ database, authentication, caching និង monitoring។",
+      "pace": "៩–១២ ខែ ប្រហែល ១០ ម៉ោងក្នុងមួយសប្តាហ៍",
+      "stages": {
+        "language": {
+          "title": "ភាសាមួយ ឱ្យស៊ីជម្រៅ",
+          "goal": "ស្ទាត់ភាសា server មួយ និងឧបករណ៍ជុំវិញវា។",
+          "skills": [
+            {
+              "name": "ភាសាមួយ",
+              "note": "Node.js, Python, Go ឬ Java"
+            },
+            {
+              "name": "Packages និង testing",
+              "note": "ឧបករណ៍ដែលគម្រោងនីមួយៗក្នុងភាសានោះប្រើ"
+            },
+            {
+              "name": "Git និង command line",
+              "note": "ឧបករណ៍ប្រចាំថ្ងៃក្នុងគ្រប់ក្រុម"
+            },
+            {
+              "name": "មូលដ្ឋាន Linux",
+              "note": "Files, processes និង permissions លើ servers"
+            }
+          ],
+          "decision": "តើខ្ញុំគួររៀនភាសាណា?",
+          "advice": "ភាសាដែលក្រុមហ៊ុនដែលអ្នកចង់ធ្វើការជាមួយប្រើច្រើនបំផុត។ គោលគំនិតអាចយកទៅប្រើបាន ការប្តូរពេលក្រោយចំណាយពេលប៉ុន្មានសប្តាហ៍ មិនមែនប៉ុន្មានឆ្នាំទេ។",
+          "project": "Command-line tool ដែលអានឯកសារ បំប្លែងវា និងមាន tests។"
+        },
+        "http-apis": {
+          "title": "HTTP និង APIs",
+          "goal": "រចនា APIs ដែលអាចទស្សន៍ទាយបានសម្រាប់អ្នកដែលហៅវា។",
+          "skills": [
+            {
+              "name": "ការរចនា REST",
+              "note": "Resources, status codes និង errors ដែលស៊ីសង្វាក់"
+            },
+            {
+              "name": "Input validation",
+              "note": "កុំទុកចិត្តអ្វីដែល client ផ្ញើមក"
+            },
+            {
+              "name": "Idempotency",
+              "note": "ធ្វើឱ្យ retries មានសុវត្ថិភាពសម្រាប់អ្នកហៅ"
+            },
+            {
+              "name": "Rate limiting និងឯកសារ",
+              "note": "ការពារ API និងពិពណ៌នាវាដោយ OpenAPI"
+            }
+          ],
+          "decision": "REST ឬ GraphQL?",
+          "advice": "REST លុះត្រាតែ clients ច្រើនខុសៗគ្នាត្រូវការទិន្នន័យដូចគ្នាក្នុងទម្រង់ខុសគ្នាខ្លាំង។ វាងាយស្រួល cache, ការពារ និង debug ជាង។",
+          "project": "REST API ដែលមានឯកសារ សម្រាប់ domain តូចមួយ (បណ្ណាល័យ ហាង) ជាមួយ validation និង errors ដែលស៊ីសង្វាក់គ្នា។"
+        },
+        "databases": {
+          "title": "Databases",
+          "goal": "រៀបចំគំរូទិន្នន័យឱ្យត្រឹមត្រូវ និង query វាដោយគ្មានការភ្ញាក់ផ្អើល។",
+          "skills": [
+            {
+              "name": "SQL",
+              "note": "Joins, aggregates និង transactions"
+            },
+            {
+              "name": "Schema និង migrations",
+              "note": "ផ្លាស់ប្តូរ database ដោយសុវត្ថិភាពតាមពេលវេលា"
+            },
+            {
+              "name": "Indexes និង query plans",
+              "note": "ស្វែងរកមូលហេតុដែល query យឺត"
+            },
+            {
+              "name": "ORMs",
+              "note": "ប្រើវាដោយមិនលាក់ SQL ដែលវាដំណើរការ"
+            }
+          ],
+          "decision": "SQL ឬ NoSQL?",
+          "advice": "PostgreSQL ជាលំនាំដើម។ ជ្រើសរើសអ្វីផ្សេងនៅពេលអ្នកអាចប្រាប់ឈ្មោះ access pattern ដែលវាបម្រើបានល្អជាង។",
+          "project": "ប្រើ PostgreSQL សម្រាប់ API របស់អ្នក ជាមួយ migrations និង index មួយដែលអ្នកបញ្ជាក់ហេតុផលដោយ EXPLAIN។"
+        },
+        "auth-security": {
+          "title": "Authentication និងសុវត្ថិភាព",
+          "goal": "ដឹងថានរណាកំពុងហៅ និងរក្សាទិន្នន័យរបស់ពួកគេឱ្យមានសុវត្ថិភាព។",
+          "skills": [
+            {
+              "name": "Password hashing",
+              "note": "bcrypt ឬ Argon2 កុំរក្សាទុកជាអក្សរធម្មតា"
+            },
+            {
+              "name": "Sessions, JWT និង OAuth",
+              "note": "វិធីចងចាំថានរណាបាន sign in"
+            },
+            {
+              "name": "OWASP Top 10",
+              "note": "វិធីទូទៅបំផុតដែលកម្មវិធីត្រូវបានវាយប្រហារ"
+            },
+            {
+              "name": "ការគ្រប់គ្រង secrets",
+              "note": "Keys និង passwords ចេញពី repository"
+            }
+          ],
+          "decision": "បង្កើត auth ដោយខ្លួនឯង ឬប្រើ provider?",
+          "advice": "បង្កើតវាម្តងដើម្បីរៀន បន្ទាប់មកប្រើ library ឬ provider ដែលបានបញ្ជាក់ក្នុង production។ Bug ផ្នែក auth ថ្លៃ ហើយស្ងាត់។",
+          "project": "បន្ថែម sign-up, login, roles និង password reset ទៅ API របស់អ្នក។"
+        },
+        "caching-async": {
+          "title": "Caching និងការងារនៅផ្ទៃខាងក្រោយ",
+          "goal": "រក្សា responses ឱ្យលឿន ហើយផ្លាស់ការងារយឺតចេញពី request។",
+          "skills": [
+            {
+              "name": "Caching ជាមួយ Redis",
+              "note": "បម្រើការអានដដែលៗដោយមិនចាំបាច់ database"
+            },
+            {
+              "name": "Job queues",
+              "note": "Workers ដោះស្រាយការងារយឺតដូចជាអ៊ីមែល"
+            },
+            {
+              "name": "Retries ជាមួយ backoff",
+              "note": "ស្តារពីការបរាជ័យដោយមិនបន្ថែមបន្ទុក"
+            },
+            {
+              "name": "Message brokers",
+              "note": "ពេលណា Kafka ឬ RabbitMQ សមនឹងប្រើ"
+            }
+          ],
+          "decision": "តើខ្ញុំត្រូវការ Redis ឬ Kafka ឥឡូវនេះទេ?",
+          "advice": "ប្រហែលជាមិនទាន់ទេ។ វាស់មុន បន្ថែម cache នៅពេល query ត្រូវបានបញ្ជាក់ថាយឺត និង broker នៅពេល queue ដែលប្រើ database មិនអាចតាមទាន់។",
+          "project": "ផ្ញើអ៊ីមែលពី background worker ហើយ cache endpoint យឺតមួយ — ជាមួយតួលេខមុន និងក្រោយ។"
+        },
+        "production": {
+          "title": "ដំណើរការក្នុង production",
+          "goal": "Deploy, តាមដាន និងពង្រីកសេវាដែលអ្នកទទួលខុសត្រូវ។",
+          "skills": [
+            {
+              "name": "Docker និង deployment",
+              "note": "ដំណើរការ build ដូចគ្នានៅគ្រប់ទីកន្លែង"
+            },
+            {
+              "name": "Logs, metrics និង alerts",
+              "note": "មើលឃើញអ្វីដែលសេវាកំពុងធ្វើ"
+            },
+            {
+              "name": "Pools និង graceful shutdown",
+              "note": "កុំបាត់ requests ពេល deploy"
+            },
+            {
+              "name": "Scaling out",
+              "note": "Instances បន្ថែមនៅពេលមួយមិនគ្រប់គ្រាន់"
+            }
+          ],
+          "decision": "Monolith ឬ microservices?",
+          "advice": "Monolith។ បំបែកសេវាចេញនៅពេលក្រុម ឬតម្រូវការពង្រីកបង្ខំ មិនមែនមុននោះទេ។",
+          "project": "Deploy API របស់អ្នកជាមួយ health check, dashboard និង alert មួយដែលនឹងដាស់អ្នកដោយហេតុផលត្រឹមត្រូវ។"
+        }
+      }
+    },
+    "mobile-developer": {
+      "label": "Mobile Developer",
+      "summary": "បង្កើតកម្មវិធីសម្រាប់ Android និង iOS ដែលមានអារម្មណ៍ស៊ាំនៅលើទូរស័ព្ទ។",
+      "outcome": "កម្មវិធីមួយដែលបានផ្សព្វផ្សាយលើ store ជាមួយការគាំទ្រ offline និង push notifications។",
+      "pace": "៨–១២ ខែ ប្រហែល ១០ ម៉ោងក្នុងមួយសប្តាហ៍",
+      "stages": {
+        "programming-basics": {
+          "title": "មូលដ្ឋានគ្រឹះនៃការសរសេរកម្មវិធី",
+          "goal": "រៀនសរសេរកូដ មុនរៀនបង្កើតកម្មវិធី។",
+          "skills": [
+            {
+              "name": "ភាសាមួយ",
+              "note": "Dart, Kotlin, Swift ឬ JavaScript"
+            },
+            {
+              "name": "Types និង classes",
+              "note": "រៀបចំគំរូទិន្នន័យដែលកម្មវិធីរបស់អ្នកប្រើ"
+            },
+            {
+              "name": "កូដ asynchronous",
+              "note": "រង់ចាំបណ្តាញដោយមិនគាំង"
+            },
+            {
+              "name": "មូលដ្ឋាន Git",
+              "note": "រក្សាទុក និងចែករំលែកការងាររបស់អ្នក"
+            }
+          ],
+          "decision": "ភាសាណាមុន?",
+          "advice": "បើអាច ជ្រើសរើសបន្ទាប់ពីការសម្រេចចិត្តនៃដំណាក់កាលបន្ទាប់៖ Dart សម្រាប់ Flutter, Kotlin សម្រាប់ Android, Swift សម្រាប់ iOS, JavaScript សម្រាប់ React Native។",
+          "project": "កម្មវិធី console តូចមួយ ដូចជាកម្រងសំណួរ ឬកម្មវិធីតាមដានថវិកា ដែលមាន tests។"
+        },
+        "choose-approach": {
+          "title": "Native ឬ cross-platform",
+          "goal": "ជ្រើសរើសវិធីសាស្ត្រដែលសមនឹងកម្មវិធីដែលអ្នកចង់បង្កើត។",
+          "skills": [
+            {
+              "name": "Native",
+              "note": "Kotlin ជាមួយ Jetpack Compose, Swift ជាមួយ SwiftUI"
+            },
+            {
+              "name": "Cross-platform",
+              "note": "Flutter ឬ React Native, codebase តែមួយ"
+            },
+            {
+              "name": "Emulators និងឧបករណ៍",
+              "note": "ដំណើរការកម្មវិធីនៅកន្លែងដែលអ្នកប្រើនឹងប្រើ"
+            },
+            {
+              "name": "Build និង sign",
+              "note": "របៀបដែលកម្មវិធីក្លាយជាឯកសារដែលអាចដំឡើងបាន"
+            }
+          ],
+          "decision": "Native ឬ cross-platform?",
+          "advice": "Cross-platform បើអ្នកចង់បាន store ទាំងពីរដោយ codebase តែមួយ។ Native បើអ្នកផ្តោតលើ platform តែមួយ ឬត្រូវការមុខងារឧបករណ៍ស៊ីជម្រៅ។",
+          "project": "ដំណើរការកម្មវិធី hello-world លើទូរស័ព្ទពិត មិនមែនតែលើ emulator ទេ។"
+        },
+        "screens": {
+          "title": "បង្កើតអេក្រង់",
+          "goal": "រៀបប្លង់អេក្រង់ដែលធ្វើតាមទម្លាប់របស់ platform នីមួយៗ។",
+          "skills": [
+            {
+              "name": "Layouts និង lists",
+              "note": "ខ្លឹមសារ scroll ដែលនៅតែរលូន"
+            },
+            {
+              "name": "Navigation",
+              "note": "ការផ្លាស់ទីរវាងអេក្រង់ និងត្រឡប់ក្រោយ"
+            },
+            {
+              "name": "គោលការណ៍ platform",
+              "note": "Material Design និង HIG របស់ Apple"
+            },
+            {
+              "name": "ទំហំអេក្រង់",
+              "note": "ទូរស័ព្ទតូច ទូរស័ព្ទធំ និង tablets"
+            }
+          ],
+          "decision": "រចនាតែមួយសម្រាប់ platform ទាំងពីរ ឬរូបរាង native?",
+          "advice": "ម៉ាកយីហោរួម ឥរិយាបថ native៖ រក្សាពណ៌ និងអក្សររបស់អ្នក ប៉ុន្តែឱ្យការត្រឡប់ក្រោយ និង gestures មានអារម្មណ៍ដូច platform។",
+          "project": "កម្មវិធីបីអេក្រង់ (បញ្ជី ព័ត៌មានលម្អិត ការកំណត់) ដែលមាន navigation។"
+        },
+        "state-data": {
+          "title": "State និងទិន្នន័យ",
+          "goal": "Load ទិន្នន័យពីបណ្តាញ និងរក្សាកម្មវិធីឱ្យប្រើបានពេល offline។",
+          "skills": [
+            {
+              "name": "State management",
+              "note": "រក្សាអេក្រង់ឱ្យស្របនឹងទិន្នន័យ"
+            },
+            {
+              "name": "HTTP និង JSON",
+              "note": "ទាក់ទងជាមួយ backend API របស់អ្នក"
+            },
+            {
+              "name": "Local storage",
+              "note": "SQLite និង key-value stores លើឧបករណ៍"
+            },
+            {
+              "name": "Offline sync",
+              "note": "តម្រង់ការផ្លាស់ប្តូរ ហើយព្យាយាមម្តងទៀតពេលមានអ៊ីនធឺណិត"
+            }
+          ],
+          "decision": "តើគួរដំណើរការ offline បានប៉ុណ្ណា?",
+          "advice": "យ៉ាងហោចណាស់ការអានអ្វីដែលអ្នកប្រើបានឃើញរួច។ សម្រេចចិត្តឱ្យបានឆាប់ — ការគាំទ្រ offline ពិបាកបន្ថែមពេលក្រោយ។",
+          "project": "ភ្ជាប់កម្មវិធីរបស់អ្នកទៅ API, cache ទិន្នន័យក្នុងឧបករណ៍ និងដោះស្រាយការដាច់បណ្តាញ។"
+        },
+        "device-features": {
+          "title": "មុខងាររបស់ឧបករណ៍",
+          "goal": "ប្រើអ្វីដែលធ្វើឱ្យទូរស័ព្ទពិសេស ដោយមានការអនុញ្ញាតពីអ្នកប្រើ។",
+          "skills": [
+            {
+              "name": "Permissions",
+              "note": "សុំនៅពេលត្រឹមត្រូវ ហើយដោះស្រាយពេលគេបដិសេធ"
+            },
+            {
+              "name": "កាមេរ៉ា និង uploads",
+              "note": "រូបថត និងឯកសារលើបណ្តាញយឺត"
+            },
+            {
+              "name": "ទីតាំង និងផែនទី",
+              "note": "កន្លែងដែលអ្នកប្រើនៅ ប្រើដោយប្រុងប្រយ័ត្ន"
+            },
+            {
+              "name": "Push notifications",
+              "note": "នាំអ្នកប្រើត្រឡប់មកវិញដោយមិនរំខាន"
+            }
+          ],
+          "decision": "ពេលណាគួរសុំការអនុញ្ញាត?",
+          "advice": "នៅពេលមុខងារត្រូវបានប្រើ ដោយមានហេតុផលបង្ហាញលើអេក្រង់។ ការសុំពេលបើកដំបូងតែងតែទទួលបាន «ទេ»។",
+          "project": "បន្ថែមការ upload រូបថតដែលបង្ហាញវឌ្ឍនភាព និង push notification មួយទៅកម្មវិធីរបស់អ្នក។"
+        },
+        "publish": {
+          "title": "Testing និងការផ្សព្វផ្សាយ",
+          "goal": "ចេញផ្សាយដល់អ្នកប្រើពិត និងរក្សាកម្មវិធីឱ្យមានស្ថិរភាព។",
+          "skills": [
+            {
+              "name": "Unit និង UI tests",
+              "note": "ចាប់ regressions មុនអ្នកប្រើជួប"
+            },
+            {
+              "name": "Crash reporting",
+              "note": "ដឹងពី crashes ភ្លាមៗនៅពេលវាកើតឡើង"
+            },
+            {
+              "name": "ការដាក់ស្នើទៅ store",
+              "note": "ការពិនិត្យរបស់ Play Store និង App Store"
+            },
+            {
+              "name": "Staged rollouts",
+              "note": "ចេញផ្សាយដល់អ្នកប្រើមួយចំនួនមុន ជាមួយ flags"
+            }
+          ],
+          "decision": "ពេលណាវារួចរាល់សម្រាប់ផ្សព្វផ្សាយ?",
+          "advice": "នៅពេលដំណើរការស្នូលដំណើរការ ហើយ crashes ត្រូវបានរាយការណ៍មកអ្នក។ ផ្សព្វផ្សាយតូចៗ និងឆាប់ៗ អ្នកប្រើពិតរកឃើញអ្វីដែលអ្នកសាកល្បងរកមិនឃើញ។",
+          "project": "ផ្សព្វផ្សាយកម្មវិធីរបស់អ្នកលើ store យ៉ាងហោចណាស់មួយ ដោយបើក crash reporting។"
+        }
+      }
+    },
+    "ux-ui-designer": {
+      "label": "UX/UI Designer",
+      "summary": "យល់ពីបញ្ហារបស់មនុស្ស និងរចនា interface ដែលដោះស្រាយវា។",
+      "outcome": "Portfolio នៃ case studies ដែលបង្ហាញដំណើរការរបស់អ្នក ពីការស្រាវជ្រាវរហូតដល់ការរចនាដែលបានសាកល្បង។",
+      "pace": "៦–៩ ខែ ប្រហែល ១០ ម៉ោងក្នុងមួយសប្តាហ៍",
+      "stages": {
+        "ux-foundations": {
+          "title": "មូលដ្ឋាន UX",
+          "goal": "ចាប់ផ្តើមពីបញ្ហារបស់អ្នកប្រើ មិនមែនពីអេក្រង់ទេ។",
+          "skills": [
+            {
+              "name": "ការស្រាវជ្រាវអ្នកប្រើ",
+              "note": "ការសម្ភាសន៍ដែលបង្ហាញតម្រូវការពិត"
+            },
+            {
+              "name": "Personas និង jobs to be done",
+              "note": "អ្នកណាដែលអ្នករចនាសម្រាប់ និងអ្វីដែលពួកគេត្រូវធ្វើ"
+            },
+            {
+              "name": "Problem statements",
+              "note": "ដាក់ឈ្មោះបញ្ហាមុនដំណោះស្រាយណាមួយ"
+            },
+            {
+              "name": "Design thinking",
+              "note": "យល់ ស្វែងរក សាកល្បង ធ្វើម្តងទៀត"
+            }
+          ],
+          "decision": "ស្រាវជ្រាវមុន ឬគូរមុន?",
+          "advice": "និយាយជាមួយអ្នកប្រើប្រាំនាក់មុន។ វាចំណាយពេលពីរបីថ្ងៃ ហើយការពារអ្នកពីការខិតខំកែលម្អដំណោះស្រាយសម្រាប់បញ្ហាខុស។",
+          "project": "សម្ភាសន៍មនុស្សប្រាំនាក់អំពីកិច្ចការប្រចាំថ្ងៃមួយ ហើយសរសេរបញ្ហាដែលអ្នកនឹងដោះស្រាយ។"
+        },
+        "flows-wireframes": {
+          "title": "Flows និង wireframes",
+          "goal": "រៀបចំខ្លឹមសារ និងជំហាន មុនសម្រេចថាអ្វីៗមើលទៅយ៉ាងណា។",
+          "skills": [
+            {
+              "name": "Information architecture",
+              "note": "ដាក់ក្រុម និងដាក់ឈ្មោះខ្លឹមសារឱ្យមនុស្សរកឃើញ"
+            },
+            {
+              "name": "User flows",
+              "note": "ជំហានពីគោលដៅរហូតដល់រួចរាល់"
+            },
+            {
+              "name": "Wireframes",
+              "note": "ប្លង់ low-fidelity ដែលងាយផ្លាស់ប្តូរ"
+            },
+            {
+              "name": "Card sorting",
+              "note": "ឱ្យអ្នកប្រើបង្ហាញពីរបៀបដែលពួកគេដាក់ក្រុម"
+            }
+          ],
+          "decision": "Wireframes លើក្រដាស ឬឌីជីថល?",
+          "advice": "ក្រដាសសម្រាប់គំនិតដំបូង — វាថោកក្នុងការបោះចោល។ ប្តូរទៅឌីជីថលនៅពេល flow ច្បាស់លាស់។",
+          "project": "គូរ wireframe សម្រាប់ flow ពេញលេញនៃបញ្ហាពីដំណាក់កាលទីមួយ។"
+        },
+        "visual-design": {
+          "title": "Visual design",
+          "goal": "ធ្វើឱ្យ interface ច្បាស់ ស៊ីសង្វាក់ និងរីករាយក្នុងការប្រើ។",
+          "skills": [
+            {
+              "name": "Typography",
+              "note": "ទំហំ និងកម្រាស់អក្សរដែលបង្កើត hierarchy"
+            },
+            {
+              "name": "ពណ៌ និង contrast",
+              "note": "មានអត្ថន័យ អានងាយ និងស្របនឹងម៉ាក"
+            },
+            {
+              "name": "គម្លាត និង grids",
+              "note": "ចង្វាក់ និងការតម្រឹមដែលស៊ីសង្វាក់"
+            },
+            {
+              "name": "Icons និងរូបភាព",
+              "note": "គាំទ្រខ្លឹមសារ មិនមែនគ្រាន់តែតុបតែង"
+            }
+          ],
+          "decision": "ប្រើ fonts និងពណ៌ប៉ុន្មាន?",
+          "advice": "តិចជាងអ្វីដែលអ្នកគិត៖ typeface មួយ ឬពីរ ពណ៌សង្កត់ធ្ងន់មួយ និងមាត្រដ្ឋានគម្លាតដ៏តឹងរ៉ឹង។",
+          "project": "បំប្លែង wireframes របស់អ្នកទៅជាអេក្រង់ high-fidelity ជាមួយ style guide សាមញ្ញមួយ។"
+        },
+        "prototyping": {
+          "title": "Figma និង prototyping",
+          "goal": "បង្កើតការរចនាដែលមានឥរិយាបថដូចផលិតផលពិត។",
+          "skills": [
+            {
+              "name": "Auto Layout",
+              "note": "Frames ដែលប្តូរទំហំដូច interface ពិត"
+            },
+            {
+              "name": "Components និង variants",
+              "note": "រចនាម្តង ប្រើឡើងវិញគ្រប់កន្លែង"
+            },
+            {
+              "name": "Interactive prototypes",
+              "note": "Flows ដែលអាចចុចបាន ដើម្បីសាកល្បងជាមួយអ្នកប្រើ"
+            },
+            {
+              "name": "ទូរស័ព្ទ និងកុំព្យូទ័រ",
+              "note": "សម្របការរចនាតែមួយសម្រាប់ទំហំទាំងពីរ"
+            }
+          ],
+          "decision": "Prototype គួរមើលទៅពិតប្រាកដប៉ុណ្ណា?",
+          "advice": "ពិតប្រាកដតែប៉ុណ្ណាដែលសំណួរដែលអ្នកកំពុងសាកល្បងត្រូវការ។ សាកល្បង flow ជាប្រអប់ពណ៌ប្រផេះ មុនពណ៌។",
+          "project": "Prototype ដែលអាចចុចបាន សម្រាប់ flow ស្នូលរបស់អ្នក លើទូរស័ព្ទ និងកុំព្យូទ័រ។"
+        },
+        "accessibility-systems": {
+          "title": "Accessibility និង design systems",
+          "goal": "រចនាសម្រាប់គ្រប់គ្នា និងក្នុងទំហំធំ។",
+          "skills": [
+            {
+              "name": "មូលដ្ឋាន WCAG",
+              "note": "សមាមាត្រ contrast និងទំហំអក្សរដែលអានបាន"
+            },
+            {
+              "name": "Focus និងផ្លូវក្តារចុច",
+              "note": "ប្រើបានដោយគ្មាន mouse"
+            },
+            {
+              "name": "Design tokens",
+              "note": "ពណ៌ និងគម្លាតជាតម្លៃដែលមានឈ្មោះ"
+            },
+            {
+              "name": "Component libraries",
+              "note": "ផ្នែករួមសម្រាប់អ្នករចនា និងអ្នកអភិវឌ្ឍ"
+            }
+          ],
+          "decision": "ប្រើ design system ដែលមានស្រាប់ ឬបង្កើតថ្មី?",
+          "advice": "ចាប់ផ្តើមពីអ្វីដែលមានស្រាប់ (Material, Figma UI kit) ហើយកែសម្រួលវា។ បង្កើតផ្ទាល់ខ្លួននៅពេលផលិតផលធំលើសវា។",
+          "project": "បំប្លែងអេក្រង់របស់អ្នកទៅជា design system តូចមួយ ដែលមាន tokens និង components ដែល accessible។"
+        },
+        "testing-handoff": {
+          "title": "Usability testing និង handoff",
+          "goal": "បញ្ជាក់ថាការរចនាដំណើរការ និងជួយអ្នកអភិវឌ្ឍបង្កើតវា។",
+          "skills": [
+            {
+              "name": "Usability testing",
+              "note": "មើលមនុស្សពិតសាកល្បងការរចនារបស់អ្នក"
+            },
+            {
+              "name": "រង្វាស់ភាពជោគជ័យ",
+              "note": "ការបញ្ចប់កិច្ចការ និងរយៈពេល"
+            },
+            {
+              "name": "Developer handoff",
+              "note": "Specs, states និងករណីពិសេស"
+            },
+            {
+              "name": "Case studies",
+              "note": "បង្ហាញដំណើរការរបស់អ្នកក្នុង portfolio"
+            }
+          ],
+          "decision": "តើខ្ញុំដឹងយ៉ាងដូចម្តេចថាការរចនាល្អ?",
+          "advice": "មើលអ្នកប្រើប្រាំនាក់សាកល្បងកិច្ចការស្នូលដោយគ្មានជំនួយ។ កន្លែងដែលពួកគេស្ទាក់ស្ទើរ គឺជាកន្លែងដែលការរចនាត្រូវកែ មិនមែនកន្លែងដែលពួកគេនិយាយនោះទេ។",
+          "project": "សាកល្បង prototype របស់អ្នកជាមួយអ្នកប្រើប្រាំនាក់ កែអ្វីដែលពួកគេពិបាក ហើយផ្សព្វផ្សាយវាជា case study។"
+        }
+      }
+    },
+    "devops": {
+      "label": "DevOps Engineer",
+      "summary": "ធ្វើស្វ័យប្រវត្តិកម្មលើរបៀបដែល software ត្រូវបាន build, deploy និងរក្សាឱ្យដំណើរការ។",
+      "outcome": "Pipeline ស្វ័យប្រវត្តិដែល test, deploy និងតាមដានកម្មវិធីមួយលើ cloud infrastructure ដែលអ្នកកំណត់ជាកូដ។",
+      "pace": "៩–១២ ខែ ប្រហែល ១០ ម៉ោងក្នុងមួយសប្តាហ៍",
+      "stages": {
+        "linux-networking": {
+          "title": "Linux និង networking",
+          "goal": "ស៊ាំនឹង server និងយល់ពីរបៀបដែលម៉ាស៊ីននិយាយគ្នា។",
+          "skills": [
+            {
+              "name": "Shell",
+              "note": "Files, processes និង permissions"
+            },
+            {
+              "name": "SSH និង packages",
+              "note": "ចូល servers និងដំឡើង software ដោយសុវត្ថិភាព"
+            },
+            {
+              "name": "IP, ports និង DNS",
+              "note": "របៀបដែលម៉ាស៊ីនរកឃើញ និងទាក់ទងគ្នា"
+            },
+            {
+              "name": "HTTP, TLS និង Nginx",
+              "note": "បម្រើគេហទំព័រដោយសុវត្ថិភាពនៅក្រោយ reverse proxy"
+            }
+          ],
+          "decision": "ប្រើ Linux distribution មួយណា?",
+          "advice": "Ubuntu ឬ Debian។ អ្វីដែលសំខាន់គឺជំនាញ ហើយវាអាចយកទៅប្រើលើគ្រប់ distribution។",
+          "project": "រៀបចំ Linux server មួយ ការពារ SSH ហើយបម្រើគេហទំព័រតាម HTTPS ជាមួយ Nginx។"
+        },
+        "scripting-git": {
+          "title": "Scripting និង version control",
+          "goal": "ធ្វើស្វ័យប្រវត្តិកម្មលើកិច្ចការដែលអ្នកនឹងធ្វើដោយដៃពីរដង។",
+          "skills": [
+            {
+              "name": "Bash scripting",
+              "note": "ភ្ជាប់ commands ទៅជា scripts ដែលអាចប្រើម្តងទៀត"
+            },
+            {
+              "name": "Python សម្រាប់ស្វ័យប្រវត្តិកម្ម",
+              "note": "នៅពេល script ត្រូវការតក្កវិជ្ជាពិតប្រាកដ"
+            },
+            {
+              "name": "Git workflows",
+              "note": "Branches, pull requests និង reviews"
+            },
+            {
+              "name": "YAML និង JSON",
+              "note": "ទម្រង់ដែលឧបករណ៍ទាំងអស់ប្រើសម្រាប់ការកំណត់"
+            }
+          ],
+          "decision": "Bash ឬ Python?",
+          "advice": "Bash សម្រាប់ភ្ជាប់ commands ជាមួយគ្នា Python នៅពេល script ត្រូវការតក្កវិជ្ជា ការដោះស្រាយ error ឬ tests។",
+          "project": "Script ដែល backup ថតឯកសារ លុប backups ចាស់ៗ និងរាយការណ៍ការបរាជ័យ។"
+        },
+        "containers": {
+          "title": "Containers",
+          "goal": "វេចខ្ចប់កម្មវិធីឱ្យដំណើរការដូចគ្នានៅគ្រប់ទីកន្លែង។",
+          "skills": [
+            {
+              "name": "Dockerfiles",
+              "note": "Build image សម្រាប់កម្មវិធីរបស់អ្នក"
+            },
+            {
+              "name": "Docker Compose",
+              "note": "ដំណើរការកម្មវិធីជាមួយ database និងបណ្តាញរបស់វា"
+            },
+            {
+              "name": "Images តូច និងមានសុវត្ថិភាព",
+              "note": "Layers តិច ចំណុចខ្សោយតិច"
+            },
+            {
+              "name": "Health checks",
+              "note": "ប្រាប់ platform ថាកម្មវិធីនៅដំណើរការ"
+            }
+          ],
+          "decision": "តើខ្ញុំត្រូវការ Kubernetes ឥឡូវនេះទេ?",
+          "advice": "មិនទាន់ទេ រហូតដល់ server មួយជាមួយ Docker Compose មិនគ្រប់គ្រាន់។ Kubernetes ដោះស្រាយបញ្ហាដែលអ្នកចាប់ផ្តើមមិនទាន់មាន។",
+          "project": "ដាក់កម្មវិធីមួយ និង database របស់វាក្នុង containers ដោយប្រើ Docker Compose។"
+        },
+        "ci-cd": {
+          "title": "CI/CD",
+          "goal": "ធ្វើឱ្យរាល់ការផ្លាស់ប្តូរត្រូវបាន test និងអាច deploy ដោយស្វ័យប្រវត្តិ។",
+          "skills": [
+            {
+              "name": "Pipelines",
+              "note": "GitHub Actions ឬ GitLab CI"
+            },
+            {
+              "name": "Tests និង image builds",
+              "note": "រាល់ merge បង្កើត artifact ដែលបាន test"
+            },
+            {
+              "name": "យុទ្ធសាស្ត្រ deploy",
+              "note": "Rolling, blue-green និង canary releases"
+            },
+            {
+              "name": "Rollbacks និង flags",
+              "note": "ត្រឡប់ release អាក្រក់វិញក្នុងប៉ុន្មាននាទី"
+            }
+          ],
+          "decision": "Deploy រាល់ពេល merge?",
+          "advice": "បាទ/ចាស នៅពេលមាន tests និង rollback រហ័ស។ ការ deploy តូចៗញឹកញាប់មានសុវត្ថិភាពជាងការ deploy ធំៗម្តងម្កាល។",
+          "project": "Pipeline ដែល test, build និង deploy កម្មវិធី container របស់អ្នករាល់ពេល merge។"
+        },
+        "cloud-iac": {
+          "title": "Cloud និង infrastructure as code",
+          "goal": "បង្កើត cloud infrastructure ដែលអ្នកអាចពិនិត្យ ធ្វើម្តងទៀត និងលុបចោលបាន។",
+          "skills": [
+            {
+              "name": "Cloud មួយ",
+              "note": "AWS, Google Cloud ឬ Azure"
+            },
+            {
+              "name": "Networking និង IAM",
+              "note": "Least privilege តាំងពីថ្ងៃដំបូង"
+            },
+            {
+              "name": "Terraform",
+              "note": "Infrastructure ដែលអ្នកអាចពិនិត្យក្នុង pull request"
+            },
+            {
+              "name": "Managed services និងចំណាយ",
+              "note": "ដឹងថាអ្នកដំណើរការអ្វី និងវាថ្លៃប៉ុណ្ណា"
+            }
+          ],
+          "decision": "Scale up ឬ scale out?",
+          "advice": "Scale up មុន — ម៉ាស៊ីនធំជាងគឺជាការផ្លាស់ប្តូរតែមួយ។ Scale out នៅពេលអ្នកត្រូវការ redundancy ឬបានដល់ម៉ាស៊ីនធំបំផុតហើយ។",
+          "project": "កំណត់ infrastructure នៃកម្មវិធីរបស់អ្នកក្នុង Terraform ហើយបង្កើតវាឡើងវិញពីសូន្យ។"
+        },
+        "observability": {
+          "title": "Observability និង reliability",
+          "goal": "ដឹងថាមានបញ្ហា មុនអ្នកប្រើប្រាប់អ្នក ហើយស្តារឡើងវិញយ៉ាងរហ័ស។",
+          "skills": [
+            {
+              "name": "Logs, metrics និង traces",
+              "note": "ទិដ្ឋភាពបីនៃអ្វីដែលប្រព័ន្ធកំពុងធ្វើ"
+            },
+            {
+              "name": "Prometheus និង Grafana",
+              "note": "ប្រមូល metrics និងបង្កើត dashboards"
+            },
+            {
+              "name": "Alerting",
+              "note": "ដាស់មនុស្សតែសម្រាប់អ្វីដែលអ្នកប្រើមានអារម្មណ៍"
+            },
+            {
+              "name": "Backups និង incidents",
+              "note": "ស្តារទិន្នន័យ និងរៀនពីការដាច់សេវា"
+            }
+          ],
+          "decision": "តើខ្ញុំគួរ alert លើអ្វី?",
+          "advice": "រោគសញ្ញាដែលអ្នកប្រើមានអារម្មណ៍ — errors, latency, disk ពេញ — មិនមែនរាល់ការកើនឡើង CPU ទេ។ Alert ដែលគ្មាននរណាធ្វើតាម បង្រៀនមនុស្សឱ្យមិនអើពើ alerts។",
+          "project": "Dashboard និង alerts សម្រាប់កម្មវិធីរបស់អ្នក និងការ restore ពី backup ដែលបានសាកល្បង។"
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,174 @@
+---
+title: "How do I handle webhooks reliably?"
+question: "How do I reliably handle incoming third-party webhooks?"
+summary: "Third-party webhooks (Stripe, GitHub, Shopify) deliver at-least-once, arrive out-of-order, and retry aggressively during outages. Acknowledge with HTTP 200 immediately, push to an internal queue, and process idempotently."
+tags: [webhooks, integration, payments, queues, idempotency]
+related: [patterns/idempotency, patterns/retry, tradeoffs/sync-vs-async]
+order: 13
+updated: "2026-09-12"
+contributors: [veasna]
+---
+
+## Context
+
+An e-commerce, SaaS, or fintech application receiving webhook notifications from third-party services: Stripe for credit card payment confirmations, Shopify for order updates, or Twilio for SMS delivery receipts.
+
+The initial implementation handled business logic directly inside the webhook HTTP handler: verify HMAC signature, parse JSON, execute 4 database queries, make an external call to an ERP API, and send a confirmation email, finally returning HTTP 200 after 1,800 ms.
+
+One day, during a minor database hiccup or rolling deployment, the webhook handler takes 5,500 ms. Stripe times out at 5,000 ms, records a failure, and initiates its exponential retry schedule.
+
+## Symptoms
+
+- **Duplicate processing:** Customers receive duplicate welcome emails or their subscription is renewed twice because the provider retried a webhook that actually succeeded internally.
+- **Out-of-order execution:** A `subscription.deleted` webhook is processed before the delayed `subscription.created` webhook, leaving the customer account in an active state when it should be canceled.
+- **Provider disabling the webhook endpoint:** After 50 consecutive timeout failures, Stripe or Shopify automatically disables the webhook endpoint, halting all automated order processing across the company.
+- **Cascading timeouts:** When your server experiences high load, slow webhook processing ties up HTTP worker threads, worsening overall server congestion.
+
+<Callout type="warning" title="Webhook providers deliver at-least-once and do not guarantee ordering">
+A webhook is not an RPC call. Providers guarantee that they will deliver the event *at least once*, but they may send duplicates, retry on network drops, and deliver later events before earlier ones.
+</Callout>
+
+## Diagnose
+
+1. **Check provider webhook dashboards:** Inspect the latency graph in the Stripe or GitHub developer dashboard. If your p95 webhook latency is above 1,500 ms, you are on the brink of timeout failures.
+2. **Review webhook endpoint handlers:** Does the endpoint execute synchronous third-party API calls, PDF generation, or email sending before returning HTTP 200?
+3. **Check for missing idempotency tables:** Does your code query a processed-webhook-IDs table before executing business actions?
+
+## Options
+
+1. **Synchronous in-handler processing.** Execute everything in the HTTP handler and return 200 when done. (Fails under any downstream latency spike).
+2. **Synchronous with increased provider timeout.** Ask the provider to wait 30 seconds. (Unsupported by most providers, blocks worker threads).
+3. **Asynchronous Ingestion (Acknowledge & Queue).** Verify the signature, append the raw payload to an internal queue or database outbox, and immediately return HTTP 200 within 20 ms.
+4. **Idempotent Background Consumer with Event Ordering.** Process queue messages in the background with idempotency key deduplication and timestamp checks.
+
+## Trade-offs
+
+| Approach | Latency to Provider | Outage Resilience | Duplication Safety |
+| :--- | :--- | :--- | :--- |
+| **Sync Processing** | 1,000–5,000 ms | **Terrible** (triggers provider disabling) | Poor |
+| **Async Buffer Queue** | **< 25 ms** | **Maximum** (survives app downtime) | Requires consumer deduplication |
+| **Direct DB Outbox** | **< 20 ms** | High (uses standard SQL) | Strong (unique constraint on event ID) |
+
+## Decision
+
+Adopt the **Acknowledge-and-Queue pattern**:
+
+1. **Fast-path Ingestion (HTTP Handler):**
+   - Verify cryptographic HMAC signature (reject invalid senders with HTTP 400 immediately).
+   - Check if event ID was already processed; if so, return HTTP 200 immediately.
+   - Insert raw event into an `incoming_webhooks` table or push to a queue (BullMQ / RabbitMQ).
+   - Return **HTTP 200 OK immediately** (target latency: < 30 ms).
+2. **Slow-path Processing (Background Worker):**
+   - Background worker pulls events from the queue.
+   - Guard execution with database unique constraints on `event_id`.
+   - Discard out-of-order events by comparing the event's `created_at` timestamp with the entity's current `last_updated_at`.
+
+## Implementation
+
+### 1. Fast-Path HTTP Webhook Ingestion (Node.js / Express):
+
+```typescript
+import express from 'express';
+import crypto from 'crypto';
+import { pool } from './db';
+
+const app = express();
+
+// Use express.raw() to preserve exact payload bytes for HMAC verification
+app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), async (req, res) => {
+  const signature = req.headers['stripe-signature'] as string;
+  const secret = process.env.STRIPE_WEBHOOK_SECRET!;
+
+  // 1. Cryptographic HMAC verification (< 2 ms)
+  try {
+    // In production: stripe.webhooks.constructEvent(req.body, signature, secret)
+  } catch (err) {
+    return res.status(400).send('Invalid signature');
+  }
+
+  const event = JSON.parse(req.body.toString());
+
+  try {
+    // 2. Persist to database queue in a single fast query (< 10 ms)
+    await pool.query(
+      `INSERT INTO incoming_webhooks (provider, event_id, event_type, payload, status)
+       VALUES ('stripe', $1, $2, $3, 'pending')
+       ON CONFLICT (provider, event_id) DO NOTHING`,
+      [event.id, event.type, JSON.stringify(event)]
+    );
+
+    // 3. Acknowledge provider immediately!
+    return res.status(200).json({ received: true });
+  } catch (err) {
+    console.error('Failed to buffer webhook', err);
+    // Return 500 so provider retries if database is momentarily down
+    return res.status(500).send('Storage failure');
+  }
+});
+```
+
+### 2. Idempotent Background Worker Processing:
+
+```typescript
+export async function processWebhookQueue() {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // Acquire next pending webhook with lock
+    const res = await client.query(`
+      SELECT id, event_id, event_type, payload
+      FROM incoming_webhooks
+      WHERE status = 'pending'
+      ORDER BY created_at ASC
+      LIMIT 1 FOR UPDATE SKIP LOCKED
+    `);
+
+    if (res.rows.length === 0) {
+      await client.query('COMMIT');
+      return;
+    }
+
+    const webhook = res.rows[0];
+    const payload = JSON.parse(webhook.payload);
+
+    // Business logic execution (can take 3 seconds safely!)
+    await handleBusinessEvent(webhook.event_type, payload);
+
+    // Mark as completed
+    await client.query(
+      `UPDATE incoming_webhooks SET status = 'processed', processed_at = NOW() WHERE id = $1`,
+      [webhook.id]
+    );
+
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('Webhook processing failed; worker will retry', err);
+  } finally {
+    client.release();
+  }
+}
+```
+
+## Verification
+
+1. **Provider latency confirmation:** Review the provider's developer console (e.g. Stripe Webhook attempts). Response latency should report **< 50 ms** across all events.
+2. **Duplicate event resilience:** Send the exact same webhook payload twice within 100 ms using curl. Both requests must return HTTP 200, but internal business logic (e.g. sending confirmation emails) should execute **only once**.
+3. **Simulated downtime recovery:** Stop the background worker for 10 minutes while receiving webhooks. Ingestion continues returning 200 OK. When the worker restarts, it smoothly drains the backlog.
+
+## Why
+
+Webhook senders are distributed systems with rigid HTTP timeout boundaries (often 5 seconds). If your server performs synchronous downstream calls, any transient lag in an external service (like Sendgrid or an internal DB) causes the webhook sender to record a failure.
+
+Decoupling ingestion (fast HTTP buffer) from processing (asynchronous background queue) isolates your availability from your processing speed.
+
+## When Not To Use
+
+- **Synchronous webhook verification handshakes:** Some providers (like WhatsApp or Zoom) send an initial `GET` or `POST` containing a challenge token that must be echoed back in the response body synchronously. Handle the challenge synchronously; buffer normal event notifications asynchronously.
+
+## Common Mistakes
+
+- **Parsing JSON before HMAC verification.** If your JSON parser modifies whitespace or key ordering, the HMAC hash will not match the provider's signature, causing constant 400 errors. Always verify against the raw byte buffer.
+- **Returning HTTP 200 on HMAC failure.** Never return 200 if the signature fails; return 400 or 401 so attackers cannot send fake events.
+- **Omitting event ordering guards.** If a customer cancels their subscription and re-subscribes within 5 minutes, processing the cancellation second will leave them without access. Always compare event timestamps with entity versions.

@@ -1,0 +1,180 @@
+---
+title: "Transactional Outbox"
+question: "តើខ្ញុំអាច update database និង publish event ដោយរបៀបណាដោយមិនឱ្យទិន្នន័យបាត់បង់ ឬមិនស៊ីគ្នា?"
+summary: "កត់ត្រាសារដែលត្រូវផ្ញើចេញចូលទៅក្នុង table outbox នៅក្នុង ACID database transaction តែមួយជាមួយ domain entity។ Process មួយផ្សេងទៀតនឹងទាញយក event នោះទៅ publish យ៉ាងទុកចិត្តបាន ដែលជួយលុបបំបាត់បញ្ហា dual-write ទាំងស្រុង។"
+tags: [patterns, outbox, event-driven, messaging, microservices, reliability]
+related: [problems/should-i-use-kafka, patterns/idempotency, tradeoffs/sync-vs-async]
+order: 6
+updated: "2026-09-12"
+contributors: [veasna]
+translation: draft
+---
+
+## Context
+
+សេវាកម្មគ្រប់គ្រងការបញ្ជាទិញ (Order Service) មួយទទួលបាន HTTP request ដើម្បីបង្កើតការបញ្ជាទិញថ្មីមួយ។ សេវាកម្មនេះត្រូវតែរក្សាទុកការបញ្ជាទិញក្នុង PostgreSQL និង publish ព្រឹត្តិការណ៍ `order.created` ទៅកាន់ message broker (ដូចជា Kafka, RabbitMQ ឬ AWS SQS) ដើម្បីឱ្យសេវាកម្មស្តុកទំនិញ, ការទូទាត់ប្រាក់ និងការផ្ញើសារជូនដំណឹងអាចបន្តដំណើរការបាន។
+
+ការសរសេរទិន្នន័យទៅកាន់ប្រព័ន្ធផ្ទុកទិន្នន័យឯករាជ្យពីរផ្សេងគ្នា (Relational Database និង Message Broker) ត្រូវបានគេហៅថា **Dual Write**។ ដោយសារតែ distributed transactions ឆ្លងប្រព័ន្ធមិនអាចអនុវត្តបានក្នុងទ្រង់ទ្រាយធំ នោះប្រាកដជាមានពេលមួយដែលការសរសេរមួយជោគជ័យ ខណៈមួយទៀតត្រូវបរាជ័យ។
+
+## Symptoms
+
+- **ការបាត់បង់ Events (Lost Events)៖** Database transaction បាន commit ជោគជ័យ ប៉ុន្តែ network call ទៅកាន់ Kafka ត្រូវ timeout ឬ process គាំងមុនពេលបាន publish។ អតិថិជនមើលឃើញការបញ្ជាទិញរបស់ពួកគេនៅលើវេបសាយ ប៉ុន្តែខាងឃ្លាំងស្តុក និងផ្នែកដឹកជញ្ជូនមិនដែលទទួលបាន event នោះឡើយ។
+- **Phantom Events៖** សេវាកម្មផ្ញើ event ទៅកាន់ broker ជាមុន; ស្រាប់តែបន្ទាប់មក database transaction បរាជ័យដោយសារ unique constraint error ហើយត្រូវ rollback។ សេវាកម្មខាងក្រោមបានរៀបចំទំនិញរួចរាល់ សម្រាប់ការបញ្ជាទិញដែលគ្មាននៅក្នុង database មេទៅវិញ។
+- **ការដោះស្រាយបញ្ហាជាមួយ Customer Support៖** «ការបញ្ជាទិញលេខ 4829 មាននៅក្នុង database ប៉ុន្តែមិនដែលត្រូវបានកាត់លុយ ឬដឹកជញ្ជូនឡើយ»។
+- **Script កែតម្រូវទិន្នន័យ (Reconciliation Scripts)៖** វិស្វករត្រូវដំណើរការ SQL script រៀងរាល់ថ្ងៃដើម្បីតាមរកមើល និងបំពេញបន្ថែម events ដែលបាត់ដោយដៃ។
+
+<Callout type="warning" title="Dual writes មិនអាចដោះស្រាយដោយប្រើ try/catch បានទេ">
+ការរុំព័ទ្ធការ publish ក្នុងប្លុក `try/catch` ឬ retry loop មិនអាចជួយដោះស្រាយបញ្ហានេះបានឡើយ។ ប្រសិនបើ server ដាច់ភ្លើង ឬ restart នៅចន្លោះពេល commit database និងការផ្ញើសារ នោះ event នឹងត្រូវបាត់បង់ជាអចិន្ត្រៃយ៍។
+</Callout>
+
+## Diagnose
+
+1. **ស្វែងរកកូដដែលមានទម្រង់ Dual Write៖** ស្វែងរកកន្លែងណាដែល database query និង message publisher ដំណើរការបន្តបន្ទាប់គ្នា៖
+   ```typescript
+   // កំហុស DUAL WRITE៖ កូដមួយអាចបរាជ័យ ខណៈមួយទៀតជោគជ័យ
+   await db.orders.create({ data: orderData });
+   await messageBroker.publish('order.created', orderData);
+   ```
+2. **វាស់ស្ទង់ចំនួន Event ដែលបាត់បង់៖** ប្រៀបធៀបចំនួន orders ដែលបានបង្កើតក្នុង database ក្នុងរយៈពេលមួយខែចុងក្រោយ ធៀបនឹងចំនួន events សរុបដែល queues ខាងក្រោមទទួលបាន។
+3. **ពិនិត្យមើលពេលប្រព័ន្ធគាំង៖** តើមានអ្វីកើតឡើងប្រសិនបើ pod របស់ application ត្រូវបានបិទភ្លាមៗដោយ `SIGKILL` នៅចន្លោះប្រតិបត្តិការទាំងពីរ?
+
+## Options
+
+1. **Dual write ជាមួយ Client Retry។** នៅរក្សាការសរសេរបន្តបន្ទាប់គ្នាដដែល ប៉ុន្តែ retry ការ publish ប្រសិនបើវាបរាជ័យ។ (នៅតែបរាជ័យទាំងស្រុងប្រសិនបើ process គាំង ឬដាច់បណ្តាញយូរ)។
+2. **Two-Phase Commit (2PC / XA Transactions)។** គ្រប់គ្រង transaction រវាង Postgres និង broker តាមរយៈ distributed transaction coordinator។ (មិនអាច scale បាន, latency ខ្ពស់, និងមិនត្រូវបានគាំទ្រដោយ cloud brokers ទំនើបដូចជា Kafka ឬ SQS ឡើយ)។
+3. **Transactional Outbox ជាមួយ Polling Relay។** រក្សាទុក event ជាជួរទិន្នន័យមួយក្នុង table `outbox` នៅក្នុង database transaction តែមួយ។ Worker មួយផ្សេងទៀតទាញយកទិន្នន័យនោះតាមរយៈ `FOR UPDATE SKIP LOCKED` រួច publish ទៅកាន់ broker។
+4. **Transactional Outbox ជាមួយ Change Data Capture (CDC / Debezium)។** រក្សាទុក event ក្នុង outbox table ប៉ុន្តែប្រើប្រាស់ Debezium ដើម្បីអាន transaction write-ahead log (WAL) របស់ database ដោយផ្ទាល់។
+
+## Trade-offs
+
+| យុទ្ធសាស្ត្រ | ការធានាលើភាពស៊ីសង្វាក់គ្នានៃទិន្នន័យ | ភាពស្មុគស្មាញនៃប្រតិបត្តិការ | ប្រសិទ្ធភាព / Throughput |
+| :--- | :--- | :--- | :--- |
+| **Dual Write** | មិនស៊ីសង្វាក់គ្នា (ទិន្នន័យអាចបាត់) | ទាបបំផុត | ខ្ពស់រហូតដល់មានការបរាជ័យកើតឡើង |
+| **2PC / XA** | រឹងមាំ | ស្មុគស្មាញខ្លាំង (blocking locks) | Throughput ទាបខ្លាំង |
+| **Outbox + Polling** | **At-least-once delivery (ធានាមិនបាត់បង់)** | **ទាប** (បន្ថែម table មួយ និង query មួយ) | រាប់រយ ដល់រាប់ពាន់ events/sec |
+| **Outbox + CDC (Debezium)** | **At-least-once delivery (ធានាមិនបាត់បង់)** | ខ្ពស់ (ត្រូវការ Kafka Connect, Debezium) | រាប់ម៉ឺន events/sec |
+
+## Decision
+
+- **ប្រើប្រាស់ Transactional Outbox Pattern ជាមួយ Polling** សម្រាប់ក្រុមការងារភាគច្រើន។
+- រក្សាទុក domain records និង events នៅក្នុង **ACID transaction តែមួយ**។ ដោយសារតែប្រតិបត្តិការទាំងពីរធ្វើឡើងនៅលើ PostgreSQL តែមួយ លក្ខណៈសម្បត្តិ ACID ធានាថា **ជោគជ័យទាំងពីរ ឬបរាជ័យទាំងពីរ**។
+- បង្កើត background relay worker មួយដើម្បីទាញយកទិន្នន័យ outbox ដែលមិនទាន់ដំណើរការតាមរយៈ `FOR UPDATE SKIP LOCKED` រួច publish ទៅកាន់ message broker ហើយកត់ត្រាថាបាន publish រួចរាល់។
+- **ត្រូវប្រើទន្ទឹមគ្នានឹង Consumer Idempotency៖** ដោយសារតែ relay ធានាការបញ្ជូនសារយ៉ាងហោចណាស់ម្តង (**at-least-once**), consumer ខាងក្រោមត្រូវតែពិនិត្យមើល event ID ដើម្បីការពារកុំឱ្យដំណើរការសារដដែលៗពីរដង។
+
+## Implementation
+
+### 1. Schema របស់ Outbox Table
+
+```sql
+CREATE TABLE outbox_events (
+  id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  aggregate_type VARCHAR(64) NOT NULL,
+  aggregate_id   VARCHAR(64) NOT NULL,
+  event_type     VARCHAR(64) NOT NULL,
+  payload        JSONB NOT NULL,
+  created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  published_at   TIMESTAMPTZ
+);
+
+-- Partial index ដើម្បីទាញយក events ដែលមិនទាន់ publish បានលឿន
+CREATE INDEX idx_outbox_unpublished 
+ON outbox_events (created_at ASC) 
+WHERE published_at IS NULL;
+```
+
+### 2. ការសរសេរទិន្នន័យបែប Atomic ក្នុងកូដ
+
+```typescript
+import { PoolClient } from 'pg';
+
+export async function createOrder(client: PoolClient, orderData: OrderInput) {
+  // 1. បញ្ចូល domain entity
+  const orderRes = await client.query(
+    `INSERT INTO orders (customer_id, total_cents, status) 
+     VALUES ($1, $2, 'pending') RETURNING id`,
+    [orderData.customerId, orderData.totalCents]
+  );
+  const orderId = orderRes.rows[0].id;
+
+  // 2. បញ្ចូល outbox event ក្នុង TRANSACTION តែមួយដដែល
+  await client.query(
+    `INSERT INTO outbox_events (aggregate_type, aggregate_id, event_type, payload)
+     VALUES ('order', $1, 'order.created', $2)`,
+    [orderId, JSON.stringify({ orderId, ...orderData })]
+  );
+
+  // ប្រតិបត្តិការទាំងពីរត្រូវបាន commit ព្រមគ្នាដោយសុវត្ថិភាព
+  await client.query('COMMIT');
+}
+```
+
+### 3. Background Polling Relay Worker
+
+Relay ប្រើប្រាស់ `FOR UPDATE SKIP LOCKED` ដើម្បីអនុញ្ញាតឱ្យ relay pods ច្រើនដំណើរការព្រមគ្នាដោយមិនជាន់ការងារគ្នា ឬ lock រារាំងគ្នាទៅវិញទៅមកឡើយ៖
+
+```typescript
+export async function relayOutboxEvents() {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // ជ្រើសរើស events ចំនួន 50 ដែលមិនទាន់ publish និងរំលងជួរណាដែល worker ផ្សេងកំពុង lock
+    const res = await client.query(`
+      SELECT id, aggregate_type, aggregate_id, event_type, payload
+      FROM outbox_events
+      WHERE published_at IS NULL
+      ORDER BY created_at ASC
+      LIMIT 50
+      FOR UPDATE SKIP LOCKED
+    `);
+
+    for (const event of res.rows) {
+      // Publish ទៅកាន់ message broker
+      await messageBroker.publish(event.event_type, {
+        id: event.id,
+        aggregateId: event.aggregate_id,
+        data: event.payload,
+      });
+
+      // កត់ត្រាថាបាន publish រួចរាល់
+      await client.query(
+        `UPDATE outbox_events SET published_at = NOW() WHERE id = $1`,
+        [event.id]
+      );
+    }
+
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('Outbox relay បរាជ័យ នឹងសាកល្បងម្តងទៀតនៅជុំបន្ទាប់', err);
+  } finally {
+    client.release();
+  }
+}
+
+// ដំណើរការ polling loop រៀងរាល់ 500 ms
+setInterval(relayOutboxEvents, 500);
+```
+
+## Verification
+
+1. **គ្មានការបាត់បង់ Event៖** សាកល្បងបិទភ្លើង ឬ terminate process (`kill -9`) ភ្លាមៗក្រោយពេល order ត្រូវបានបង្កើត។ ផ្ទៀងផ្ទាត់ថានៅពេល service restart ឡើងវិញ outbox relay នឹងរកឃើញ row នោះ ហើយ publish event បានយ៉ាងជោគជ័យ។
+2. **ភាពធន់ពេល Broker មានបញ្ហា៖** ផ្តាច់ Kafka ឬ RabbitMQ រយៈពេល ៥ នាទី។ ការបង្កើត order ត្រូវតែបន្តដំណើរការបានដោយគ្មាន error ដោយសារ event ត្រូវបានរក្សាទុកក្នុង PostgreSQL ដោយសុវត្ថិភាព។ នៅពេល broker ដំណើរការវិញ relay នឹងបញ្ជូន events ទាំងអស់ចេញរហូតដល់អស់។
+3. **ការគ្រប់គ្រងទំហំ Outbox Table៖** ត្រូវប្រាកដថាទិន្នន័យចាស់ៗដែលបាន publish រួច ត្រូវបានលុបជាប្រចាំតាមរយៈ batch job (`DELETE FROM outbox_events WHERE published_at < NOW() - INTERVAL '7 days'`)។
+
+## Why
+
+ACID transactions ត្រូវបានបង្កើតឡើងដើម្បីធានាភាពមិនអាចបំបែកបាន (atomicity) រវាង tables ច្រើននៅក្នុង relational database តែមួយ។ វាមិនអាចឆ្លងកាត់ network ទៅកាន់ប្រព័ន្ធខាងក្រៅបានឡើយ។
+
+តាមរយៈការបម្លែងការងារខាងក្រៅ (ការផ្ញើសារ) ឱ្យទៅជាការសរសេរទិន្នន័យខាងក្នុង database (ការ insert ចូល table មួយ) យើងបានទាញយក event នោះឱ្យមកស្ថិតនៅក្រោមការការពារនៃ ACID boundary របស់ database។ Write-ahead log (WAL) របស់ database ធានាថាសារនោះនឹងមិនអាចបាត់បង់បានឡើយ ទោះបីជាប្រព័ន្ធត្រូវគាំងក៏ដោយ។
+
+## When Not To Use
+
+- **Events មិនសូវសំខាន់ (Fire-and-forget)៖** សម្រាប់ analytics ទូទៅ ឬការចុច mouse លើ UI ដែលការបាត់បង់ 0.01% មិនបង្កផលប៉ះពាល់ ការ publish តាមធម្មតាគឺងាយស្រួលជាង។
+- **ទំហំ Events ធំសម្បើម (>50,000 writes/sec)៖** ការ poll លើ outbox table ក្នុងកម្រិតនេះអាចបង្កើនទំហំសរសេរលើ database ខ្លាំងពេក។ ក្នុងករណីនេះ គួរប្រើ Kafka ផ្ទាល់ ឬប្រើ CDC (Debezium) ដើម្បីអាន replication logs។
+
+## Common Mistakes
+
+- **Publish ជាមុន រួចទើប Commit ក្រោយ។** ប្រសិនបើ database transaction rollback នោះប្រព័ន្ធខាងក្រោមនឹងដំណើរការ event សម្រាប់ order ដែលមិនមានពិតប្រាកដ។
+- **ការលុបជួរទិន្នន័យ Outbox ភ្លាមៗ។** ការលុប row ភ្លាមៗញឹកញាប់អាចបណ្តាលឱ្យ table bloat ក្នុង PostgreSQL។ គួរប្រើ `published_at = NOW()` រួចធ្វើការ purge ជាក្រុមៗនៅពេលយប់។
+- **ការភ្លេចធ្វើ Consumer Deduplication។** ដោយសារ relay អាចនឹងគាំងក្រោយពេល publish ទៅ broker ប៉ុន្តែមុនពេល update database នោះ event អាចនឹងត្រូវផ្ញើពីរដង។ Consumers ខាងក្រោមត្រូវតែត្រួតពិនិត្យ event ID ជានិច្ចដើម្បីធានា idempotency។

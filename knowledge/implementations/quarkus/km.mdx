@@ -1,0 +1,198 @@
+---
+title: "Quarkus (Java)"
+question: "តើត្រូវអនុវត្ត SmallRye Fault Tolerance, Agroal Connection Pooling, និង Idempotency ក្នុង Quarkus ដោយរបៀបណា?"
+summary: "SmallRye Fault Tolerance Timeouts, Retries ជាមួយ Jitter, Agroal Connection Pooling, Redis Caching ជាមួយ Mutiny, និង Transactional Idempotency ក្នុង Quarkus។"
+tags: [quarkus, java, graalvm, mutiny, implementation]
+related: [patterns/retry, patterns/circuit-breaker, patterns/caching, patterns/idempotency]
+order: 14
+updated: "2026-09-12"
+contributors: [veasna]
+translation: draft
+---
+
+ការអនុវត្ត Patterns សម្រាប់ Quarkus 3+ លើ Java 21+ ក្នុង Production។ ផ្តោតលើ Declarative Resilience ជាមួយ SmallRye Fault Tolerance, ការកែសម្រួល Agroal Connection Pool, Mutiny Reactive Caching, និង Transactional Idempotency។
+
+## Timeouts first (SmallRye Fault Tolerance)
+
+Quarkus ប្រើប្រាស់ MicroProfile Fault Tolerance Annotations ដើម្បីកំណត់រយៈពេលផុតកំណត់ដោយមិនបាច់រង់ចាំខាតពេល៖
+
+```java
+package com.example.rates;
+
+import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.ws.rs.client.ClientBuilder;
+import jakarta.ws.rs.core.Response;
+import org.eclipse.microprofile.faulttolerance.Timeout;
+import org.eclipse.microprofile.faulttolerance.Fallback;
+import java.time.temporal.ChronoUnit;
+
+@ApplicationScoped
+public class ExchangeRateService {
+
+    @Timeout(value = 2, unit = ChronoUnit.SECONDS)
+    @Fallback(fallbackMethod = "fallbackRates")
+    public String getLatestRates() {
+        Response response = ClientBuilder.newClient()
+                .target("https://api.example.com/rates")
+                .request()
+                .get();
+
+        if (response.getStatus() != 200) {
+            throw new RuntimeException("Upstream បរាជ័យជាមួយ Status " + response.getStatus());
+        }
+        return response.readEntity(String.class);
+    }
+
+    public String fallbackRates() {
+        return "{\"status\":\"cached_fallback\",\"rate\":1.0}";
+    }
+}
+```
+
+## Retry and Circuit Breaker
+
+រួមបញ្ចូល `@Retry` ជាមួយ `@CircuitBreaker` ដើម្បីទប់ទល់នឹងបញ្ហាបណ្តាញបណ្តោះអាសន្ន៖
+
+```java
+package com.example.inventory;
+
+import jakarta.enterprise.context.ApplicationScoped;
+import org.eclipse.microprofile.faulttolerance.CircuitBreaker;
+import org.eclipse.microprofile.faulttolerance.Retry;
+import java.time.temporal.ChronoUnit;
+
+@ApplicationScoped
+public class InventoryClient {
+
+    @Retry(
+        maxRetries = 3,
+        delay = 200,
+        delayUnit = ChronoUnit.MILLIS,
+        jitter = 100,
+        retryOn = { java.io.IOException.class, jakarta.ws.rs.WebApplicationException.class }
+    )
+    @CircuitBreaker(
+        requestVolumeThreshold = 10,
+        failureRatio = 0.5,
+        delay = 5,
+        delayUnit = ChronoUnit.SECONDS
+    )
+    public ItemInventory checkStock(String sku) {
+        return callDownstreamService(sku);
+    }
+
+    private ItemInventory callDownstreamService(String sku) {
+        return new ItemInventory(sku, 42);
+    }
+}
+```
+
+## Database connection pool (Agroal)
+
+Quarkus ប្រើប្រាស់ Agroal សម្រាប់ Connection Pool ដែលស្រាល និងមានប្រសិទ្ធភាពខ្ពស់។ កំណត់ក្នុង `application.properties`៖
+
+```properties
+# application.properties
+quarkus.datasource.db-kind=postgresql
+quarkus.datasource.jdbc.url=jdbc:postgresql://localhost:5432/orders_db
+quarkus.datasource.username=postgres
+quarkus.datasource.password=secret
+
+# Agroal Pool Configuration
+quarkus.datasource.jdbc.min-size=5
+quarkus.datasource.jdbc.max-size=30
+quarkus.datasource.jdbc.acquisition-timeout=3S
+quarkus.datasource.jdbc.idle-removal-interval=5M
+
+# Statement Timeouts
+quarkus.datasource.jdbc.statement-timeout=5S
+```
+
+## Idempotency ជាមួយ Panache និង `@Transactional`
+
+ធានាសុវត្ថិភាពទិន្នន័យដោយប្រើ Database Constraints និង Jakarta Transactions៖
+
+```java
+package com.example.orders;
+
+import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.transaction.Transactional;
+import jakarta.ws.rs.*;
+import jakarta.ws.rs.core.Response;
+
+@Path("/orders")
+@ApplicationScoped
+public class OrderResource {
+
+    @POST
+    @Transactional
+    public Response createOrder(
+            @HeaderParam("Idempotency-Key") String key,
+            OrderRequest request) {
+
+        if (key == null || key.isBlank()) {
+            return Response.status(Response.Status.BAD_REQUEST)
+                    .entity("តម្រូវឱ្យមាន Idempotency-Key header")
+                    .build();
+        }
+
+        IdempotencyRecord record = IdempotencyRecord.findById(key);
+        if (record != null) {
+            if (record.responseBody != null) {
+                return Response.status(record.statusCode).entity(record.responseBody).build();
+            }
+            return Response.status(Response.Status.CONFLICT)
+                    .entity("សំណើកំពុងដំណើរការនៅឡើយ")
+                    .build();
+        }
+
+        IdempotencyRecord claim = new IdempotencyRecord(key);
+        claim.persist();
+
+        Order order = new Order(request.customerId, request.totalCents);
+        order.persist();
+
+        claim.statusCode = 201;
+        claim.responseBody = "{\"orderId\":\"" + order.id + "\"}";
+        claim.persist();
+
+        return Response.status(Response.Status.CREATED).entity(claim.responseBody).build();
+    }
+}
+```
+
+## Reactive Caching ជាមួយ Mutiny និង Redis
+
+ប្រើប្រាស់ Reactive Redis Client ដើម្បីកាត់បន្ថយការប្រើប្រាស់ Threads៖
+
+```java
+package com.example.cache;
+
+import io.quarkus.redis.datasource.ReactiveRedisDataSource;
+import io.quarkus.redis.datasource.value.ReactiveValueCommands;
+import io.smallrye.mutiny.Uni;
+import jakarta.enterprise.context.ApplicationScoped;
+import java.time.Duration;
+
+@ApplicationScoped
+public class ReactiveProductCache {
+
+    private final ReactiveValueCommands<String, String> countCommands;
+
+    public ReactiveProductCache(ReactiveRedisDataSource ds) {
+        this.countCommands = ds.value(String.class);
+    }
+
+    public Uni<String> getProduct(String id) {
+        String key = "product:" + id;
+        return countCommands.get(key)
+                .onItem().ifNull().switchTo(() -> fetchFromDbAndCache(key, id));
+    }
+
+    private Uni<String> fetchFromDbAndCache(String key, String id) {
+        String data = "{\"id\":\"" + id + "\",\"name\":\"Widget\"}";
+        return countCommands.setex(key, Duration.ofMinutes(5).toSeconds(), data)
+                .replaceWith(data);
+    }
+}
+```

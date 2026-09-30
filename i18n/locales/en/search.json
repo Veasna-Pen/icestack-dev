@@ -1,0 +1,20 @@
+{
+  "placeholder": "Search problems, patterns, trade-offs and courses…",
+  "clear": "Clear search",
+  "noResults": "No results for “{{query}}”",
+  "tryHint": "Try “redis”, “retry”, “slow query” or “kafka”.",
+  "toNavigate": "to navigate",
+  "toOpen": "to open",
+  "results_one": "{{count}} result",
+  "results_other": "{{count}} results",
+  "groupTopics": "Knowledge",
+  "groupPages": "Pages",
+  "pageBadge": "Page",
+  "roadmapBadge": "Roadmap",
+  "roadmapsDescription": "Beginner career paths, stage by stage",
+  "courseBadge": "Course",
+  "lessonBadge": "Lesson",
+  "coursesDescription": "Short problem-first courses, lesson by lesson",
+  "howToThinkDescription": "The nine steps from a problem to a decision",
+  "contributeDescription": "Write or translate a page on GitHub"
+}

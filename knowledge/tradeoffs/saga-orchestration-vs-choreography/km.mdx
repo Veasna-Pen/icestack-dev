@@ -1,0 +1,173 @@
+---
+title: "Orchestration vs Choreography"
+question: "តើខ្ញុំគួរសម្របសម្រួល Distributed Transactions តាមរយៈ Orchestration ឬ Choreography?"
+summary: "ជ្រើសរើស Choreography សម្រាប់លំហូរការងារសាមញ្ញ ២–៣ ជំហាន ដែលសេវាកម្មនីមួយៗគ្រាន់តែ publish domain events; ជ្រើសរើស Orchestration នៅពេលដំណើរការអាជីវកម្មមានលក្ខខណ្ឌខ្នែងច្រើន (branching), timeouts, ការត្រឡប់ក្រោយ (compensating rollbacks) ឬតម្រូវការ audit ច្បាស់លាស់។"
+tags: [architecture, saga, distributed-transactions, microservices, event-driven]
+related: [tradeoffs/monolith-vs-microservices, tradeoffs/sync-vs-async, patterns/transactional-outbox]
+order: 6
+updated: "2026-09-12"
+contributors: [veasna]
+translation: draft
+---
+
+## Context
+
+នៅក្នុងស្ថាបត្យកម្ម microservices ដំណើរការអាជីវកម្មតែមួយជារឿយៗទាមទារឱ្យមានការកែប្រែទិន្នន័យឆ្លងកាត់សេវាកម្ម និង database ឯករាជ្យជាច្រើន៖
+1. **Order Service៖** បង្កើតការបញ្ជាទិញក្នុងស្ថានភាព pending។
+2. **Customer Service៖** កក់ពិន្ទុសន្សំរបស់អតិថិជន។
+3. **Payment Service៖** កាត់លុយពីកាតធនាគារ។
+4. **Inventory Service៖** កក់ទំនិញក្នុងឃ្លាំងស្តុក។
+
+ដោយសារតែ distributed ACID transactions (Two-Phase Commit / 2PC) មិនអាច scale បាន និងបង្កឱ្យមាន blocking locks នោះប្រព័ន្ធ distributed ត្រូវប្រើប្រាស់ **Saga Pattern**៖ ជាលំដាប់លំដោយនៃ local transactions ដែលជំហាននីមួយៗធ្វើការ publish event ឬបញ្ជា command មួយ។ ប្រសិនបើជំហានណាមួយបរាជ័យ Saga នឹងដំណើរការ **Compensating Transactions** ដើម្បីលុបចោលការកែប្រែក្នុងជំហានមុនៗ។
+
+ការសម្រេចចិត្តលើស្ថាបត្យកម្មដ៏សំខាន់នោះគឺ៖ តើត្រូវសម្របសម្រួល Saga តាមរយៈ **Choreography** (វិមជ្ឈការ ផ្អែកលើ event-driven) ឬតាមរយៈ **Orchestration** (មជ្ឈការ ប្រើប្រាស់ state machine)?
+
+## Symptoms
+
+- **ផលប៉ះពាល់បែប "បាល់ប៉េងប៉ុង" ក្នុង Choreography៖** ក្រុមការងារជ្រើសរើស choreography ដោយសារគិតថា "microservices គួរតែ decoupled ពីគ្នា" ប៉ុន្តែមិនយូរប៉ុន្មាន គ្មាននរណាម្នាក់អាចដឹងថា order កំពុងស្ថិតនៅត្រង់ណាឡើយ។ Event មួយបង្កឱ្យមាន event មួយទៀត រហូតបង្កើតជាព្យុះ event វិលជុំរកក្បាលកន្ទុយមិនឃើញ។
+- **ភាពមិនច្បាស់លាស់នៃស្ថានភាពបរាជ័យ៖** នៅពេលជំហានទី ៣ បរាជ័យក្នុងចំណោម ៥ ជំហាន ការស្វែងរកមើលថាតើសេវាកម្មណាខ្លះបាន rollback រួច ហើយសេវាកម្មណាខ្លះជាប់គាំង តម្រូវឱ្យវិស្វករចូលទៅតាមដាន log ក្នុងសេវាកម្មទាំង ៥ ផ្សេងគ្នាក្នុង Datadog ដោយដៃ។
+- **Orchestrator Monolith៖** ក្រុមការងារជ្រើសរើស orchestration ប៉ុន្តែ developer បែរជាញាត់គ្រប់ business logic និង validation ទាំងអស់ចូលទៅក្នុង coordinator កណ្តាល ដែលធ្វើឱ្យវាក្លាយជា "god service" ដ៏ធំ និងពិបាកកែប្រែទៅវិញ។
+
+<Callout type="warning" title="Compensating transactions មិនមែនជាការ Rollback ធម្មតាទេ">
+Database rollback លុបទិន្នន័យដែលមិនទាន់ commit ចោលដូចជាគ្មានរឿងអ្វីកើតឡើង។ ប៉ុន្តែ compensating transaction ក្នុង Saga គឺជាការសរសេរទិន្នន័យថ្មីមួយទៅមុខទៀត ដើម្បីប៉ះប៉ូវកែតម្រូវទិន្នន័យចាស់ (ឧទាហរណ៍ ការផ្ញើប្រាក់សងត្រឡប់ទៅវិញ មិនមែនជាការលុបប្រវត្តិទូទាត់ចោលនោះឡើយ)។
+</Callout>
+
+## Diagnose
+
+វាយតម្លៃលើកម្រិតនៃភាពស្មុគស្មាញនៃ business workflow របស់អ្នក៖
+
+1. **ចំនួនជំហាន និងលក្ខខណ្ឌបែកខ្នែង៖** តើមានសេវាកម្មប៉ុន្មានចូលរួម? តើលំហូរដើរជាជួរត្រង់ ($A \to B \to C$) ឬមានលក្ខខណ្ឌបែកខ្នែង, ជំហានដំណើរការព្រមគ្នា ($B$ និង $C$ ដើរព្រមគ្នា), ឬមានការកំណត់ timeout រង់ចាំ?
+2. **ភាពញឹកញាប់នៃការបរាជ័យ និងការប៉ះប៉ូវ៖** ប្រសិនបើជំហានទី ៤ បរាជ័យ តើវាស្មុគស្មាញប៉ុណ្ណាដើម្បី compensate ជំហាន ១, ២ និង ៣?
+3. **តម្រូវការលើ Audit និង Visibility៖** តើផ្នែកប្រតិបត្តិការ ឬច្បាប់ទាមទារចម្លើយភ្លាមៗដែរឬទេថា «តើ order លេខ #1084 ឥឡូវនេះកំពុងស្ថិតក្នុងស្ថានភាពណាជាក់លាក់?»
+4. **រចនាសម្ព័ន្ធក្រុមការងារ៖** តើមានក្រុមតែមួយទទួលខុសត្រូវលើ checkout flow ទាំងមូល ឬមានក្រុមឯករាជ្យ ៤ ផ្សេងគ្នាគ្រប់គ្រង domain events ដាច់ដោយឡែកពីគ្នា?
+
+## Options
+
+1. **Choreography (Event-Driven Pub/Sub)៖** សេវាកម្មនីមួយៗស្តាប់ domain events ពីសេវាកម្មដទៃ ដំណើរការ local transaction របស់ខ្លួន រួច publish event ថ្មីមួយទៀត។ គ្មាន coordinator កណ្តាលឡើយ។
+2. **Orchestration (Command-Driven State Machine)៖** សេវាកម្មសម្របសម្រួលកណ្តាលមួយ (ឬ workflow engine ដូចជា Temporal, AWS Step Functions, Camunda) បញ្ជូន commands ផ្ទាល់ទៅកាន់សេវាកម្មដែលចូលរួម រង់ចាំចម្លើយ និងបញ្ជាឱ្យធ្វើ compensating commands ប្រសិនបើមានជំហានណាមួយបរាជ័យ។
+3. **Two-Phase Commit (2PC / XA)៖** ការ lock ទិន្នន័យឆ្លងកាត់ database ច្រើន។ (គួរចៀសវាងក្នុង microservices ដោយសារបញ្ហា latency និង coordinator failure)។
+
+## Trade-offs
+
+| លក្ខណៈ | Choreography | Orchestration |
+| :--- | :--- | :--- |
+| **ភាពជាប់ទាក់ទងគ្នានៃកូដ (Coupling)** | ទាប (សេវាកម្មស្គាល់តែ events) | ខ្ពស់ជាង (Orchestrator ស្គាល់សេវាកម្មទាំងអស់) |
+| **ភាពងាយស្រួលក្នុងការមើលឃើញ Workflow** | **ពិបាកខ្លាំង** (រាយប៉ាយតាម logs នៃសេវាកម្មច្រើន) | **ងាយស្រួលបំផុត** (មាន state machine log តែមួយ) |
+| **ការគ្រប់គ្រងកំហុស និង Rollbacks** | **ស្មុគស្មាញ** (គ្រប់សេវាកម្មត្រូវចាំស្តាប់ failure events) | **សាមញ្ញ និងច្បាស់លាស់** (Orchestrator ហៅ undo commands) |
+| **ការ Debug និងស្វែងរកបញ្ហា** | ពិបាក (ត្រូវការ Jaeger ឬ Distributed Tracing) | ងាយស្រួល (មើលស្ថានភាពក្នុង Orchestrator UI) |
+| **Single Point of Failure** | គ្មានសេវាកម្មកណ្តាលដែលប្រឈមការដួល | Orchestrator ត្រូវតែមាន high availability |
+| **ស័ក្តិសមបំផុតសម្រាប់** | Workflow ខ្លីៗ ២ ទៅ ៣ ជំហានត្រង់ៗ | Workflow វែងៗ មានលក្ខខណ្ឌច្រើន និង timeouts |
+
+## Decision
+
+- **ជ្រើសរើស Choreography នៅពេល៖**
+  - Workflow មានត្រឹមតែ **២ ទៅ ៣ ជំហានប៉ុណ្ណោះ** ហើយគ្មានលក្ខខណ្ឌបែកខ្នែងច្រើន (ឧទាហរណ៍ Order Created $\to$ Send Notification $\to$ Update Analytics)។
+  - ដំណើរការអាជីវកម្មកម្រមានការផ្លាស់ប្តូរ។
+  - អ្នកមានប្រព័ន្ធ Distributed Tracing (OpenTelemetry/Jaeger) រួចរាល់ក្នុងដៃ។
+- **ជ្រើសរើស Orchestration នៅពេល៖**
+  - Workflow មាន **៤ ជំហានឡើងទៅ** ឬមានជំហានដំណើរការស្របគ្នា (ឧ. កាត់លុយបណ្តើរ កក់ទំនិញក្នុងស្តុកបណ្តើរ)។
+  - សកម្មភាព Compensating មានភាពស្មុគស្មាញ (ឧទាហរណ៍ បើកាត់លុយមិនបាន ត្រូវដោះលែងកៅអី, បញ្ចូលទំនិញទៅស្តុកវិញ និងផ្ញើអ៊ីមែលសុំទោស)។
+  - អាជីវកម្មត្រូវការដឹងភ្លាមៗអំពីស្ថានភាពច្បាស់លាស់នៃ order នីមួយៗ។
+  - មានជំហានដែលត្រូវរង់ចាំមនុស្សអនុម័ត ឬរង់ចាំយូរ (ឧទាហរណ៍ រង់ចាំ ២៤ ម៉ោងដើម្បីផ្ទេរប្រាក់តាមធនាគារ)។
+
+## Implementation
+
+### Orchestrated Saga State Machine ក្នុង TypeScript៖
+
+```typescript
+interface SagaStep {
+  name: string;
+  execute: (context: any) => Promise<any>;
+  compensate: (context: any) => Promise<void>;
+}
+
+export class OrderSagaOrchestrator {
+  private steps: SagaStep[] = [];
+  private executedSteps: SagaStep[] = [];
+
+  addStep(step: SagaStep) {
+    this.steps.push(step);
+    return this;
+  }
+
+  async execute(context: any) {
+    console.log(`ចាប់ផ្តើម Order Saga សម្រាប់ order ${context.orderId}`);
+
+    for (const step of this.steps) {
+      try {
+        console.log(`កំពុងដំណើរការជំហាន៖ ${step.name}`);
+        await step.execute(context);
+        this.executedSteps.push(step);
+      } catch (err) {
+        console.error(`ជំហាន ${step.name} បានបរាជ័យ! ចាប់ផ្តើមធ្វើ compensation...`, err);
+        await this.rollback(context);
+        throw new Error(`Saga បរាជ័យត្រង់ជំហាន ${step.name}: ${err}`);
+      }
+    }
+
+    console.log(`Order Saga ${context.orderId} បានបញ្ចប់ដោយជោគជ័យ។`);
+  }
+
+  private async rollback(context: any) {
+    // ធ្វើការ rollback តាមលំដាប់ច្រាសទិសមកវិញ
+    for (const step of this.executedSteps.reverse()) {
+      try {
+        console.log(`កំពុងធ្វើការប៉ះប៉ូវ (compensating) ជំហាន៖ ${step.name}`);
+        await step.compensate(context);
+      } catch (compensateErr) {
+        // សំខាន់បំផុត៖ ត្រូវកត់ត្រាចូល dead-letter queue ដើម្បីឱ្យមនុស្សជួយកែសម្រួល
+        console.error(`FATAL: ការប៉ះប៉ូវបរាជ័យសម្រាប់ ${step.name}`, compensateErr);
+      }
+    }
+  }
+}
+```
+
+### ការកំណត់ជំហានក្នុង Saga៖
+
+```typescript
+const saga = new OrderSagaOrchestrator()
+  .addStep({
+    name: 'ReserveInventory',
+    execute: async (ctx) => await inventoryClient.reserve(ctx.orderId, ctx.items),
+    compensate: async (ctx) => await inventoryClient.release(ctx.orderId),
+  })
+  .addStep({
+    name: 'ProcessPayment',
+    execute: async (ctx) => await paymentClient.charge(ctx.orderId, ctx.amount),
+    compensate: async (ctx) => await paymentClient.refund(ctx.orderId),
+  })
+  .addStep({
+    name: 'ShipOrder',
+    execute: async (ctx) => await shippingClient.scheduleDelivery(ctx.orderId),
+    compensate: async (ctx) => await shippingClient.cancelDelivery(ctx.orderId),
+  });
+
+// ដំណើរការ workflow
+await saga.execute({ orderId: 'ord_9182', amount: 150, items: ['item_1'] });
+```
+
+## Verification
+
+1. **Failure Compensation Test៖** នៅក្នុង staging environment សាកល្បងបង្កកំហុសសិប្បនិម្មិតក្នុង `ProcessPayment`។ ផ្ទៀងផ្ទាត់ថា `inventoryClient.release` ត្រូវបានហៅដោយស្វ័យប្រវត្តិ ហើយចំនួនទំនិញក្នុងស្តុកត្រូវត្រឡប់មកដូចដើមវិញភ្លាមៗ។
+2. **ពិនិត្យស្ថានភាពក្នុង State Machine៖** Query មើល database របស់ orchestrator; វាត្រូវតែរាយការណ៍ស្ថានភាព `COMPENSATED` ជាមួយពេលវេលា និង log នៃកំហុសទូទាត់ប្រាក់យ៉ាងច្បាស់លាស់។
+3. **គ្មានទិន្នន័យ Lock ចោល៖** ត្រូវប្រាកដថាគ្មាន row ណាមួយក្នុង database ជាប់គាំងក្នុងស្ថានភាព pending បន្ទាប់ពី saga បរាជ័យឡើយ។
+
+## Why
+
+នៅពេលប្រព័ន្ធកាន់តែរីកធំឡើង **ភាពងាយយល់នៃប្រព័ន្ធ (comprehensibility) គឺជាឧបសគ្គធំជាងគេ** មិនមែនកម្លាំងម៉ាស៊ីន CPU នោះទេ។
+
+នៅក្នុង Choreography ដែលមានសេវាកម្ម ១០ ការស្វែងយល់ពីលំហូរការងារទាមទារឱ្យវិស្វករត្រូវផ្គុំរូបភាពនៅក្នុងខួរក្បាលចេញពីកូដ ១០ ផ្សេងគ្នា។ នៅពេលមាន bug កើតឡើង ការតាមដាន race condition នៃ events ឆ្លង queues ច្រើន គឺជាការងារពិបាកបំផុតមួយក្នុងវិស័យ software engineering។
+
+Orchestration ជំនួសខ្សែសង្វាក់ event ដែលមើលមិនឃើញ ដោយរូបភាពលំហូរការងារ (flowchart) ដ៏ច្បាស់លាស់មួយនៅក្នុងកូដ។
+
+## When Not To Use
+
+- **កុំប្រើ Saga ប្រសិនបើអ្នកអាចប្រើ Monolith បាន។** ប្រសិនបើ tables ទាំងអស់អាចស្ថិតក្នុង PostgreSQL តែមួយ សូមប្រើ ACID transaction ធម្មតា (`BEGIN ... COMMIT`)។ Saga នាំមកនូវភាពស្មុគស្មាញនៃ eventual consistency និងការ rollback ដ៏ឈឺក្បាល។
+- **កុំប្រើ Orchestration សម្រាប់ការជូនដំណឹងធម្មតា។** បើអ្នកប្រើប្រាស់ប្តូររូប Profile ហើយសេវាកម្ម ៥ ផ្សេងទៀតគ្រាន់តែចង់ refresh រូបភាព ចូរប្រើ event choreography (pub/sub) សាមញ្ញគឺគ្រប់គ្រាន់ហើយ។
+
+## Common Mistakes
+
+- **សរសេរសកម្មភាព Compensating ដែលគ្មាន Idempotency។** ប្រសិនបើដាច់ network ពេលកំពុង refund លុយក្នុងជំហាន rollback នោះ orchestrator នឹង retry។ API refund ត្រូវតែគាំទ្រ idempotency key ដើម្បីការពារកុំឱ្យច្រឡំសងលុយពីរដង!
+- **ច្រឡំរវាង Commands និង Domain Events។** ក្នុង choreography សេវាកម្មគួរតែបញ្ចេញ past-tense domain events (`OrderPlaced`) មិនមែនបញ្ជាគេតាមរយៈ imperative commands ក្លែងបន្លំជា event នោះឡើយ (`ChargePaymentRequested`)។
+- **ភ្លេចថាអ្នកប្រើប្រាស់អាចមើលឃើញទិន្នន័យកណ្តាលទី។** Saga គ្មានលក្ខណៈសម្បត្តិ Isolation ($I$) របស់ ACID ទេ។ ខណៈពេល saga កំពុងដើរ អ្នកប្រើប្រាស់ដទៃអាចមើលឃើញទិន្នន័យដែលកំពុង "pending"។ ត្រូវរចនា UI ឱ្យគាំទ្រស្ថានភាព pending ទាំងនេះ។

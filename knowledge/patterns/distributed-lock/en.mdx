@@ -1,0 +1,167 @@
+---
+title: "Distributed Lock"
+question: "How do I ensure only one instance executes a critical task across a distributed cluster?"
+summary: "Coordinate mutually exclusive execution across multiple independent server nodes using an external lock coordinator (Redis SET NX PX with TTL & fencing token, or PostgreSQL advisory locks)."
+tags: [concurrency, distributed-systems, redis, locking, reliability]
+related: [patterns/idempotency, patterns/optimistic-locking, problems/database-deadlocks]
+order: 15
+updated: "2026-09-12"
+contributors: [veasna]
+---
+
+## Context
+
+In modern cloud environments, backend applications run across multiple load-balanced containers or Kubernetes pods. When a periodic task (e.g. running a midnight billing run, settling lottery bets, or sending a daily newsletter) triggers, every running pod triggers the event at the same second.
+
+Without synchronization, all 5 instances execute the task simultaneously: customers receive 5 duplicate charges, double the money is withdrawn, or database deadlocks corrupt the ledger.
+
+In a single-process application, an in-memory mutex (`sync.Mutex` in Go, `ReentrantLock` in Java) prevents concurrent execution. But in-memory locks are useless across separate processes on different machines. A **Distributed Lock** coordinates mutual exclusion across independent servers using an external shared state store like Redis, etcd, or PostgreSQL advisory locks.
+
+## Symptoms
+
+- A scheduled cron job or billing cycle runs multiple times simultaneously because every web container executes it at midnight.
+- Users receive duplicate payment receipts or duplicate SMS notifications during high-concurrency requests.
+- Two worker pods pick up the same unassigned background task simultaneously, causing race conditions and database constraint violations.
+- A long-running task crashes midway, leaving a lock stuck forever and permanently preventing any future runs.
+
+<Callout type="warning" title="Locks without lease timeouts (TTLs) create permanent deadlocks">
+If a server acquires a distributed lock and immediately crashes or runs out of memory, that lock will remain held forever unless a hard TTL lease automatically expires it.
+</Callout>
+
+## Diagnose
+
+1. **Check server topology:** Are you running more than 1 replica of your application behind a load balancer?
+2. **Audit scheduled jobs:** How are cron tasks triggered? Does each pod have an in-process `node-cron` or `cron` daemon firing locally?
+3. **Inspect race condition logs:** Look for `duplicate key value violates unique constraint` errors during periodic batch operations.
+4. **Evaluate lock duration:** How long does the critical section take to execute? Is it 50 milliseconds or 10 minutes?
+
+## Options
+
+1. **Redis Key with Lease TTL (`SET resource_name token NX PX 30000`):** Fast, simple, sub-millisecond acquisition. Safe when combined with a unique owner token and atomic release via Lua script.
+2. **PostgreSQL Advisory Locks (`pg_try_advisory_lock(key)`):** Leverages existing database infrastructure without needing Redis. Automatically released if the client connection drops.
+3. **etcd / ZooKeeper Distributed Consensus:** Strongest consistency guarantees with heartbeats and leader leases. (Ideal for enterprise orchestration, but heavy infrastructure overhead).
+4. **Idempotency Keys / DB Constraints:** Instead of locking, use unique database constraints to make the underlying operation idempotent.
+
+## Trade-offs
+
+| Lock Mechanism | Latency | Crash Recovery | Infrastructure Overhead | Consensus Strength |
+| :--- | :--- | :--- | :--- | :--- |
+| **Redis (SET NX PX)** | Ultra-fast (< 1 ms) | Automatic via TTL | Minimal (if Redis exists) | Eventual / Failover edge cases |
+| **Postgres Advisory Lock** | Fast (1–3 ms) | Automatic on disconnect | Zero (uses existing DB) | Strong ACID |
+| **etcd / ZooKeeper** | Medium (5–10 ms) | Heartbeat lease expiry | High (dedicated cluster) | Strong CP Consensus (Raft/Paxos) |
+| **In-Memory Mutex** | Sub-microsecond | Instant | Zero | **Useless across pods** |
+
+## Decision
+
+- **Use PostgreSQL Advisory Locks if you already use Postgres and do not have Redis:** `SELECT pg_try_advisory_lock(123456)`. It is completely free of external dependencies and automatically cleans up if the process crashes.
+- **Use Redis `SET NX PX` with a unique owner token for high-throughput distributed locking:**
+  - Always generate a random unique token (e.g. UUID) per acquisition.
+  - Release the lock ONLY if the value matches the token, using an atomic Lua script. This prevents a slow instance from accidentally releasing a lock that has already expired and been acquired by another instance.
+- **Always attach a lease TTL:** Never acquire a distributed lock without an expiration (TTL). The TTL must be comfortably longer than the expected task execution time (e.g., 30 seconds for a 5-second task).
+- **Use Fencing Tokens for storage protection:** Pass an incrementing counter or version with the lock so storage engines can reject delayed writes from expired lock holders.
+
+## Implementation
+
+### Production-Grade Redis Distributed Lock in TypeScript:
+
+```typescript
+import { Redis } from 'ioredis';
+import { randomUUID } from 'crypto';
+
+export class DistributedLock {
+  constructor(private readonly redis: Redis) {}
+
+  /**
+   * Acquire a distributed lock.
+   * @param lockKey The resource key to lock
+   * @param ttlMs Max lease time in milliseconds before auto-expiry
+   * @returns lockToken if acquired, or null if already locked
+   */
+  async acquire(lockKey: string, ttlMs: number): Promise<string | null> {
+    const token = randomUUID();
+    // SET lockKey token NX (only if not exists) PX ttlMs (expiration in ms)
+    const result = await this.redis.set(lockKey, token, 'PX', ttlMs, 'NX');
+    return result === 'OK' ? token : null;
+  }
+
+  /**
+   * Release the distributed lock safely using an atomic Lua script.
+   * Only deletes the key if the token still matches our token!
+   */
+  async release(lockKey: string, token: string): Promise<boolean> {
+    const luaScript = `
+      if redis.call("get", KEYS[1]) == ARGV[1] then
+        return redis.call("del", KEYS[1])
+      else
+        return 0
+      end
+    `;
+
+    const result = await this.redis.eval(luaScript, 1, lockKey, token);
+    return result === 1;
+  }
+
+  /**
+   * Run a critical task exclusively with automatic acquisition and release.
+   */
+  async runExclusive<T>(
+    lockKey: string,
+    ttlMs: number,
+    task: () => Promise<T>
+  ): Promise<{ executed: boolean; result?: T }> {
+    const token = await this.acquire(lockKey, ttlMs);
+    if (!token) {
+      console.log(`[DistributedLock] Resource ${lockKey} is currently locked by another node. Skipping execution.`);
+      return { executed: false };
+    }
+
+    try {
+      const result = await task();
+      return { executed: true, result };
+    } finally {
+      await this.release(lockKey, token);
+    }
+  }
+}
+```
+
+### Usage for a nightly midnight billing job:
+
+```typescript
+const lock = new DistributedLock(new Redis(process.env.REDIS_URL!));
+
+export async function runMidnightBilling() {
+  // Lock for 60 seconds. If another pod is already running it, skip safely.
+  const outcome = await lock.runExclusive('locks:billing:midnight', 60000, async () => {
+    console.log('Acquired exclusive lock! Executing midnight billing run...');
+    await processSubscriptions();
+  });
+
+  if (!outcome.executed) {
+    console.log('Another pod is already processing midnight billing. Skipping gracefully.');
+  }
+}
+```
+
+## Verification
+
+1. **Multi-instance collision test:** Spin up 5 parallel worker processes attempting to acquire the same lock key at the exact same millisecond. Verify that exactly 1 worker acquires the lock, while the other 4 return `null` and skip execution.
+2. **Crash-safety verification:** Acquire a lock with a 3,000 ms TTL, then simulate a sudden process crash (`process.exit(1)`). Verify that after 3,001 ms, another instance can successfully acquire the lock without administrative intervention.
+3. **Lua release protection test:** Acquire a lock with a short 500 ms TTL. Sleep for 1,000 ms (allowing the lock to expire and be acquired by another node). Attempt to release the lock. Verify that the Lua script rejects the release and leaves the new owner's lock intact.
+
+## Why
+
+In distributed systems, physical isolation between compute nodes means that memory is not shared. When asynchronous events or schedule timers trigger across multiple containers, chaos ensues without an external referee.
+
+A Distributed Lock serves as that referee. By combining atomic compare-and-swap primitives (`SET NX`) with automatic time-based leases, it provides safe coordination, prevents duplicate execution, and ensures that hardware crashes do not permanently freeze critical business pipelines.
+
+## When Not To Use
+
+- **High-frequency write paths (Thousands per sec):** Acquiring a distributed lock on every user order or chat message will saturate your Redis cluster. Use optimistic concurrency (`WHERE version = 1`) or database row-level locking (`FOR UPDATE`) instead.
+- **Operations that take hours:** Distributed locks are designed for short tasks (seconds to minutes). For tasks taking hours, use a persistent workflow engine (Temporal, AWS Step Functions) or job queue with durable leases.
+
+## Common Mistakes
+
+- **Releasing locks with a simple `DEL` command:** If the task takes longer than the TTL, the lock expires, another node acquires it, and the first node's `DEL` will delete the *second* node's lock! Always use the Lua script with unique tokens.
+- **Forgetting TTL entirely:** Storing a key without an expiration means a single container crash or unhandled exception permanently locks the resource forever.
+- **Ignoring GC pauses:** In garbage-collected languages (Java, Node.js), a prolonged GC pause can freeze a process until its lock TTL expires, allowing another node to enter the critical section concurrently.

@@ -1,0 +1,105 @@
+---
+title: "How an index makes a query fast"
+summary: "Read a query plan, see why a query scans the whole table, and add the index that fixes it."
+minutes: 15
+related: [problems/database-is-slow]
+updated: "2026-09-29"
+contributors: [Veasna-Pen]
+---
+
+## The problem
+
+In the last lesson you found the query that takes most of the database's time:
+
+```sql
+SELECT * FROM orders
+WHERE customer_id = 1042
+ORDER BY created_at DESC
+LIMIT 20;
+```
+
+It takes **38 ms** on average and runs 400,000 times a day. The `orders` table has **5 million rows**. Why is fetching 20 rows so slow?
+
+## The idea
+
+Without help, the database has only one way to find the matching rows: read **every row** in the table and keep the ones that match. This is a **sequential scan** (Seq Scan). It gets slower as the table grows.
+
+An **index** is a sorted list of one or more columns, with a pointer to each row, like the index at the back of a book. With an index on `customer_id`, the database jumps straight to customer 1042's rows instead of reading 5 million.
+
+A good index for this query follows two rules:
+
+1. **Columns you filter on with `=` come first**: `customer_id`.
+2. **Then the column you sort on**: `created_at`. The rows are then already in order, so the database can stop after 20.
+
+Indexes are not free. Each one uses disk space and makes every `INSERT` and `UPDATE` a little slower, so add the ones your real queries need, not one per column.
+
+## Example
+
+Ask the database how it runs the query:
+
+```sql
+EXPLAIN ANALYZE
+SELECT * FROM orders WHERE customer_id = 1042 ORDER BY created_at DESC LIMIT 20;
+```
+
+Before (simplified):
+
+```text
+Limit  (actual time=37.9 ms rows=20)
+  -> Sort
+       -> Seq Scan on orders  (rows=5000000)
+            Filter: (customer_id = 1042)
+Execution Time: 38.1 ms
+```
+
+`Seq Scan` over 5 million rows is the warning sign. Add a composite index. `CONCURRENTLY` builds it without locking writes to the table:
+
+```sql
+CREATE INDEX CONCURRENTLY idx_orders_customer_created
+  ON orders (customer_id, created_at DESC);
+```
+
+After:
+
+```text
+Limit  (actual time=0.05 ms rows=20)
+  -> Index Scan using idx_orders_customer_created on orders
+       Index Cond: (customer_id = 1042)
+Execution Time: 0.09 ms
+```
+
+From **38 ms to 0.09 ms**. There is no `Sort` step any more, because the index already stores the rows in date order.
+
+## Try it
+
+1. Take the top query from the last lesson's exercise.
+2. Run it with `EXPLAIN ANALYZE` and look for `Seq Scan` on a large table, and for a `Sort` step.
+3. Write a composite index: equality columns first, then the sort column.
+4. Create it on a development database and run `EXPLAIN ANALYZE` again. Compare the execution time and check that the plan now says `Index Scan`.
+
+## Check yourself
+
+**1. A query filters `WHERE status = 'paid' AND customer_id = 7` and sorts by `created_at`. Which index fits best?**
+
+<Answer>
+`(customer_id, status, created_at)` or `(status, customer_id, created_at)`: both equality columns first, then the sort column. Put the more selective column first when it is used alone by other queries too.
+</Answer>
+
+**2. You add an index but the plan still shows a Seq Scan. Name one possible reason.**
+
+<Answer>
+The query matches a large share of the table, so reading everything is genuinely cheaper; the table is tiny; the column is wrapped in a function such as `lower(email)`, which a plain index cannot use; or the planner's statistics are out of date (run `ANALYZE orders`).
+</Answer>
+
+**3. Why not add an index to every column, just in case?**
+
+<Answer>
+Every index slows down writes and takes disk space and memory, and single-column indexes often don't match how queries filter and sort. Add indexes for the queries you actually run.
+</Answer>
+
+## Key takeaways
+
+- A **Seq Scan** on a big table is the usual cause of a slow lookup.
+- An **index** lets the database jump to the rows it needs.
+- Order the columns: **equality filters first, then the sort column**.
+- Always confirm with `EXPLAIN ANALYZE` before and after, and build indexes with `CONCURRENTLY` in production.

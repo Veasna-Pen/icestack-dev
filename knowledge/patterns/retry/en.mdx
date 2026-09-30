@@ -1,0 +1,132 @@
+---
+title: "Retry"
+question: "Should I add a retry?"
+summary: "Retry only failures that are transient, only operations that are safe to repeat, and always with exponential backoff, jitter and a limit. A retry without those limits turns a small outage into a large one."
+tags: [retry, resilience, backoff, reliability]
+related: [patterns/idempotency, patterns/rate-limiting, tradeoffs/sync-vs-async]
+order: 2
+updated: "2026-09-11"
+---
+
+## Context
+
+A service calls something over the network: another service, a payment provider, a database, an email API. Sometimes that call fails. Adding a retry is often the first fix anyone reaches for, and one of the easiest ways to make an incident worse.
+
+## Symptoms
+
+- Intermittent errors: `ECONNRESET`, `503 Service Unavailable`, timeouts, "deadlock detected", `429 Too Many Requests`.
+- Failures cluster around deploys, failovers or traffic spikes, and the same call succeeds moments later.
+- A job queue shows failed jobs that succeed when someone re-runs them by hand.
+
+## Diagnose
+
+Classify the failure before you retry it:
+
+1. **Is it transient?** Timeouts, connection resets, 502, 503, 504, 429, and database serialization or deadlock errors often are. 400, 401, 403, 404, 422 and validation errors are not: retrying a bad request just sends it again.
+2. **Is the operation safe to repeat?** Reads are. `PUT` and `DELETE` usually are. Creating a payment, sending an email or incrementing a counter are not, unless you make them idempotent; see [Idempotency](../idempotency).
+3. **Might the first attempt have succeeded?** A timeout means *unknown*, not *failed*. The server may have finished the work after you stopped waiting.
+4. **How many layers retry?** If the client, the gateway and the service each retry three times, one failing call becomes up to 27 attempts at the bottom of the stack.
+5. **What does the dependency say?** A `Retry-After` header or documented limits tell you when to try again.
+
+## Options
+
+1. **Don't retry; fail fast** and let the caller or the user decide.
+2. **Retry immediately**, once. Fine for a single dropped connection, harmful under load.
+3. **Exponential backoff with jitter**, capped by a number of attempts and a total deadline.
+4. **Retry asynchronously:** move the work to a queue with delayed retries and a dead-letter queue.
+5. **A circuit breaker** in front of the retries, which stops calling a dependency that is clearly down.
+
+## Trade-offs
+
+| Option | Helps with | Risk | Latency cost |
+| :--- | :--- | :--- | :--- |
+| No retry | Keeps load honest | More errors reach users | None |
+| Immediate retry | A single dropped packet | Doubles load during an outage | Small |
+| Backoff + jitter + limit | Most transient failures | Duplicates if the operation isn't idempotent | Bounded by the deadline |
+| Queue with delayed retries | Long outages, background work | The result arrives later, not now | Work leaves the request path |
+| Circuit breaker | Dependencies that are down | Rejects a few calls that would have worked | Fails fast |
+
+Retries buy success rate with extra load. When a dependency is failing *because* it is overloaded, synchronized retries are exactly the extra load that keeps it down. That's a retry storm.
+
+## Decision
+
+Retry when **the error is transient, the operation is idempotent, and there is a budget**:
+
+- At most **three attempts** in a user-facing request, with exponential backoff and full jitter, and a total deadline shorter than the caller's timeout.
+- Retry at **one layer only**, usually the one closest to the failing dependency.
+- For background work, move retries into the **queue**: backoff from minutes to hours, then a dead-letter queue.
+- Honour **`Retry-After`** and 429 responses.
+
+Revisit if retries make up more than a few percent of the calls to a dependency. That is a reliability problem to fix, not one to retry around.
+
+## Implementation
+
+A small, dependency-free retry helper in TypeScript with full jitter, an attempt limit and a deadline. It only retries errors it recognizes as transient:
+
+```ts
+const TRANSIENT_STATUS = new Set([408, 429, 500, 502, 503, 504]);
+
+export const isTransient = (err: any): boolean =>
+  err?.code === 'ECONNRESET' || err?.code === 'ETIMEDOUT' || TRANSIENT_STATUS.has(err?.status);
+
+type RetryOptions = {
+  attempts?: number;      // total tries, including the first
+  baseMs?: number;
+  maxDelayMs?: number;
+  deadlineMs?: number;    // give up after this much time in total
+  isRetryable?: (err: unknown) => boolean;
+};
+
+const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+export async function retry<T>(fn: () => Promise<T>, options: RetryOptions = {}): Promise<T> {
+  const { attempts = 3, baseMs = 100, maxDelayMs = 2000, deadlineMs = 5000, isRetryable = isTransient } = options;
+  const started = Date.now();
+
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      const elapsed = Date.now() - started;
+      if (attempt >= attempts || !isRetryable(err) || elapsed >= deadlineMs) throw err;
+
+      // Full jitter: a random delay up to the exponential ceiling.
+      const ceiling = Math.min(maxDelayMs, baseMs * 2 ** (attempt - 1));
+      await sleep(Math.min(Math.random() * ceiling, deadlineMs - elapsed));
+    }
+  }
+}
+
+// The idempotency key is what makes a repeated charge safe.
+await retry(() =>
+  payments.charge({ orderId, amount }, { idempotencyKey: `charge:${orderId}` })
+);
+```
+
+## Verification
+
+- **The success rate improved** for calls to the dependency, without raising its error rate or latency.
+- **Retries are visible.** Log or count every retry with its attempt number and error, and alert when the retry rate climbs.
+- **No duplicates.** In staging, kill the dependency mid-request and confirm there is no double charge, email or record.
+- **Load stays bounded during an outage.** Make the dependency return 503 for a minute and confirm the calls it receives stay at no more than `attempts` times normal, then fall off as the deadline and circuit breaker take over.
+
+## Why
+
+A retry assumes the next attempt will meet a different world: the packet gets through, the lock is free, the instance has restarted. That holds for brief, random failures and fails for overload and for bad requests. Backoff and jitter spread attempts out so the dependency can recover; idempotency makes repetition harmless; the attempt limit and the deadline keep the promises the caller already made. Without all four, a retry is a bet you can't afford to lose.
+
+## When Not To Use
+
+- **Client errors** (4xx other than 408 and 429) and validation failures.
+- **Non-idempotent operations** that have no idempotency key.
+- **Inside a transaction that has already failed.** Restart the whole transaction instead of retrying one statement.
+- **When a user is waiting and the deadline is almost gone.** Fail fast, with a clear message.
+- **At every layer of a call chain.**
+
+## Common Mistakes
+
+- **Retrying everything**, including 400s and 404s.
+- **No jitter**, so every client retries at the same instant and the dependency sees synchronized waves.
+- **Unlimited retries**, or a total retry time longer than the caller's timeout, so work continues after nobody is waiting for it.
+- **Retrying non-idempotent calls**, producing double charges and duplicate emails.
+- **Stacked retries** in the client, the gateway, the service and the database driver.
+- **Retries that hide failures:** they succeed quietly and the underlying problem is never fixed.

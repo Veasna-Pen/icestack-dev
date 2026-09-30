@@ -1,0 +1,173 @@
+---
+title: "Circuit Breaker"
+question: "How do I stop cascading failures when dependencies fail?"
+summary: "Wrap calls to external dependencies in a state machine that trips open after a threshold of failures, failing fast instead of exhausting worker threads. Pair it with timeouts and fallbacks."
+tags: [reliability, resilience, distributed-systems, circuit-breaker, microservices]
+related: [patterns/retry, patterns/rate-limiting, tradeoffs/sync-vs-async]
+order: 5
+updated: "2026-09-12"
+contributors: [veasna]
+---
+
+## Context
+
+A service depends on remote network dependencies: an external payment gateway, a credit bureau, a recommendation service, or an internal inventory API. 
+
+When a downstream dependency suffers an outage or severe latency (e.g. taking 20 seconds to respond instead of 100 ms), callers keep sending requests. Worker threads, event loop sockets, and database connections pile up waiting for downstream timeouts. Soon, the calling service itself runs out of resources and crashes, bringing down services upstream of it in a cascading outage.
+
+## Symptoms
+
+- A minor downstream dependency slows down, and within minutes, the entire user-facing application becomes unresponsive.
+- Server thread pools or Node.js event loops become saturated with open sockets waiting for HTTP timeouts.
+- Outbound retry loops make the problem worse by blasting the struggling dependency with multiplicative retry storms.
+- Health checks fail on upstream services because all web server worker threads are blocked.
+
+<Callout type="warning" title="Retries without circuit breakers cause death spirals">
+When a downstream service is struggling under load, retrying failed requests multiplies traffic and ensures the dependency can never recover. A circuit breaker cuts traffic off to give the dependency breathing room.
+</Callout>
+
+## Diagnose
+
+1. **Map outbound dependencies:** List every remote network call made by your service (HTTP, gRPC, third-party SDKs).
+2. **Review timeout configurations:** Does any network call lack an explicit deadline? A single unconfigured timeout will block indefinitely.
+3. **Analyze outage cascading patterns:** In recent incidents, did an outage in a non-critical feature (e.g. recommendation carousel or analytics tracking) take down checkout or authentication?
+4. **Inspect failure modes:** Is the failure transient (a network blip affecting one request) or systemic (a downstream service taking 30 seconds to fail for 95% of traffic)?
+
+## Options
+
+1. **Timeouts only.** Set aggressive timeouts (e.g., 1–2 seconds) on every call. Requests still execute and block threads for that timeout duration.
+2. **Circuit Breaker state machine.** Track failure rates over a sliding window. Trip to `OPEN` after a threshold (e.g., 50% failures over 10 requests), failing subsequent calls immediately in 0 ms without making network requests.
+3. **Bulkhead isolation.** Allocate dedicated thread/connection pools per dependency so an outage in one dependency cannot exhaust threads needed for other features.
+4. **Fallback degradation.** When the breaker trips, return cached data, default static values, or gracefully omit optional UI widgets.
+
+## Trade-offs
+
+| Strategy | Protection Level | Latency During Outage | Complexity | Fallback Behavior |
+| :--- | :--- | :--- | :--- | :--- |
+| **Timeouts only** | Weak | High (blocks for timeout duration) | Minimal | Throws error after waiting |
+| **Circuit Breaker** | High | Near 0 ms (immediate fail-fast) | Low to Medium | Fails fast or returns cached/degraded value |
+| **Bulkhead** | Very High | Isolated to specific pool | High | Dedicated resource limits |
+| **Breaker + Fallback** | Maximum | Near 0 ms | Medium | Users receive degraded experience instead of 500 error |
+
+## Decision
+
+- **Use a three-state Circuit Breaker** (`CLOSED`, `OPEN`, `HALF-OPEN`) on all network calls to external third parties and internal microservices.
+- **Always pair the circuit breaker with a strict timeout.** A breaker counts timeouts as failures to determine whether to trip.
+- **Provide a fallback whenever possible:**
+  - For non-critical features (recommendations, reviews): return an empty list or cached data.
+  - For critical features (payments): fail fast with an informative error rather than freezing the checkout button.
+- **Reset with `HALF-OPEN` probes:** After a cooldown period (e.g., 30 seconds), allow a single probe request through. If it succeeds, close the circuit; if it fails, reset the cooldown timer.
+
+## Implementation
+
+A lightweight, dependency-free Circuit Breaker implementation in TypeScript:
+
+```typescript
+type CircuitState = 'CLOSED' | 'OPEN' | 'HALF_OPEN';
+
+interface CircuitBreakerOptions {
+  failureThreshold: number; // e.g., 5 failures to trip
+  resetTimeoutMs: number;    // e.g., 30000 ms cooldown
+}
+
+export class CircuitBreaker {
+  private state: CircuitState = 'CLOSED';
+  private failureCount = 0;
+  private nextAttempt = Date.now();
+
+  constructor(
+    private readonly name: string,
+    private readonly options: CircuitBreakerOptions = { failureThreshold: 5, resetTimeoutMs: 30000 }
+  ) {}
+
+  async execute<T>(action: () => Promise<T>, fallback?: () => Promise<T>): Promise<T> {
+    if (this.state === 'OPEN') {
+      if (Date.now() > this.nextAttempt) {
+        this.state = 'HALF_OPEN';
+      } else {
+        if (fallback) return fallback();
+        throw new Error(`[CircuitBreaker:${this.name}] Circuit is OPEN - failing fast`);
+      }
+    }
+
+    try {
+      const result = await action();
+      this.onSuccess();
+      return result;
+    } catch (err) {
+      this.onFailure();
+      if (fallback) return fallback();
+      throw err;
+    }
+  }
+
+  private onSuccess() {
+    this.failureCount = 0;
+    this.state = 'CLOSED';
+  }
+
+  private onFailure() {
+    this.failureCount++;
+    if (this.state === 'HALF_OPEN' || this.failureCount >= this.options.failureThreshold) {
+      this.state = 'OPEN';
+      this.nextAttempt = Date.now() + this.options.resetTimeoutMs;
+      console.warn(`[CircuitBreaker:${this.name}] Breaker TRIPPED to OPEN until ${new Date(this.nextAttempt).toISOString()}`);
+    }
+  }
+
+  getState(): CircuitState {
+    return this.state;
+  }
+}
+```
+
+### Usage with an external dependency and fallback:
+
+```typescript
+const paymentBreaker = new CircuitBreaker('stripe-api', {
+  failureThreshold: 3,
+  resetTimeoutMs: 20000,
+});
+
+export async function processCharge(payload: ChargeRequest) {
+  return await paymentBreaker.execute(
+    async () => {
+      // Always enforce a timeout inside the breaker action
+      const res = await fetch('https://api.stripe.com/v1/charges', {
+        method: 'POST',
+        signal: AbortSignal.timeout(3000), // 3-second hard deadline
+        body: JSON.stringify(payload),
+      });
+      if (!res.ok) throw new Error(`Stripe error: ${res.status}`);
+      return await res.json();
+    },
+    // Optional fallback (e.g. enqueue for async processing or return structured error)
+    async () => {
+      return { status: 'queued', message: 'Payment gateway slow. Queued for asynchronous processing.' };
+    }
+  );
+}
+```
+
+## Verification
+
+1. **Fail-fast latency:** When downstream API latency spikes to 20 seconds, the first 5 requests will time out at 3 seconds, but the 6th request should fail or trigger fallback in **< 1 ms**.
+2. **Resource conservation:** During a prolonged dependency outage, caller CPU and active connection metrics should remain completely flat.
+3. **Automated recovery:** Once the downstream dependency recovers, verify that the probe request in `HALF_OPEN` state transitions the breaker back to `CLOSED` automatically without requiring manual restarts.
+
+## Why
+
+In electrical engineering, a physical circuit breaker interrupts the flow of electricity when current exceeds safe thresholds, preventing house fires.
+
+In software, computing resources (thread pools, socket connections, memory buffers) are finite. When a remote service fails, threads waiting on network I/O cannot serve new users. A circuit breaker protects the local service's resources by breaking the circuit, allowing your application to survive external catastrophes.
+
+## When Not To Use
+
+- **In-memory local operations:** Do not wrap fast local database queries or file reads in circuit breakers; standard error handling is sufficient.
+- **Asynchronous background queues:** If messages are processed from a durable queue (like SQS or Kafka), pausing consumption or dead-lettering is often simpler than in-process circuit breaking.
+
+## Common Mistakes
+
+- **Circuit breaker without timeouts:** If a downstream call hangs forever, the breaker never records a failure until the client disconnects, preventing the breaker from tripping.
+- **Setting thresholds too low:** Tripping after 1 single timeout causes unnecessary service disruption from brief network blips. Use a threshold (e.g. 5 failures or 50% error rate).
+- **Not logging breaker state transitions:** Always emit alerts or logs when a breaker transitions to `OPEN` so operations teams know a downstream dependency is down.

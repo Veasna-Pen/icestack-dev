@@ -1,0 +1,134 @@
+---
+title: "Caching"
+question: "តើខ្ញុំគួរ cache ទិន្នន័យនេះដែរឬទេ?"
+summary: "Cache នៅពេលចម្លើយដែលចំណាយខ្លាំងដដែល ត្រូវបានអានញឹកញាប់ជាងការផ្លាស់ប្តូររបស់វាឆ្ងាយ ហើយចម្លើយដែលហួសសម័យបន្តិចអាចទទួលយកបាន។ Cache នីមួយៗគឺជាច្បាប់ចម្លងដែលអាចខុស ដូច្នេះត្រូវសម្រេចថាវាហួសសម័យដោយរបៀបណា មុននឹងសម្រេចថាវានៅទីណា។"
+tags: [caching, performance, redis, http]
+related: [problems/should-i-use-redis, problems/database-is-slow, patterns/rate-limiting]
+order: 1
+updated: "2026-09-11"
+translation: draft
+---
+
+## Context
+
+Caching មានន័យថាការរក្សាទុកច្បាប់ចម្លងនៃលទ្ធផលមួយ ឱ្យនៅជិតកន្លែងដែលត្រូវការវា ដើម្បីកុំឱ្យត្រូវគណនា ឬទាញយកវាម្តងទៀត។ វាកើតឡើងនៅគ្រប់ស្រទាប់៖ browser, CDN, reverse proxy, memory របស់ application, Redis និង buffer pool របស់ database ខ្លួនឯង។ សំណួរ «តើខ្ញុំគួរ cache ទិន្នន័យនេះដែរឬទេ?» ជាធម្មតាកើតឡើងនៅពេល endpoint មួយយឺត ឬ database រវល់ខ្លាំង។
+
+## Symptoms
+
+- Query ឬ API call ដដែល ដំណើរការរាប់ពាន់ដងជាមួយ inputs ដដែល និងលទ្ធផលដដែល។
+- ទំព័រ ឬ endpoint មួយយឺត ព្រោះវាប្រមូលផ្តុំទិន្នន័យ៖ dashboards, ការរាប់ចំនួន, recommendations។
+- External API មួយយឺត មានដែនកំណត់ rate ឬគិតថ្លៃតាមការហៅនីមួយៗ។
+- គេរំពឹងថា traffic កើនខ្លាំង (ការលក់បញ្ចុះតម្លៃ ការដាក់ឱ្យប្រើថ្មី) នឹងធ្វើឱ្យ backend ផ្ទុកលើសចំណុះ។
+
+## Diagnose
+
+មុននឹង cache សូមវាស់វែងបីចំណុចអំពីទិន្នន័យ៖
+
+1. **សមាមាត្រ read/write។** តើមាន reads ប៉ុន្មានសម្រាប់ការផ្លាស់ប្តូរមួយ? ទំព័រផលិតផលដែលត្រូវបានអាន 10,000 ដងក្នុងការ update មួយ គឺជាបេក្ខភាពដ៏ល្អ។ កន្ត្រកទំនិញដែលត្រូវបានអានពីរដងក្នុងការផ្លាស់ប្តូរមួយ មិនមែនទេ។
+2. **ភាពហួសសម័យដែលអាចទទួលយកបាន។** តើចម្លើយក្នុង cache អាចខុសបានប៉ុណ្ណា ហើយរយៈពេលប៉ុន្មាន? សរសេរវាជាវិនាទី៖ «តម្លៃ៖ 60 s», «ស្តុកនៅពេល checkout៖ 0 s»។
+3. **ការចំណាយនៃ miss មួយ។** តើការគណនាចម្លើយយឺត ឬថ្លៃប៉ុណ្ណា? ប្រសិនបើ miss មួយចំណាយត្រឹម 3 ms នោះ cache ស្ទើរតែមិនជួយអ្វីទេ។
+
+ក៏ត្រូវបញ្ជាក់ផងដែរថាភាពយឺតនេះ មិនមែនបណ្តាលមកពី index ដែលខ្វះ ឬ N+1 query; សូមមើល [ហេតុអ្វីបានជា database របស់ខ្ញុំយឺត?](../../problems/database-is-slow)។ ការ cache query យឺត គ្រាន់តែលាក់វា រហូតដល់ពេល cache ទទេ។
+
+## Options
+
+1. **មិន cache ទេ៖ ធ្វើឱ្យប្រភពលឿនជាងមុន** ដោយប្រើ index, query ល្អជាងមុន ឬ column ដែលគណនាទុកជាមុន។
+2. **HTTP caching៖** headers `Cache-Control`, CDN និងការ revalidate ដោយ `ETag`។ មិនត្រូវការកូដ application ទាល់តែសោះ សម្រាប់ responses សាធារណៈដែលដូចគ្នា។
+3. **In-process cache៖** LRU map មួយនៅក្នុង server នីមួយៗ។ ជម្រើសលឿនបំផុត ប៉ុន្តែ server នីមួយៗមានច្បាប់ចម្លងផ្ទាល់ខ្លួន។
+4. **Shared cache (Redis, Memcached)៖** ច្បាប់ចម្លងតែមួយសម្រាប់ servers ទាំងអស់ ជាមួយ TTLs និង invalidation ច្បាស់លាស់។
+5. **គណនាទុកជាមុន៖** materialized views, summary tables ឬ job ដែលសរសេរចម្លើយទុកជាមុន។
+
+## Trade-offs
+
+| ជម្រើស | ល្បឿនដែលទទួលបាន | ការគ្រប់គ្រងភាពហួសសម័យ | ការងារ invalidation | ចំណុចខូចថ្មីៗ |
+| :--- | :--- | :--- | :--- | :--- |
+| ប្រភពលឿនជាងមុន | ពិតប្រាកដ និងអចិន្ត្រៃយ៍ | មិនចាំបាច់ | គ្មាន | គ្មាន |
+| HTTP / CDN | ធំណាស់សម្រាប់មាតិកាសាធារណៈ | TTL, revalidation | Purge API | ទិន្នន័យឯកជនត្រូវបម្រើជាសាធារណៈ ប្រសិនបើ headers ខុស |
+| In-process | ខ្ពស់បំផុតក្នុងមួយ hit | TTL នៅក្នុង server នីមួយៗ | ពិបាកឆ្លង servers | Servers មិនស៊ីគ្នា; សម្ពាធ memory |
+| Redis | ខ្ពស់ | TTL បូកការលុបច្បាស់លាស់ | មធ្យម | Redis គាំង, stampedes, entries ហួសសម័យ |
+| គណនាទុកជាមុន | ខ្ពស់ | កាលវិភាគ refresh | Refresh jobs | ហួសសម័យរហូតដល់ refresh បន្ទាប់; jobs បរាជ័យ |
+
+ការចំណាយដែលកើតឡើងម្តងហើយម្តងទៀតនៅគ្រប់ជម្រើសទាំងអស់គឺ **invalidation**៖ ការដឹងថានៅពេលណាច្បាប់ចម្លងបានក្លាយជាខុស។ Invalidation ដោយ TTL តែម្យ៉ាង គឺសាមញ្ញ ហើយអាចព្យាករបាន។ Invalidation ផ្អែកលើ events ផ្តល់ទិន្នន័យថ្មីជាង ប៉ុន្តែគ្រប់ផ្លូវ write ទាំងអស់ត្រូវតែចងចាំធ្វើវា។
+
+## Decision
+
+Cache នៅពេល **reads ច្រើនជាង writes ឆ្ងាយ, miss មួយចំណាយខ្លាំង, ហើយភាពហួសសម័យមានដែនកំណត់ដែលបានព្រមព្រៀងគ្នា។** ជម្រើសតាមលំដាប់៖ ជួសជុលប្រភព; ប្រើ HTTP caching សម្រាប់មាតិកាសាធារណៈ; ប្រើ cache-aside ដែលមាន TTL ខ្លីក្នុង Redis (ឬ in-process នៅពេលមាន server តែមួយ) សម្រាប់ផ្នែកដែលនៅសល់។
+
+ចាប់ផ្តើមជាមួយ invalidation ដោយ TTL តែម្យ៉ាង ហើយ TTL ស្មើនឹងភាពហួសសម័យដែលអ្នកបានព្រមព្រៀង។ បន្ថែម invalidation ច្បាស់លាស់ តែសម្រាប់ទិន្នន័យដែលការរង់ចាំ TTL យឺតពេកប៉ុណ្ណោះ។
+
+កុំ cache ទិន្នន័យដែលត្រូវតែត្រឹមត្រូវទាំងស្រុងនៅពេលវាត្រូវបានប្រើ (សមតុល្យ ស្តុកនៅពេល checkout សិទ្ធិភ្លាមៗបន្ទាប់ពីវាផ្លាស់ប្តូរ) លុះត្រាតែអ្នកក៏ពិនិត្យប្រភពនៅពេលនោះដែរ។
+
+## Implementation
+
+Cache-aside ជាមួយ TTL, jitter និង single-flight refill ដើម្បីកុំឱ្យ key ពេញនិយមមួយផុតកំណត់ ហើយបញ្ជូន stampede ទៅកាន់ database។ Node.js ជាមួយ `ioredis`៖
+
+```ts
+const inflight = new Map<string, Promise<unknown>>();
+
+export async function cached<T>(key: string, ttlSeconds: number, load: () => Promise<T>): Promise<T> {
+  const hit = await redis.get(key).catch(() => null);
+  if (hit !== null) return JSON.parse(hit) as T;
+
+  // Single flight: concurrent misses in this process share one load.
+  const pending = inflight.get(key);
+  if (pending) return pending as Promise<T>;
+
+  const promise = (async () => {
+    try {
+      const value = await load();
+      // Jitter spreads expiry, so keys written together don't expire together.
+      const ttl = Math.round(ttlSeconds * (0.9 + Math.random() * 0.2));
+      await redis.set(key, JSON.stringify(value), 'EX', ttl).catch(() => {});
+      return value;
+    } finally {
+      inflight.delete(key);
+    }
+  })();
+
+  inflight.set(key, promise);
+  return promise;
+}
+
+// Usage
+const product = await cached(`product:v1:${id}`, 60, () => db.product.findUnique({ where: { id } }));
+```
+
+នៅពេល write មួយត្រូវតែមើលឃើញភ្លាមៗ សូមលុប key បន្ទាប់ពី database commit ជំនួសឱ្យការសរសេរតម្លៃថ្មីចូលទៅក្នុងវា៖
+
+```ts
+await db.product.update({ where: { id }, data });
+await redis.del(`product:v1:${id}`);   // the next read refills from the source of truth
+```
+
+សម្រាប់ responses សាធារណៈដែលដូចគ្នាសម្រាប់មនុស្សគ្រប់គ្នា សូមឱ្យ HTTP ធ្វើការងារនេះ៖
+
+```text
+Cache-Control: public, max-age=60, stale-while-revalidate=300
+```
+
+## Verification
+
+- **Hit ratio** លើសពីប្រហែល 80% សម្រាប់ keys ដែលសំខាន់ (`keyspace_hits` ធៀបនឹង `keyspace_misses` ឬ metrics តាម key នៅក្នុង app របស់អ្នក)។
+- **Load របស់ប្រភពបានធ្លាក់ចុះ** ប្រហែលស្មើនឹង hit ratio ហើយ p95 របស់ endpoint បានធ្លាក់ចុះ។
+- **ភាពហួសសម័យស្ថិតក្នុងដែនកំណត់ដែលបានព្រមព្រៀង៖** update record មួយ ហើយវាស់ថាតម្លៃចាស់នៅតែត្រូវបានបម្រើរយៈពេលប៉ុន្មាន។
+- **Cache ទទេមានសុវត្ថិភាព៖** flush វានៅក្នុង staging ខណៈមាន load។ Database គួរតែរស់រានពីការបំពេញឡើងវិញ។
+
+## Why
+
+Cache ដោះដូរភាពថ្មីស្រស់ (freshness) ដើម្បីបានល្បឿន។ ការដោះដូរនោះមានសុវត្ថិភាព លុះត្រាតែអ្នកដឹងពីតម្លៃរបស់វា ហេតុនេះហើយការព្រមព្រៀងលើភាពហួសសម័យដែលអាចទទួលយកបាន ត្រូវតែមកមុនការជ្រើសរើសឧបករណ៍។ Bugs ភាគច្រើនទាក់ទងនឹង caching មិនមែននិយាយពី Redis ឬ TTLs ទេ; វានិយាយពីទិន្នន័យដែលគេសន្មតថាថ្មី តែតាមពិតមិនមែន។
+
+## When Not To Use
+
+- **ទិន្នន័យដែល write ច្រើន ឬកម្រត្រូវបានអានឡើងវិញ** ដែល hit ratio នឹងទាប។
+- **ទិន្នន័យដែលត្រូវតែត្រឹមត្រូវទាំងស្រុងនៅពេលធ្វើការសម្រេចចិត្ត** (លុយ ស្តុក ការគ្រប់គ្រងសិទ្ធិ) លុះត្រាតែអ្នកពិនិត្យប្រភពម្តងទៀត។
+- **ទិន្នន័យតាមអ្នកប្រើម្នាក់ៗដែលកម្រប្រើឡើងវិញ** ដែលចំនួន keys កើនឡើងយ៉ាងខ្លាំង ហើយ key នីមួយៗត្រូវបានអានតែម្តង។
+- **ដើម្បីលាក់ query យឺតដែលអ្នកអាចជួសជុលបាន។** Cache នឹងទទេនៅពេល deploy និងពេលមាន incident ដែលជាពេលដែលអ្នកត្រូវការវាខ្លាំងបំផុត។
+
+## Common Mistakes
+
+- **Cache មុនពេលវាស់វែង** ដូច្នេះគ្មាននរណាដឹងថាវាជួយឬអត់។
+- **គ្មាន TTL** ដូច្នេះ bug ណាមួយក្នុង invalidation នៅជារៀងរហូត។
+- **សរសេរតម្លៃថ្មីចូល cache រាល់ពេល update។** Writes ពីរដែលកើតឡើងព្រមគ្នា អាចធ្លាក់ចូលខុសលំដាប់ ហើយបន្សល់ទុកតម្លៃចាស់។ ការលុប key បន្ទាប់ពី commit គឺសាមញ្ញជាង ហើយកែខ្លួនឯងបាន នៅពេលមាន TTL។
+- **Stampedes** នៅពេល hot key ផុតកំណត់។ ប្រើ jitter, single-flight refills ឬ `stale-while-revalidate`។
+- **Cache errors ឬលទ្ធផលទទេយូរពេក** ដូច្នេះ outage ខ្លីមួយនៅតែបន្តលើសពីរយៈពេលពិតរបស់វា។
+- **HTTP headers ខុស** ដូចជា `public` លើ response ផ្ទាល់ខ្លួន ដែលអនុញ្ញាតឱ្យ CDN បម្រើទិន្នន័យរបស់អ្នកប្រើម្នាក់ទៅអ្នកប្រើម្នាក់ទៀត។

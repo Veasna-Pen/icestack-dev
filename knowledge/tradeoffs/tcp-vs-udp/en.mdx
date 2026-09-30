@@ -1,0 +1,139 @@
+---
+title: "TCP vs UDP"
+question: "When should network protocols use reliable TCP versus low-latency UDP or modern QUIC?"
+summary: "TCP provides a reliable, ordered, flow-controlled byte stream with guaranteed delivery, essential for web APIs, files, and databases. UDP provides lightweight, connectionless datagrams with zero handshake latency, ideal for real-time gaming, voice/video streaming, and DNS. QUIC merges the reliability of TCP with the speed of UDP."
+tags: [networking, protocols, tcp, udp, quic, http3]
+related: [tradeoffs/rest-vs-grpc, tradeoffs/websockets-vs-sse]
+order: 17
+updated: "2026-09-12"
+contributors: [veasna]
+---
+
+## Context
+
+At the transport layer of the internet (Layer 4), virtually all network traffic is governed by two fundamental protocols:
+1. **TCP (Transmission Control Protocol):** Connection-oriented. It establishes a connection via a 3-way handshake (`SYN`, `SYN-ACK`, `ACK`), guarantees that every single byte arrives intact and in order through sequence numbers and acknowledgments, and prevents network collapse via flow control and congestion windows.
+2. **UDP (User Datagram Protocol):** Connectionless. It sends independent packets ("datagrams") to a destination port with zero handshake, zero delivery guarantees, and zero retransmissions. If a packet is dropped by an overloaded router, it is lost forever.
+3. **QUIC (HTTP/3):** Built on top of UDP in user space, QUIC brings TCP-like reliability and congestion control without TCP's Head-of-Line blocking, achieving 0-RTT handshakes and seamless connection migration across Wi-Fi and cellular networks.
+
+Choosing the wrong protocol leads to severe latency penalties on real-time media (TCP retransmission freezes during video calls) or silent data corruption (UDP used for financial file transfers).
+
+## Symptoms
+
+- **TCP Head-of-Line Blocking:** A multiplayer game or live audio call stutters and freezes for 300 ms whenever a single packet drops on a mobile cellular connection, because TCP halts all delivery until the dropped packet is retransmitted.
+- **UDP Data Loss Disaster:** An application attempts to stream financial transactions or binary files over raw UDP; packets arrive out of order or silently disappear over the public internet, corrupting data.
+- **Handshake Latency Overhead:** A mobile client on a slow 150 ms cellular connection spends 450 ms merely establishing TCP and TLS handshakes before transmitting a single byte of HTTP payload.
+
+<Callout type="warning" title="TCP guarantees delivery by pausing time; UDP preserves time by dropping packets">
+If freshness matters more than completeness (e.g. current player coordinates in a game or live voice audio), old packets are useless. TCP will freeze the stream to redeliver obsolete packets; UDP drops them and keeps going.
+</Callout>
+
+## Diagnose
+
+1. **Evaluate data tolerance for packet loss:** If 1% of packets drop, does the application break (corrupted file, broken API), or does it merely cause a microscopic audio glitch?
+2. **Measure latency constraints:** Does your workload require sub-50ms round-trip latency (FPS gaming, WebRTC video conferencing, real-time audio), or is 200 ms latency completely acceptable?
+3. **Audit network environment:** Are your clients operating on unstable mobile networks (subway, cellular switching) where packet loss is frequent?
+4. **Inspect connection setup frequency:** Are clients sending tiny, one-off queries (like DNS lookups) where a 3-way TCP handshake triples the query duration?
+
+## Options
+
+1. **Standard TCP (HTTP/1.1 & HTTP/2):** Rock-solid reliability, ordered streams, hardware offloading. (Suffers from handshake latency and head-of-line blocking on packet loss).
+2. **Raw UDP:** Zero handshake, minimal 8-byte header overhead, fire-and-forget. (No congestion control, packets may arrive duplicated or out of order).
+3. **WebRTC (UDP + SRTP / SCTP):** Real-time peer-to-peer audio, video, and data channels with built-in encryption and jitter buffers.
+4. **QUIC / HTTP/3:** UDP-based multiplexed transport with TLS 1.3 encryption, eliminating head-of-line blocking across independent streams.
+
+## Trade-offs
+
+| Dimension | TCP | UDP | QUIC (HTTP/3) |
+| :--- | :--- | :--- | :--- |
+| **Reliability & Ordering** | **Guaranteed (100% loss-free)** | None (best effort) | **Guaranteed per stream** |
+| **Connection Setup** | 1 RTT (3-way handshake) | **0 RTT (connectionless)** | **0–1 RTT (integrated TLS 1.3)** |
+| **Head-of-Line Blocking** | High (drops block entire stream) | **None (independent datagrams)** | **None across streams** |
+| **Header Overhead** | 20–60 bytes per packet | **8 bytes** | Variable (compact) |
+| **Congestion Control** | Built-in (BBR, CUBIC) | None (must implement in app) | Built-in (modern BBR) |
+| **Firewall Friendliness** | **Universal (never blocked)** | Mostly open (some ISP throttling)| UDP port 443 blocked on some corporate nets |
+
+## Decision
+
+- **Use TCP for:**
+  - Web REST/JSON APIs, GraphQL, gRPC over HTTP/2.
+  - Database client connections (PostgreSQL, Redis, MySQL).
+  - File transfers, software downloads, email (SMTP/IMAP), and secure shell (SSH).
+  - Any domain where a single missing byte corrupts the payload.
+- **Use UDP for:**
+  - Real-time multiplayer game state replication (player positions, orientation).
+  - Voice-over-IP (VoIP), live video streaming, and video conferencing (WebRTC).
+  - High-frequency ephemeral telemetry, metrics gathering (StatsD / Prometheus push), and Syslog.
+  - DNS resolution queries (speed is critical, client can simply retry).
+- **Upgrade to QUIC / HTTP/3 for:**
+  - Modern web and mobile applications with global users on cellular connections, eliminating connection drops when switching between Wi-Fi and 5G.
+
+## Implementation
+
+### 1. Reliable TCP Server in Node.js:
+
+```typescript
+import net from 'net';
+
+// TCP Server: Guarantees every byte arrives in strict order
+const tcpServer = net.createServer((socket) => {
+  console.log(`[TCP] Client connected: ${socket.remoteAddress}:${socket.remotePort}`);
+
+  socket.on('data', (buffer) => {
+    console.log(`[TCP] Received ordered data stream (${buffer.length} bytes)`);
+    // Echo back reliably
+    socket.write(buffer);
+  });
+
+  socket.on('error', (err) => console.error('[TCP] Error:', err.message));
+});
+
+tcpServer.listen(9000, () => console.log('TCP Server listening on port 9000'));
+```
+
+### 2. High-Speed UDP (Datagram) Server for Telemetry:
+
+```typescript
+import dgram from 'dgram';
+
+// UDP Socket: Ultra-fast, connectionless, fire-and-forget metrics
+const udpSocket = dgram.createSocket('udp4');
+
+udpSocket.on('message', (msg, rinfo) => {
+  // Process instant metrics with zero connection overhead (< 0.1 ms)
+  const metricString = msg.toString();
+  // Example StatsD format: "api.requests:1|c"
+  recordMetric(metricString);
+});
+
+udpSocket.bind(8125, () => console.log('UDP StatsD Server listening on port 8125'));
+
+function recordMetric(data: string) {
+  // Ingest metric without acknowledging (no network return trip!)
+}
+```
+
+## Verification
+
+1. **Packet drop simulation:** Use `tc` (Linux Traffic Control) to introduce 5% packet loss: `tc qdisc add dev eth0 root netem loss 5%`. Verify that TCP latency spikes significantly due to retransmissions, while UDP latency remains flat.
+2. **Handshake round-trip measurement:** Compare time-to-first-byte between TCP+TLS 1.2 (3 RTTs) versus QUIC (1 RTT on cold, 0 RTT on resume). QUIC should establish connections 60% faster on mobile networks.
+3. **Wi-Fi to mobile network handoff test:** Stream data over HTTP/3 QUIC on a mobile device and turn off Wi-Fi. Verify that the stream continues without dropping or reconnecting via Connection ID migration.
+
+## Why
+
+At the hardware level, routers and switches operate by forwarding packets across physical lines. When a buffer overflows, routers simply drop packets onto the floor.
+- **TCP forces the digital universe to simulate perfection:** It pauses time, tracks sequences, and re-requests lost pieces until the byte stream is 100% complete.
+- **UDP embraces reality as it is:** It prioritizes the present moment over historical perfection. In live human communication, the sentence spoken 500 ms ago is irrelevant compared to the sentence being spoken right now.
+
+Understanding this division allows you to match transport mechanics to the temporal nature of your data.
+
+## When Not To Use
+
+- **UDP for financial ledgers:** If a single packet drops containing `$10,000`, the ledger will become permanently corrupted.
+- **TCP for real-time competitive first-person shooter games:** A single dropped packet will cause all players to teleport or freeze while waiting for the TCP retransmission window.
+
+## Common Mistakes
+
+- **Reinventing TCP over UDP poorly:** Building custom ACK and retransmission protocols on top of UDP without congestion control, accidentally creating network congestion collapse. Use QUIC or WebRTC instead.
+- **Corporate firewall blocking of UDP:** Assuming UDP port 443 (QUIC) is always open. Many restrictive corporate proxies block all non-TCP traffic. Always support automatic fallback to TCP/HTTPS.
+- **Sending giant packets over UDP:** Exceeding the network MTU (typically 1,500 bytes) forces IP-level packet fragmentation. If one fragment drops, the entire UDP datagram is discarded. Keep UDP payloads under 1,400 bytes.

@@ -1,0 +1,166 @@
+---
+title: "Why is my app leaking memory?"
+question: "Why does my application keep running out of memory?"
+summary: "Memory leaks in garbage-collected runtimes happen when unused objects remain reachable from global roots. Compare heap snapshots before you blindly raise container limits or schedule periodic restarts."
+tags: [memory, performance, nodejs, debugging, containers]
+related: [problems/database-is-slow, patterns/caching]
+order: 7
+updated: "2026-09-12"
+contributors: [veasna]
+---
+
+## Context
+
+A containerized backend service running on Kubernetes with a 512 MB memory limit (`resources.limits.memory: 512Mi`). When first deployed, the process consumes about 120 MB of RAM. Over the next three days, memory usage climbs steadily without ever decreasing, until the Kubernetes kubelet abruptly terminates the container with `Exit Code 137` (`OOMKilled`).
+
+The team's immediate reaction is to double the container memory limit to 1024 MB. The container stays alive for six days instead of three, then crashes again.
+
+## Symptoms
+
+- Kubernetes pods restart repeatedly with `OOMKilled` (Exit Code 137).
+- Memory metric graphs show a steady "sawtooth" pattern: climbing continuously until an instant drop to zero on crash.
+- Application latency degrades and CPU usage spikes right before the crash as the V8 Garbage Collector (GC) runs panic full-mark-sweep cycles to reclaim memory.
+- In-flight HTTP requests are dropped without graceful cleanup when the Linux kernel invokes the Out-Of-Memory (OOM) killer.
+
+<Callout type="warning" title="Increasing container memory does not fix a memory leak">
+Doubling container RAM only delays the inevitable crash and doubles your infrastructure bill. A memory leak is caused by code holding references to objects long after their useful lifecycle has ended.
+</Callout>
+
+## Diagnose
+
+In garbage-collected environments (such as Node.js, Go, or Java), memory cannot be freed if an object is still reachable from a **GC Root** (global variables, active closures, or event listener registries).
+
+**1. Distinguish normal GC memory growth from a leak.**
+Garbage collectors do not release memory immediately. If memory rises during traffic and drops after a quiet period, it is not a leak. If memory **never decreases** even during zero traffic overnight, a leak is present:
+
+```bash
+# Check memory usage trends over 24 hours in container
+kubectl top pod -l app=api-service --containers
+```
+
+**2. Capture heap snapshots.**
+Do not guess which function is leaking. Take two heap snapshots: one immediately after startup (baseline), and a second after processing 10,000 requests under load.
+
+In Node.js, you can take a heap snapshot programmatically without stopping the process:
+
+```typescript
+import v8 from 'v8';
+import fs from 'fs';
+
+export function takeHeapSnapshot(label: string) {
+  const fileName = `/tmp/heap-${label}-${Date.now()}.heapsnapshot`;
+  const stream = v8.getHeapSnapshot();
+  const fileStream = fs.createWriteStream(fileName);
+  stream.pipe(fileStream);
+  console.log(`Heap snapshot written to ${fileName}`);
+}
+```
+
+**3. Inspect in Chrome DevTools.**
+Open Chrome, navigate to `chrome://inspect`, load both snapshots, and select the **"Comparison"** view:
+
+| Constructor | # Alloc | # Freed | Alloc. Size | Size Delta |
+| :--- | :--- | :--- | :--- | :--- |
+| `(closure)` | 14,200 | 200 | 12.8 MB | **+12.6 MB** |
+| `Object` (cache entries) | 52,000 | 100 | 48.2 MB | **+48.1 MB** |
+| `EventEmitter` listeners | 8,400 | 0 | 4.2 MB | **+4.2 MB** |
+
+Look at the **Size Delta** and sort by **Retained Size**. Expand the top constructor to find the "Distance to GC Root".
+
+## Options
+
+1. **Increase container memory limits.** Mask the problem by buying more RAM.
+2. **Schedule periodic container restarts (Cron).** Restart containers every midnight to clear memory before they crash.
+3. **Replace unbounded caches with bounded LRU caches.** Cap in-memory caches to a maximum number of items with expiration.
+4. **Remove dangling event listeners and timers.** Clean up listeners and intervals when requests or socket connections complete.
+5. **Move shared state to Redis.** Offload in-memory user sessions and temporary tokens to an external store.
+
+## Trade-offs
+
+| Option | Engineering Effort | Durability of Fix | Operational Cost | Trade-offs |
+| :--- | :--- | :--- | :--- | :--- |
+| **Increase RAM** | Zero | Temporary (fails at scale) | High ($$ cloud bill) | Just delays the crash. |
+| **Periodic restarts** | Low | Hacky workaround | Low | Causes brief request interruptions and masks underlying bugs. |
+| **Bounded LRU Cache** | Low (1 hour) | **Permanent** | Zero | Prevents unbounded growth; older entries automatically evicted. |
+| **Fix event listeners** | Medium (debugging) | **Permanent** | Zero | Eliminates retaining roots completely. |
+| **Move state to Redis** | Medium | **Permanent** | Low to Medium | Adds a network dependency, but makes app containers truly stateless. |
+
+## Decision
+
+1. **Find and eliminate the retaining root:**
+   - Never accept an unbounded `Map` or `Object` as an in-memory cache. Always use a bounded **LRU (Least Recently Used)** cache with an explicit `max` size limit and TTL.
+   - Audit all `emitter.on(...)` subscriptions. If a listener is attached inside an HTTP request handler without a corresponding `.off(...)` or using `.once(...)`, memory will leak on every single request.
+2. **Configure Node.js heap limits relative to container limits:**
+   - In Docker/Kubernetes, Node.js defaults `--max-old-space-size` to about 1.4 GB or 2 GB if unconfigured. If your container limit is 512 MB, Node.js will attempt to grow past 512 MB before triggering full GC, causing the Linux kernel to kill the container instantly.
+   - Always set `--max-old-space-size` to roughly **75% of your container limit** (e.g. `384` for a `512Mi` container).
+
+## Implementation
+
+### 1. Replace an unbounded cache with a bounded LRU Cache
+
+```typescript
+// ANTI-PATTERN: Leaks memory over time as keys accumulate forever
+// const cache = new Map<string, UserProfile>();
+
+import { LRUCache } from 'lru-cache';
+
+// CORRECT: Bounded memory footprint
+export const userProfileCache = new LRUCache<string, UserProfile>({
+  max: 1000,             // At most 1,000 items in memory
+  ttl: 1000 * 60 * 15,   // Auto-expire after 15 minutes
+  updateAgeOnGet: true,  // Refresh TTL on cache hit
+});
+```
+
+### 2. Clean up event listeners in request handlers
+
+```typescript
+// ANTI-PATTERN: Adds a new listener on the shared messageBus for EVERY HTTP request
+// messageBus.on('notification', handler);
+
+// CORRECT: Remove listener when HTTP response finishes, or use once()
+app.get('/events', (req, res) => {
+  const onNotification = (data: any) => {
+    res.write(`data: ${JSON.stringify(data)}\n\n`);
+  };
+
+  messageBus.on('notification', onNotification);
+
+  // Clean up when client disconnects or request finishes
+  req.on('close', () => {
+    messageBus.off('notification', onNotification);
+  });
+});
+```
+
+### 3. Container startup command with proper GC headroom
+
+In your `Dockerfile` or Kubernetes `command`:
+
+```dockerfile
+# For a container with resources.limits.memory: 512Mi
+# Set max old space size to 384 MB (75% of container limit)
+CMD ["node", "--max-old-space-size=384", "dist/index.js"]
+```
+
+## Verification
+
+1. **Load testing verification:** Run a stress test of 50,000 requests using an HTTP benchmark tool (`autocannon -c 100 -d 60s http://localhost:3000/api`).
+2. **Memory stabilization:** Observe container memory. It should rise under load and plateau at a predictable ceiling (e.g. 250 MB), never exceeding the `--max-old-space-size` boundary.
+3. **Post-test heap comparison:** Take a final heap snapshot 5 minutes after the load test ends. Total allocated objects should drop back close to baseline levels.
+
+## Why
+
+Garbage collection in modern runtimes is based on **tracing reachability from roots**. The garbage collector cannot know what data your application actually needs; it only knows whether an object can still be reached by traversing references from a global variable or active call stack.
+
+If an entry in a global `Map` or an event listener callback holds a reference to a request context, that entire closure (including the request body, headers, and database results) cannot be garbage collected.
+
+## When Not To Use
+
+- Do not confuse temporary high memory during large batch operations (e.g. processing a 500 MB CSV file) with a leak. If memory drops back down after the job finishes, it is not a leak. (For large files, use streaming instead of buffering in memory).
+
+## Common Mistakes
+
+- **Scheduling a nightly pod restart cron job.** This masks the leak and risks dropping transactions during traffic hours if traffic spikes unexpectedly before the restart.
+- **Accidental global variables.** Omitting `const` or `let` in JavaScript attaches the variable to the `global` object, preventing garbage collection forever.
+- **Logging entire request objects.** Passing large cyclic objects (`req`, `res`, or ORM query results with nested relations) to a logger that buffers them in memory.

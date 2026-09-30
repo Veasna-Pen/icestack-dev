@@ -1,0 +1,19 @@
+{
+  "placeholder": "ស្វែងរកបញ្ហា patterns, trade-offs និងវគ្គសិក្សា…",
+  "clear": "សម្អាត",
+  "noResults": "រកមិនឃើញលទ្ធផលសម្រាប់ “{{query}}”",
+  "tryHint": "សាកល្បង “redis”, “retry”, “slow query” ឬ “kafka”។",
+  "toNavigate": "ដើម្បីរំកិល",
+  "toOpen": "ដើម្បីបើក",
+  "results_other": "{{count}} លទ្ធផល",
+  "groupTopics": "ចំណេះដឹង",
+  "groupPages": "ទំព័រ",
+  "pageBadge": "ទំព័រ",
+  "roadmapBadge": "ផែនទីផ្លូវ",
+  "roadmapsDescription": "ផ្លូវអាជីពសម្រាប់អ្នកចាប់ផ្តើម តាមដំណាក់កាលនីមួយៗ",
+  "courseBadge": "វគ្គសិក្សា",
+  "lessonBadge": "មេរៀន",
+  "coursesDescription": "វគ្គសិក្សាខ្លីៗ ចាប់ផ្តើមពីបញ្ហា មួយមេរៀនម្តងៗ",
+  "howToThinkDescription": "ជំហានទាំងប្រាំបួនពីបញ្ហាដល់ការសម្រេចចិត្ត",
+  "contributeDescription": "សរសេរ ឬបកប្រែទំព័រនៅលើ GitHub"
+}

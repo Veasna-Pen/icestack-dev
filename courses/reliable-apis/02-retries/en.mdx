@@ -1,0 +1,89 @@
+---
+title: "Retry with backoff and jitter"
+summary: "Recover from brief failures by trying again, without turning a small outage into a flood of requests."
+minutes: 12
+related: [patterns/retry, problems/rate-limit-cascade]
+updated: "2026-09-29"
+contributors: [Veasna-Pen]
+---
+
+## The problem
+
+About **1 in 200** calls to an inventory service fails with a `503` or a timeout, usually while it restarts during a deploy. Each failure shows an error to a customer. Trying again a second later would almost always work.
+
+But when the service had a real outage last month, your app's retries **tripled** its traffic and kept it down for longer.
+
+## The idea
+
+A **retry** sends the same request again after a failure. It fixes **transient** failures: short blips that go away on their own.
+
+Retries need three limits to be safe:
+
+1. **Retry only what can succeed next time.** Timeouts, `503`, `429` and connection errors: yes. `400 Bad Request` or `404 Not Found`: no, the same request will fail again.
+2. **Wait longer each time** (exponential **backoff**): for example 100 ms, then 200 ms, then 400 ms. This gives the service room to recover.
+3. **Add randomness** (**jitter**) to each wait. Without it, every client that failed at the same moment retries at the same moment too.
+
+And always **cap the number of attempts**, usually two or three retries. Retrying forever just adds load.
+
+<Warning title="Only retry safe requests">
+A `GET` is safe to repeat. A `POST` that charges a card is not, unless the server can tell a retry from a new request. That is the next lesson.
+</Warning>
+
+## Example
+
+A small retry helper with backoff and full jitter:
+
+```ts
+const RETRYABLE = new Set([429, 502, 503, 504]);
+
+async function withRetry<T>(call: () => Promise<Response>, attempts = 3): Promise<Response> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      const res = await call();
+      if (!RETRYABLE.has(res.status) || attempt === attempts) return res;
+    } catch (error) {
+      if (attempt === attempts) throw error; // timeout or network error, out of attempts
+    }
+    const backoff = 100 * 2 ** (attempt - 1); // 100, 200, 400 ms…
+    await sleep(Math.random() * backoff); // full jitter: anywhere from 0 to backoff
+  }
+}
+
+const res = await withRetry(() => fetch(`${INVENTORY_API}/items/42`, { signal: AbortSignal.timeout(500) }));
+```
+
+With one retry available, the 1-in-200 failures almost all disappear. During a real outage each request makes at most 3 attempts, spread out in time, instead of hammering the service.
+
+## Try it
+
+1. Pick one read call to another service in your project.
+2. Write down which failures are worth retrying: status codes and error types.
+3. Add a retry with a maximum of 3 attempts, exponential backoff and jitter.
+4. Test it: point the call at a stub that fails the first request and succeeds on the second, and check that the user never sees the error.
+
+## Check yourself
+
+**1. The service answers `400 Bad Request`. Should you retry?**
+
+<Answer>
+No. The request itself is wrong, so sending it again gives the same answer. Retry only failures that may be temporary: timeouts, connection errors, `429` and `5xx` such as `503`.
+</Answer>
+
+**2. What does jitter prevent that backoff alone does not?**
+
+<Answer>
+Synchronised retries. With backoff alone, thousands of clients that failed together all retry after exactly 100 ms, then 200 ms, hitting the service in waves. Random waits spread them out.
+</Answer>
+
+**3. Your service calls B, which calls C. Each layer retries 3 times. How many requests can reach C for one user request?**
+
+<Answer>
+Up to 3 × 3 = 9, and more with each extra layer. Retry at one layer only, usually the one closest to the user, or keep retries very limited in deep call chains.
+</Answer>
+
+## Key takeaways
+
+- Retries fix **transient** failures; don't retry errors that will repeat.
+- Use **exponential backoff plus jitter**, and **cap the attempts**.
+- Retry at **one layer**, or retries multiply down the call chain.
+- Only retry requests that are **safe to repeat**.

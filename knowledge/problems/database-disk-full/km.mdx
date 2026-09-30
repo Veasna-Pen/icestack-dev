@@ -1,0 +1,160 @@
+---
+title: "ហេតុអ្វីបានជា disk របស់ database ពេញ?"
+question: "ហេតុអ្វីបានជា Disk របស់ PostgreSQL ពេញដោយមិនដឹងខ្លួន?"
+summary: "ការពេញទំហំផ្ទុកលើ PostgreSQL ដោយគ្មានការកើនឡើងចំនួនទិន្នន័យច្រើន ជាទូទៅបណ្តាលមកពី table bloat (dead tuples), ទិន្នន័យដែល delete ហើយតែមិនទាន់ vacuum, replication slots ដែលគេបោះបង់ចោលឃាត់ WAL logs ទុក, ឬ temporary files ពីការ sort។"
+tags: [database, postgres, storage, vacuum, disk-full]
+related: [problems/database-is-slow, problems/running-out-of-connections]
+order: 14
+updated: "2026-09-12"
+contributors: [veasna]
+translation: draft
+---
+
+## Context
+
+Production PostgreSQL 16 database មួយដំណើរការលើ SSD storage ទំហំ 200 GB។ Tables ស្នូលមានទិន្នន័យប្រហែល 10 លាន rows ដែលស៊ីទំហំជាក់ស្តែងត្រឹមតែប្រហែល 25 GB ប៉ុណ្ណោះ។
+
+ក្នុងរយៈពេលពីរខែចុងក្រោយនេះ ដោយគ្មានការកើនឡើងចំនួនអ្នកប្រើប្រាស់ ឬទិន្នន័យថ្មីៗខុសប្រក្រតីអ្វីសោះ ការប្រើប្រាស់ disk របស់ database ស្រាប់តែកើនឡើងជាលំដាប់ពី 30 GB រហូតដល់ 190 GB (ពេញ ៩៥%)។ ប្រព័ន្ធ Cloud monitoring ចាប់ផ្តើមបញ្ចេញ alert អាសន្ន៖ ប្រសិនបើ disk ឡើងដល់ ១០០% នោះ PostgreSQL នឹងប្តូរទៅកាន់ read-only mode ឬគាំងភ្លាមៗ។
+
+ការឆ្លើយតបដំបូងរបស់ក្រុមការងារគឺទិញទំហំ disk បន្ថែម (ដំឡើងដល់ 500 GB) ប៉ុន្តែត្រឹមតែប៉ុន្មានសប្តាហ៍ក្រោយមក ទំហំ disk ចេះតែកើនឡើងទៅរកកម្រិតកំណត់ថ្មីនោះម្តងទៀត។
+
+## Symptoms
+
+- ទំហំ Disk កើនឡើងឥតឈប់ឈរ ខណៈពេលដែល `SELECT count(*)` លើ tables សំខាន់ៗនៅថេរដដែល។
+- Postgres logs ចាប់ផ្តើមព្រមាន៖ `PANIC: could not write to file ... No space left on device`។
+- ការលុបទិន្នន័យរាប់លានជួរដោយប្រើ `DELETE FROM orders WHERE created_at < NOW() - INTERVAL '1 year';` **មិនបានជួយឱ្យសល់ទំហំ disk សូម្បីតែ ១ byte** (ផ្ទុយទៅវិញ ពេលខ្លះវាថែមទាំងធ្វើឱ្យស៊ី disk លើសដើមបន្តិចទៀតផង)។
+- Automatic failover ឬ read replicas ត្រូវដាច់ការតភ្ជាប់។
+
+<Callout type="warning" title="នៅក្នុង PostgreSQL ការ DELETE មិនបានប្រគល់ទំហំ Disk ទៅ OS វិញទេ">
+PostgreSQL ប្រើប្រាស់ Multi-Version Concurrency Control (MVCC)។ ប្រតិបត្តិការ `DELETE` ឬ `UPDATE` មិនបានសរសេរជាន់ពីលើជួរទិន្នន័យលើ disk ឡើយ; វាគ្រាន់តែកត់ត្រាជួរចាស់នោះថាជា "dead tuple" ដើម្បីឱ្យ transaction ដទៃនៅតែអាចអានបាន។ ទំហំ disk រូបវន្តនឹងមិនដែលត្រូវបានប្រគល់ទៅកាន់ OS វិញឡើយ លុះត្រាតែមានការធ្វើ vacuum ឬ rebuild table ឡើងវិញ។
+</Callout>
+
+## Diagnose
+
+1. **ស្វែងរកមើលថាតើ Table ឬ Index ណាខ្លះស៊ី Disk ធំជាងគេ៖**
+   ```sql
+   SELECT
+     relname AS object_name,
+     pg_size_pretty(pg_total_relation_size(c.oid)) AS total_size,
+     pg_size_pretty(pg_relation_size(c.oid)) AS table_size,
+     pg_size_pretty(pg_total_relation_size(c.oid) - pg_relation_size(c.oid)) AS index_size
+   FROM pg_class c
+   JOIN pg_namespace n ON n.oid = c.relnamespace
+   WHERE n.nspname = 'public' AND c.relkind IN ('r', 'm')
+   ORDER BY pg_total_relation_size(c.oid) DESC
+   LIMIT 10;
+   ```
+2. **ពិនិត្យមើល Dead Tuple Bloat៖**
+   ```sql
+   SELECT
+     relname,
+     n_live_tup,
+     n_dead_tup,
+     round(100.0 * n_dead_tup / nullif(n_live_tup + n_dead_tup, 0), 1) AS dead_tuple_pct,
+     last_autovacuum
+   FROM pg_stat_user_tables
+   ORDER BY n_dead_tup DESC
+   LIMIT 10;
+   ```
+   ប្រសិនបើ `n_dead_tup` មានរាប់លាន ហើយ `dead_tuple_pct` លើសពី ៤០% មានន័យថា autovacuum ដើរមិនទាន់ ឬកំពុងត្រូវបានគេរារាំង។
+3. **ពិនិត្យមើល Abandoned Replication Slots ដែលឃាត់ WAL ទុក៖**
+   ប្រសិនបើ folder `pg_wal` ស៊ី disk ដល់ទៅ 100 GB នោះ replication slot ដែលគេលែងប្រើប្រហែលជាកំពុងរារាំង Postgres មិនឱ្យលុប WAL files ចោល៖
+   ```sql
+   SELECT
+     slot_name,
+     active,
+     pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) AS retained_wal_size
+   FROM pg_replication_slots;
+   ```
+4. **ស្វែងរក Transaction ដែលបើកចោលយូរ រារាំង VACUUM៖**
+   ```sql
+   SELECT pid, now() - xact_start AS duration, query 
+   FROM pg_stat_activity 
+   WHERE (now() - xact_start) > interval '1 hour';
+   ```
+
+## Options
+
+1. **ពង្រីកទំហំ Disk លើ Cloud បន្ថែម។** ជួយទិញពេលវេលា ប៉ុន្តែមិនបានជួសជុលបញ្ហា bloat ឡើយ។
+2. **ដំណើរការ `VACUUM FULL`។** ប្រគល់ទំហំ disk រូបវន្តទៅ OS វិញភ្លាមៗ។ (ទាមទារ **Exclusive Table Lock** ដែលបិទរាល់ការអាន និងសរសេរទាំងអស់រហូតទាល់តែដើរចប់!)។
+3. **ប្រើប្រាស់ `pg_repack`។** រៀបចំ table និង index ឡើងវិញដោយមិនចាំបាច់ lock ឬបិទប្រព័ន្ធឡើយ។
+4. **កែសម្រួលការកំណត់ Autovacuum។** កំណត់ឱ្យ autovacuum ដំណើរការញឹកញាប់ និងលឿនជាងមុន ដើម្បីកុំឱ្យកើតមាន bloat។
+5. **លុបចោល Inactive Replication Slots។** ជួយឱ្យ database លុប WAL logs រាប់សិប gigabytes ចោលភ្លាមៗ។
+
+## Trade-offs
+
+| ដំណោះស្រាយ | ទំហំ Disk ដែលទទួលបានមកវិញ | ការ Lock Table | ហានិភ័យប្រតិបត្តិការ |
+| :--- | :--- | :--- | :--- |
+| **ទិញ Disk ធំជាងមុន** | គ្មាន (គ្រាន់តែបិទបាំងបញ្ហា) | គ្មាន | គ្មាន (រហូតដល់ពេញម្តងទៀត) |
+| **`VACUUM FULL`** | **១០០% នៃទំហំ bloat** | **Exclusive lock (Downtime)** | ខ្ពស់លើ production |
+| **`pg_repack`** | **១០០% នៃទំហំ bloat** | តិចតួចបំផុត (គ្មាន lock អាន/សរសេរ) | ត្រូវការដំឡើង extension |
+| **លុប Inactive Slot** | **លុប WAL logs ភ្លាមៗ** | គ្មាន | ត្រូវប្រាកដថា slot នោះលែងប្រើ |
+| **កែសម្រួល Autovacuum** | ការពារកុំឱ្យកើតមាន bloat ទៅមុខ | គ្មាន | ស៊ី CPU/IO បន្ថែមបន្តិចបន្តួច |
+
+## Decision
+
+1. **ការសង្គ្រោះបន្ទាន់ភ្លាមៗ (Emergency)៖**
+   - ពិនិត្យមើល `pg_replication_slots`។ ប្រសិនបើ inactive slot កំពុងឃាត់ទុក WAL logs លើសពី 50 GB សូមលុបវាចោលភ្លាមៗ៖ `SELECT pg_drop_replication_slot('abandoned_slot_name');`។
+   - បិទ transaction ណាដែលបើកចោល ឬស្ថិតក្នុង `idle in transaction` លើសពី ២ ម៉ោង ពីព្រោះវាបានរារាំង autovacuum មិនឱ្យសម្អាត dead tuples ទាំងអស់ដែលកើតឡើងក្រោយវា។
+2. **ដំណោះស្រាយយូរអង្វែង (ការពារ Bloat)៖**
+   - Rebuild bloated tables តាមរយៈ `pg_repack` ឬ `REINDEX CONCURRENTLY`។
+   - កែសម្រួល autovacuum ឱ្យដំណើរការកាន់តែញឹកញាប់ និងសកម្មលើ tables ណាដែលមានការ update ខ្ពស់។
+
+## Implementation
+
+### 1. ការលុបចោល Replication Slot ដែលគេបោះបង់ចោល (ទទួលបាន Disk មកវិញភ្លាមៗ)
+
+```sql
+-- ស្វែងរក slot ដែលកំពុងឃាត់ WAL រាប់សិប GB៖
+SELECT slot_name, active, pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) AS lag
+FROM pg_replication_slots
+WHERE active = false;
+
+-- លុបវាចោល៖
+SELECT pg_drop_replication_slot('debezium_old_cdc_slot');
+```
+
+### 2. ការកំណត់ Autovacuum ឱ្យសកម្មលើ Table ដែលមានការកែប្រែទិន្នន័យច្រើន
+
+តាមលំនាំដើម autovacuum ដំណើរការតែនៅពេលដែល ២០% នៃ rows ក្នុង table ក្លាយជា dead tuples ប៉ុណ្ណោះ (`autovacuum_vacuum_scale_factor = 0.2`)។ លើ table ដែលមាន ៥០ លាន rows នោះមានន័យថាទាល់តែមាន **១០ លាន dead rows** ទើប autovacuum ចាប់ផ្តើម!
+
+កំណត់កម្រិតជាក់លាក់សម្រាប់ table នីមួយៗ៖
+
+```sql
+-- ចាប់ផ្តើម autovacuum ពេល ២% នៃ rows (ឬ ១០,០០០ rows) ក្លាយជា dead tuples៖
+ALTER TABLE orders SET (
+  autovacuum_vacuum_scale_factor = 0.02,
+  autovacuum_vacuum_threshold = 10000,
+  autovacuum_vacuum_cost_limit = 2000
+);
+```
+
+### 3. Rebuild Bloated Indexes តាមរយៈ CONCURRENTLY (គ្មាន Downtime)
+
+ជារឿយៗ Index ជួបប្រទះបញ្ហា bloat ធ្ងន់ធ្ងរជាង table ទៅទៀត៖
+
+```sql
+-- Rebuild index នៅ background ដោយមិន lock ការសរសេរទិន្នន័យ
+REINDEX INDEX CONCURRENTLY idx_orders_customer_id;
+```
+
+## Verification
+
+1. **ពិនិត្យមើលការធ្លាក់ចុះនៃទំហំ Disk៖** ដំណើរការ `df -h` ឬពិនិត្យ cloud RDS storage metric។ ការលុប inactive replication slot នឹងផ្តល់ទំហំ disk ត្រឡប់មកវិញក្នុងរយៈពេលក្រោម ៦០ វិនាទី ខណៈដែល PostgreSQL លុប WAL segments ចាស់ៗចោល។
+2. **អត្រា Dead Tuple៖** ក្នុង `pg_stat_user_tables` ផ្ទៀងផ្ទាត់ថា `n_dead_tup` ស្ថិតនៅក្រោម ៥% នៃចំនួន rows សរុបអំឡុងពេលម៉ោងធ្វើការ។
+3. **Autovacuum Logs៖** បើក `log_autovacuum_min_duration = 5000` ដើម្បីផ្ទៀងផ្ទាត់ថា autovacuum ដំណើរការជាប្រចាំ និងបញ្ចប់ការងារដោយគ្មានការព្រមាន។
+
+## Why
+
+ស្ថាបត្យកម្ម MVCC របស់ PostgreSQL ធានានូវ snapshot isolation៖ query ដែលចាប់ផ្តើមនៅម៉ោង 10:00 AM ត្រូវតែមើលឃើញ table ដូចដែលវាធ្លាប់មាននៅម៉ោង 10:00 AM បើទោះបីជា transaction មួយផ្សេងទៀត update ១ លាន rows នៅម៉ោង 10:01 AM ក៏ដោយ។
+
+ដើម្បីធ្វើបែបនេះបាន ទិន្នន័យជួរចាស់ៗត្រូវតែរក្សាទុកនៅលើ disk។ ប្រសិនបើមាន transaction តែមួយបើកចោល ឬ table មិនត្រូវបាន vacuum ទេនោះ PostgreSQL ត្រូវបានហាមឃាត់ជាដាច់ខាតមិនឱ្យយកទំហំ disk នោះមកប្រើឡើងវិញឡើយ។ ការកំណត់ autovacuum ឱ្យបានត្រឹមត្រូវ ជួយធានាថា dead rows ត្រូវបានសម្អាត និងកត់ត្រា disk pages ទាំងនោះសម្រាប់ប្រើប្រាស់ឡើងវិញបានទាន់ពេលវេលា។
+
+## When Not To Use
+
+- **កុំដំណើរការ `VACUUM FULL` អំឡុងពេលម៉ោងមមាញឹក (Peak Hours) ឱ្យសោះ។** វាទាមទារ exclusive table lock ដែលនឹងតម្រង់ជួររាល់ query ថ្មីៗទាំងអស់ រហូតដល់ connection pool របស់អ្នកដួលរលំ។
+
+## Common Mistakes
+
+- **លុបទិន្នន័យចោល រួចរំពឹងថា Disk នឹងស្រាលមកវិញ។** ក្នុង PostgreSQL ការ `VACUUM` ធម្មតាគ្រាន់តែកត់ត្រាទំហំនោះសម្រាប់ប្រើឡើងវិញលើ `INSERT` ថ្មីៗក្នុង table ដដែលប៉ុណ្ណោះ វាមិនបានកាត់បន្ថយទំហំ file លើ disk ឡើយ។
+- **ភ្លេច Replication Slots ដែលបង្កើតឡើងដោយ Test Tools។** ការតេស្តសាកល្បង CDC pipeline (ដូចជា Debezium ឬ Fivetran) រួចលុប container ចោលដោយមិនបាន drop replication slot ក្នុង PostgreSQL នឹងធ្វើឱ្យ WAL logs បន្តកកកុញរហូតដល់ពេញ disk ទាំងស្រុង។

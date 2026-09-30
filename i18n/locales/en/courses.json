@@ -1,0 +1,84 @@
+{
+  "eyebrow": "Courses",
+  "heading": "Learn one skill at a time",
+  "lead": "Short courses that start from a real problem. Each lesson explains one idea in plain words, works through an example, and lets you check yourself before you move on.",
+  "principle": "Take a lesson, then use it. Ten minutes of reading plus ten minutes trying it on your own code teaches more than an hour of reading alone.",
+  "courseCount_one": "{{count}} course",
+  "courseCount_other": "{{count}} courses",
+  "lessonCount_one": "{{count}} lesson",
+  "lessonCount_other": "{{count}} lessons",
+  "minutes": "{{minutes}} min",
+  "hoursMinutes": "{{hours}} h {{minutes}} min",
+  "levels": {
+    "beginner": "Beginner",
+    "intermediate": "Intermediate",
+    "advanced": "Advanced"
+  },
+  "open": "View course",
+  "allCourses": "All courses",
+  "start": "Start the course",
+  "continue": "Continue with lesson {{number}}",
+  "restart": "Start again from lesson 1",
+  "progress": "{{done}} of {{total}} lessons done",
+  "outcomes": "What you'll be able to do",
+  "prerequisites": "Before you start",
+  "noPrerequisites": "Nothing. This course starts from zero.",
+  "lessons": "Lessons",
+  "contents": "Course contents",
+  "related": "Go deeper in the knowledge base",
+  "lessonLabel": "Lesson {{number}}",
+  "lessonOf": "Lesson {{number}} of {{total}}",
+  "doneQuestion": "Done with this lesson?",
+  "markComplete": "Mark this lesson as done",
+  "completed": "Lesson done",
+  "markIncomplete": "Mark as not done",
+  "previous": "Previous lesson",
+  "next": "Next lesson",
+  "finish": "Finish the course",
+  "finishedTitle": "You've reached the end of the course",
+  "finishedBody": "Go back to the overview to see what you covered, or pick a related page and apply it to something you're building.",
+  "backToCourse": "Back to the course",
+  "showAnswer": "Show answer",
+  "format": {
+    "eyebrow": "How every lesson works",
+    "title": "Same six steps, every lesson",
+    "body": "You always know where you are and what comes next."
+  },
+  "sections": {
+    "problem": {
+      "heading": "The problem",
+      "hint": "A situation you'll meet at work"
+    },
+    "idea": {
+      "heading": "The idea",
+      "hint": "One concept, in plain words"
+    },
+    "example": {
+      "heading": "Example",
+      "hint": "The idea, worked step by step"
+    },
+    "try-it": {
+      "heading": "Try it",
+      "hint": "A small exercise to do yourself"
+    },
+    "check": {
+      "heading": "Check yourself",
+      "hint": "Questions with answers to reveal"
+    },
+    "takeaways": {
+      "heading": "Key takeaways",
+      "hint": "What to remember"
+    }
+  },
+  "teach": {
+    "title": "Teach what you know",
+    "body": "A course is a folder of Markdown files on GitHub: one overview and one file per lesson. Copy the lesson template, keep each lesson to one idea, and open a pull request.",
+    "cta": "Open the lesson template"
+  },
+  "home": {
+    "eyebrow": "Learn step by step",
+    "title": "Short courses, problem first",
+    "body": "A few lessons each, ten to fifteen minutes apiece. Every lesson ends with questions so you know you've got it.",
+    "cta": "See all courses"
+  }
+}

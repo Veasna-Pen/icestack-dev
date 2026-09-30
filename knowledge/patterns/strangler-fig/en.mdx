@@ -1,0 +1,170 @@
+---
+title: "Strangler Fig"
+question: "How do I migrate a critical legacy monolith to modern microservices without a risky big-bang rewrite?"
+summary: "Incrementally replace specific monolith capabilities with new services behind an interception proxy. Over time, traffic to the monolith shrinks until the old system is safely decommissioned."
+tags: [architecture, migration, strangler-fig, legacy, modernization]
+related: [patterns/api-gateway, problems/when-to-use-microservices, patterns/feature-flags]
+order: 18
+updated: "2026-09-12"
+contributors: [veasna]
+---
+
+## Context
+
+In nature, a strangler fig seed germinates in the upper branches of a host tree. It gradually grows aerial roots downward to the soil, surrounding the host tree's trunk. Over decades, the fig tree becomes self-supporting while the original host tree rots away inside, leaving an entirely new, hollow-centered tree.
+
+In software, Martin Fowler coined the **Strangler Fig Pattern** to describe migrating legacy systems. When an organization decides to modernize a mission-critical 10-year-old monolith, engineering leadership often proposes a "Big Bang Rewrite": pause feature development for 18 months and rewrite the entire system from scratch in Go or Rust.
+
+Big-bang rewrites almost always fail: business requirements evolve during those 18 months, the scope explodes, edge cases from the legacy system are forgotten, and the launch turns into an unrecoverable disaster.
+
+The Strangler Fig pattern provides a safe alternative: place an interception proxy in front of the monolith. Carve out one small, well-defined slice (e.g. user authentication or product reviews), deploy it as a modern service, route traffic to it, and leave the rest on the monolith. Repeat until the monolith is empty.
+
+## Symptoms
+
+- Management attempts "monolith rewrites from scratch" that are repeatedly delayed, over budget, and ultimately cancelled after multi-million dollar investments.
+- Deploying changes to the legacy monolith takes hours, involves manual regression testing spreadsheets, and routinely causes outages.
+- Legacy technology stacks (PHP 5.4, Python 2.7, Java 7, outdated frameworks) make hiring new engineers difficult.
+- New business features cannot be delivered because the monolithic codebase is too fragile to modify.
+
+<Callout type="warning" title="Big-bang rewrites are the highest-risk projects in software engineering">
+A system running in production for 10 years contains thousands of undocumented bug fixes and edge-case behaviors. A clean-slate rewrite will inevitably miss them, leading to immediate post-launch customer attrition.
+</Callout>
+
+## Diagnose
+
+1. **Map monolith domain boundaries:** Can you identify distinct bounded contexts (e.g. billing, notifications, catalog, orders) within the monolithic database?
+2. **Review route traffic volume:** Inspect your NGINX or load balancer logs. Which URL paths receive the highest traffic, and which have the highest failure rates?
+3. **Audit data coupling:** Do the modules you want to carve out share database foreign keys or perform raw SQL cross-table joins with unrelated tables?
+4. **Evaluate team independence:** Are feature teams blocked on a shared monolithic deployment pipeline?
+
+## Options
+
+1. **Big Bang Rewrite:** Re-architect and re-implement the entire application from zero, cut over DNS at midnight. (Catastrophic risk; high failure rate).
+2. **Strangler Fig via Edge Proxy (Layer 7 Routing):** Place an API Gateway (Envoy, NGINX, Cloudflare Workers) in front of the application. Route `/api/v1/auth/*` to the new service while routing all other paths to the legacy monolith.
+3. **Database-first Strangler (Change Data Capture / CDC):** Mirror database tables to a new database using Debezium; build new microservices reading the replica before cutting over writes.
+4. **In-process strangler (Module extraction):** Refactor monolithic spaghetti code into clean internal modules with strict interfaces first, before physically extracting them into network services.
+
+## Trade-offs
+
+| Strategy | Business Disruption | Risk of Catastrophic Failure | Time to First Production Value | Operational Complexity |
+| :--- | :--- | :--- | :--- | :--- |
+| **Big Bang Rewrite** | Total (feature freeze) | Extremely High | 12–24 months | Low initially, extreme at cutover |
+| **Strangler Fig Proxy** | Zero (continuous delivery) | Very Low (incremental) | **2–4 weeks** | Moderate (routing proxy, dual-run) |
+| **Database-first CDC** | Low | Low | 2–3 months | High (replication lag sync) |
+
+## Decision
+
+- **Never authorize a Big Bang Rewrite:** Modernize incrementally or do not modernize at all.
+- **Insert the Strangler Proxy on Day 1:** Before writing a single line of microservice code, place a reverse proxy (Envoy, NGINX, or AWS ALB) in front of the legacy monolith with 100% pass-through routing.
+- **Select the first carved-out slice wisely:**
+  - *Good first candidates:* Read-heavy auxiliary features with clear API boundaries (e.g., search recommendations, PDF invoicing, webhook dispatchers).
+  - *Bad first candidates:* The core transactional ledger with 40 foreign key dependencies.
+- **Implement Dual-Writing & Shadow Verification:** When carving out write paths, send writes to both the legacy monolith and the new service (shadow traffic). Compare results asynchronously. When output parity reaches 99.999%, flip the primary route to the new service.
+- **Decommission relentlessly:** Once an endpoint is fully migrated, physically delete the corresponding dead code and tables from the legacy monolith.
+
+## Implementation
+
+### 1. Edge Proxy Configuration (NGINX / Cloudflare):
+
+```nginx
+# Strangler Proxy Routing Table
+upstream legacy_monolith {
+    server monolith.internal:8080;
+}
+
+upstream modern_auth_service {
+    server auth-v2.internal:4000;
+}
+
+upstream modern_notification_service {
+    server notifications-v2.internal:5000;
+}
+
+server {
+    listen 443 ssl;
+    server_name api.company.com;
+
+    # 1. Carved-out slice #1: Authentication (New Modern Service)
+    location /api/v1/auth/ {
+        proxy_pass http://modern_auth_service;
+        proxy_set_header X-Strangled-By "auth-v2";
+    }
+
+    # 2. Carved-out slice #2: Notifications (New Modern Service)
+    location /api/v1/notifications/ {
+        proxy_pass http://modern_notification_service;
+        proxy_set_header X-Strangled-By "notifications-v2";
+    }
+
+    # 3. Default fallback: Everything else goes to the Legacy Monolith
+    location / {
+        proxy_pass http://legacy_monolith;
+        proxy_set_header X-Strangled-By "legacy-monolith";
+    }
+}
+```
+
+### 2. Shadow Traffic Comparator (Validating Parity before Cutover):
+
+```typescript
+export async function handleStrangledRequest(req: Request): Promise<Response> {
+  // 1. Primary call to legacy monolith (returns to user)
+  const legacyResponse = await fetch('http://monolith.internal/orders/calculate', {
+    method: 'POST',
+    body: JSON.stringify(req.body),
+    headers: { 'Content-Type': 'application/json' },
+  });
+  const legacyData = await legacyResponse.clone().json();
+
+  // 2. Fire asynchronous shadow call to new microservice in background
+  // Does not block or impact user response time
+  queueMicrotask(async () => {
+    try {
+      const newResponse = await fetch('http://orders-v2.internal/calculate', {
+        method: 'POST',
+        body: JSON.stringify(req.body),
+        headers: { 'Content-Type': 'application/json' },
+        signal: AbortSignal.timeout(2000),
+      });
+      const newData = await newResponse.json();
+
+      // Compare outputs to verify 100% calculation parity
+      if (JSON.stringify(legacyData) !== JSON.stringify(newData)) {
+        console.error('[Strangler Drift] Output mismatch between legacy and new service!', {
+          input: req.body,
+          legacy: legacyData,
+          modern: newData,
+        });
+      }
+    } catch (err) {
+      console.warn('[Strangler Shadow] Shadow request failed:', (err as Error).message);
+    }
+  });
+
+  return legacyResponse;
+}
+```
+
+## Verification
+
+1. **Proxy transparency test:** Place the strangler proxy in front of the monolith. Verify that automated test suites pass with 0 failures before carving out any services.
+2. **Shadow parity validation:** Run shadow traffic on 100,000 production requests. Confirm that the error rate of the shadow service is 0% and payload diff mismatch is 0.00%.
+3. **Canary traffic cutover:** Shift 5% of live traffic to the new service using weighted proxy routing. Monitor latency and APM error rates for 48 hours before increasing to 100%.
+4. **Dead code deletion check:** After routing 100% of auth traffic to the new service, delete the auth controllers from the monolith codebase and verify that no runtime errors occur.
+
+## Why
+
+Legacy systems are victims of their own success: they generated the revenue that allowed the company to grow. Replacing them with a massive rewrite under-appreciates the accumulated domain wisdom embedded in legacy code.
+
+The Strangler Fig pattern transforms an existential crisis into routine, low-risk engineering. By replacing systems feature by feature while running in production, value is delivered every sprint, risks remain microscopic, and the business never has to pause feature delivery.
+
+## When Not To Use
+
+- **Small applications (< 10k lines of code):** If a small application can be rewritten by two engineers in two weeks, the overhead of proxy routing and shadow traffic is overkill.
+- **Legacy code with zero active users:** If a system is being sunsetted rather than modernized, simply build an export tool and shut it down.
+
+## Common Mistakes
+
+- **Starting with the most coupled service:** Attempting to strangle the core billing engine first, getting stuck on database dependencies for a year. Start with leaf nodes.
+- **Never decommissioning the old code:** Leaving the old code paths active in the monolith indefinitely, resulting in maintaining both systems simultaneously.
+- **Direct database sharing:** Letting the new service read and write directly to the legacy database tables without an API or CDC bridge, recreating tight coupling.

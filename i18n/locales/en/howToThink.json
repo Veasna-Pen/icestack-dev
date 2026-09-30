@@ -1,0 +1,64 @@
+{
+  "eyebrow": "The method",
+  "heading": "A method for engineering decisions",
+  "lead": "Every page on IceStack walks the same nine steps. Learn them once and you can reason through problems no page covers yet, including the ones you'll take to an AI assistant.",
+  "titleAndSummary": "the title and summary",
+  "doneWhen": "You're done when you have",
+  "trap": "The trap",
+  "onEveryPage": "On every page:",
+  "tools": {
+    "eyebrow": "Thinking tools",
+    "title": "Short rules that travel",
+    "body": "Habits that make every step above faster. Each one shows up again and again across the knowledge base.",
+    "constraint": {
+      "title": "Name the constraint before the tool",
+      "body": "“We need Kafka” is a solution. “Orders are lost when the email service is down” is a problem. Tools can only be compared against a constraint."
+    },
+    "measure": {
+      "title": "Measure before you optimize",
+      "body": "Intuition about performance is wrong often enough to be dangerous. A query plan or a profile takes minutes and rules out days of wrong work."
+    },
+    "reversibility": {
+      "title": "Price in reversibility",
+      "body": "A decision you can undo in an hour deserves an hour of thought. One you will live with for years, like a database or a service boundary, deserves a written trade-off."
+    },
+    "failureModes": {
+      "title": "Count the new failure modes",
+      "body": "Every component you add is something that can be down, slow, full or out of date. If you can't say how it fails, you're not ready to run it."
+    },
+    "boring": {
+      "title": "Default to boring",
+      "body": "The technology your team already runs has known failure modes and known fixes. Something new has to earn its place against that."
+    },
+    "changeMind": {
+      "title": "Write down what would change your mind",
+      "body": "A decision with a revisit trigger (“if writes pass 5,000 per second”) is a plan. A decision without one turns into dogma."
+    }
+  },
+  "ai": {
+    "eyebrow": "Working with AI",
+    "title": "Use AI. Keep the judgment.",
+    "body": "AI is excellent at producing options and code. The steps where you supply context, choose the trade-offs and decide are the ones that make you a better engineer, so don't hand those over.",
+    "note": "The assistant on this site asks about your context before it answers.",
+    "handToAi": "Hand to AI",
+    "handToAiItems": [
+      "Listing options you might have missed",
+      "Explaining an unfamiliar error or query plan",
+      "Drafting the implementation once you have decided",
+      "Writing the test that verifies the decision"
+    ],
+    "keep": "Keep for yourself",
+    "keepItems": [
+      "Stating the problem, and the number that proves it",
+      "The context only you know: team, budget, deadlines",
+      "Choosing which trade-offs you can live with",
+      "Making the decision, and owning it"
+    ]
+  },
+  "practice": {
+    "title": "Practice on a real problem",
+    "body": "Pick a question and try the nine steps yourself before you read the answer.",
+    "browse": "Browse problems",
+    "write": "Write one yourself"
+  }
+}

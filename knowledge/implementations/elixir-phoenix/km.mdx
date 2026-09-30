@@ -1,0 +1,189 @@
+---
+title: "Elixir (Phoenix)"
+question: "តើត្រូវរៀបចំ Receive Timeouts, Ecto Multi-Transactions, Oban Background Jobs, និង Rate Limiting ក្នុង Phoenix ដោយរបៀបណា?"
+summary: "Timeouts ជាមួយ Finch/Req, Ecto Connection Pool, Ecto.Multi សម្រាប់ Idempotency, Cachex/ETS Caching, Hammer Rate Limiting, និង Oban Background Jobs ក្នុង Elixir។"
+tags: [elixir, phoenix, otp, ecto, implementation]
+related: [patterns/retry, patterns/idempotency, patterns/caching, patterns/rate-limiting]
+order: 11
+updated: "2026-09-12"
+contributors: [veasna]
+translation: draft
+---
+
+ការអនុវត្ត Patterns សម្រាប់ Elixir 1.16+ និង Phoenix 1.7+ ដោយទាញយកប្រយោជន៍ពី Concurrency និង BEAM Isolation។ ផ្តោតលើ HTTP Receive Timeouts, Ecto.Multi Atomic Transactions, ETS Caching, និង Oban Background Jobs ដែលមានសុវត្ថិភាពខ្ពស់។
+
+## Timeouts first
+
+ក្នុង Elixir រាល់ដំណើរការ (Process) ទំនាក់ទំនងគ្នាតាមរយៈសារ ហើយ HTTP Client ដូចជា `Req` ឬ `Finch` ត្រូវកំណត់ `receive_timeout` ជាដាច់ខាត៖
+
+```elixir
+defmodule MyApp.ExchangeRates do
+  @doc """
+  ទាញយកអត្រាប្តូរប្រាក់ជាមួយ Timeout រយៈពេល ២ វិនាទីយ៉ាងតឹងរ៉ឹង។
+  """
+  def fetch_rates do
+    case Req.get("https://api.example.com/rates", receive_timeout: 2_000, connect_options: [timeout: 1_000]) do
+      {:ok, %Req.Response{status: 200, body: body}} ->
+        {:ok, body}
+
+      {:error, %Mint.TransportError{reason: :timeout}} ->
+        {:error, :timeout}
+
+      {:ok, %Req.Response{status: status}} ->
+        {:error, {:upstream_error, status}}
+    end
+  end
+end
+```
+
+សម្រាប់ Database Queries កំណត់ timeout ក្នុង `config/runtime.exs`៖
+
+```elixir
+config :my_app, MyApp.Repo,
+  url: database_url,
+  pool_size: String.to_integer(System.get_env("POOL_SIZE") || "10"),
+  timeout: 5_000,       # ៥ វិនាទីសម្រាប់ Query នីមួយៗ
+  queue_target: 50,
+  queue_interval: 1_000
+```
+
+## Retry with backoff
+
+Req មានយន្តការ Retry ស្រាប់ជាមួយ Exponential Backoff និង Full Jitter៖
+
+```elixir
+defmodule MyApp.InventoryClient do
+  def fetch_item(sku) do
+    Req.new(base_url: "https://inventory.example.com")
+    |> Req.Request.put_header("accept", "application/json")
+    |> Req.get(
+      url: "/items/#{sku}",
+      retry: :transient, # Retry កូដ 408, 429, និង 5xx
+      max_retries: 3,
+      retry_delay: fn attempt ->
+        trunc(:rand.uniform() * min(2_000, 100 * :math.pow(2, attempt)))
+      end
+    )
+  end
+end
+```
+
+## Idempotency keys ជាមួយ `Ecto.Multi`
+
+ក្នុង Phoenix Controllers ប្រើប្រាស់ `Ecto.Multi` ដើម្បីធ្វើការផ្ទៀងផ្ទាត់ Idempotency និងបង្កើត Order ក្នុង Transaction តែមួយ៖
+
+```elixir
+defmodule MyAppWeb.OrderController do
+  use MyAppWeb, :controller
+  alias MyApp.{Repo, Orders.Order, Idempotency.Record}
+
+  def create(conn, %{"customer_id" => customer_id, "total_cents" => total_cents}) do
+    idempotency_key = get_req_header(conn, "idempotency-key") |> List.first()
+
+    if is_nil(idempotency_key) do
+      conn |> put_status(:bad_request) |> json(%{error: "តម្រូវឱ្យមាន Idempotency-Key header"})
+    else
+      multi =
+        Ecto.Multi.new()
+        |> Ecto.Multi.insert(:idempotency_claim, Record.changeset(%Record{}, %{key: idempotency_key}),
+          on_conflict: :nothing,
+          conflict_target: :key
+        )
+        |> Ecto.Multi.run(:verify_claim, fn _repo, %{idempotency_claim: claim} ->
+          if is_nil(claim) do
+            case Repo.get_by(Record, key: idempotency_key) do
+              %Record{response_body: body, status_code: code} when not is_nil(body) ->
+                {:error, {:cached_response, code, body}}
+              _ ->
+                {:error, :in_progress}
+            end
+          else
+            {:ok, claim}
+          end
+        end)
+        |> Ecto.Multi.insert(:order, Order.changeset(%Order{}, %{customer_id: customer_id, total_cents: total_cents}))
+        |> Ecto.Multi.update(:finalize_claim, fn %{idempotency_claim: claim, order: order} ->
+          Record.changeset(claim, %{status_code: 201, response_body: %{id: order.id, total: order.total_cents}})
+        end)
+
+      case Repo.transaction(multi) do
+        {:ok, %{order: order}} ->
+          conn |> put_status(:created) |> json(%{id: order.id, total: order.total_cents})
+
+        {:error, :verify_claim, {:cached_response, code, body}, _changes} ->
+          conn |> put_status(code) |> json(body)
+
+        {:error, :verify_claim, :in_progress, _changes} ->
+          conn |> put_status(:conflict) |> json(%{error: "សំណើកំពុងស្ថិតក្នុងដំណើរការ"})
+      end
+    end
+  end
+end
+```
+
+## Caching ជាមួយ Cachex (In-Memory ETS)
+
+តារាង ETS របស់ Elixir ផ្តល់នូវល្បឿនអានទិន្នន័យត្រឹម Microseconds ក្នុង RAM៖
+
+```elixir
+defmodule MyApp.ProductCache do
+  def get_product(product_id) do
+    Cachex.fetch(:my_cache, "product:#{product_id}", fn _key ->
+      case MyApp.Repo.get(MyApp.Catalog.Product, product_id) do
+        nil -> {:ignore, nil}
+        product -> {:commit, product, expire: :timer.minutes(5)}
+      end
+    end)
+  end
+end
+```
+
+## Rate limiting ជាមួយ Hammer
+
+ប្រើ Token-Bucket Algorithm ដោយផ្អែកលើ IP៖
+
+```elixir
+defmodule MyAppWeb.Plugs.RateLimiter do
+  import Plug.Conn
+
+  def init(opts), do: opts
+
+  def call(conn, _opts) do
+    client_ip = conn.remote_ip |> :inet.ntoa() |> to_string()
+    key = "rate:#{client_ip}"
+
+    case Hammer.check_rate(key, 60_000, 100) do
+      {:allow, _count} ->
+        conn
+
+      {:deny, _limit} ->
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(429, ~s({"error": "Too Many Requests"}))
+        |> halt()
+    end
+  end
+end
+```
+
+## Background jobs ជាមួយ Oban
+
+Oban រក្សាទុក Jobs ក្នុង PostgreSQL ជាមួយ Tables អាជីវកម្មដទៃទៀត ដែលធានាថាមិនបាត់បង់ Job សូម្បី Server គាំង៖
+
+```elixir
+defmodule MyApp.Workers.SendReceipt do
+  use Oban.Worker, queue: :mailers, max_attempts: 5
+
+  @impl Oban.Worker
+  def perform(%Oban.Job{args: %{"order_id" => order_id}}) do
+    order = MyApp.Repo.get!(MyApp.Orders.Order, order_id)
+
+    if is_nil(order.receipt_sent_at) do
+      MyApp.Mailer.send_receipt(order)
+      order |> Ecto.Changeset.change(receipt_sent_at: DateTime.utc_now()) |> MyApp.Repo.update!()
+    end
+
+    :ok
+  end
+end
+```

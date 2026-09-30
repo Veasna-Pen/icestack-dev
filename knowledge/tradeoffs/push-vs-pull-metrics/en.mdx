@@ -1,0 +1,156 @@
+---
+title: "Push vs Pull Metrics"
+question: "When should applications push metrics to an aggregator versus having Prometheus scrape (pull) metrics endpoints?"
+summary: "Push monitoring (Datadog, CloudWatch, StatsD) pushes telemetry directly from instances to a collector, ideal for ephemeral serverless functions, batch jobs, and distributed edges. Pull monitoring (Prometheus, OpenTelemetry Collector) scrapes standardized /metrics endpoints on a schedule, offering native health detection, central scrape control, and zero risk of metric spam overwhelming monitoring backends."
+tags: [observability, monitoring, devops, prometheus, datadog, metrics]
+related: [patterns/health-check, tradeoffs/serverless-vs-containers, patterns/sidecar]
+order: 18
+updated: "2026-09-12"
+contributors: [veasna]
+---
+
+## Context
+
+In production environments, engineering teams must observe application behavior in real time: request rates, p99 latency, error counts, memory usage, and business KPIs.
+
+There are two primary paradigms for gathering operational metrics:
+1. **Push-Based Monitoring:** Applications proactively emit metric packets over UDP or HTTPS to a centralized collector or SaaS agent (e.g. AWS CloudWatch, Datadog Agent, StatsD, InfluxDB). The application decides *when* and *how often* to send metrics.
+2. **Pull-Based Monitoring:** Applications expose a standardized HTTP endpoint (typically `GET /metrics`). A central monitoring server (e.g. Prometheus, VictoriaMetrics, Grafana Alloy) periodically connects to each instance (e.g. every 15 seconds) and scrapes the current counters and gauges.
+
+Choosing the wrong model creates blind spots: push systems can silently crash without you knowing they are gone, while pull systems struggle to monitor short-lived serverless functions or edge clients behind firewalls.
+
+## Symptoms
+
+- **Pull Failure Mode:** Serverless AWS Lambda functions execute in 40 ms and shut down before Prometheus can ever scrape them; edge devices or mobile apps behind cellular NATs cannot be reached by a central scraper.
+- **Push Failure Mode:** A runaway application loop pushes 10,000,000 custom metric events per minute, crashing the local metrics collector and running up a $15,000 monthly Datadog/CloudWatch bill; an entire microservice crashes, but no alert fires because "no metrics received" is treated as zero traffic.
+
+<Callout type="warning" title="Pull monitoring automatically detects node death; push monitoring requires heartbeat timeouts">
+In a pull architecture, if a scraper fails to connect to a target, it immediately marks `up == 0`. In a push architecture, an instance that dies simply stops sending data, which can look identical to an idle service.
+</Callout>
+
+## Diagnose
+
+1. **Audit workload lifespan:** Are your workloads long-running steady-state services (Kubernetes pods, VMs) or ephemeral batch tasks that live for less than 30 seconds (AWS Lambda, batch jobs)?
+2. **Inspect network reachability:** Can a central monitoring server establish inbound HTTP connections to your application pods, or are they distributed behind private corporate firewalls?
+3. **Assess high-cardinality risks:** Do developers accidentally append user IDs or email addresses to metric tags, multiplying time-series volume exponentially?
+4. **Evaluate operational budget:** Are you using self-hosted infrastructure (Prometheus/Grafana) or paying per-metric SaaS vendors (Datadog/New Relic)?
+
+## Options
+
+1. **Pull-Based Architecture (Prometheus / OpenTelemetry):** Scrapes `GET /metrics` over internal VPC. Centralized scrape rate and target discovery via Kubernetes API.
+2. **Push-Based Architecture (StatsD / CloudWatch):** Asynchronous UDP fire-and-forget metric emission.
+3. **Push via Gateway / Buffer (Prometheus Pushgateway):** Ephemeral batch jobs push metrics to a persistent intermediate gateway, which Prometheus scrapes normally.
+4. **Agent Collector Hybrid (OpenTelemetry Collector / Vector):** Applications push locally to a localhost sidecar agent via OTLP; the sidecar buffers, samples, and exports to both push and pull backends.
+
+## Trade-offs
+
+| Dimension | Pull Monitoring (Prometheus) | Push Monitoring (Datadog / StatsD) |
+| :--- | :--- | :--- |
+| **Liveness / Failure Detection** | **Automatic (`up == 0` on scrape fail)** | Requires explicit missing-data alerts |
+| **Ephemeral Jobs (Lambda/Batch)**| Difficult (requires Pushgateway) | **Native (emits before exit)** |
+| **Overload Protection** | **Total control (scraper dictates rate)** | Risky (app can flood monitoring DB) |
+| **Network & Firewall Config** | Needs inbound access to pods | **Trivial (outbound connection only)** |
+| **Service Discovery** | Required (K8s API, Consul, DNS) | None (nodes just need target IP) |
+| **High Cardinality Scaling** | Memory scales with unique series | Managed by SaaS (at high financial cost) |
+
+## Decision
+
+- **Use Pull-Based Monitoring (Prometheus) for:**
+  - Long-running backend microservices and Kubernetes container clusters.
+  - Infrastructure nodes, database servers (PostgreSQL exporter, Redis exporter), and API gateways.
+  - Teams seeking predictable infrastructure costs without per-metric bill shock.
+- **Use Push-Based Monitoring for:**
+  - Ephemeral serverless functions (AWS Lambda, Cloudflare Workers).
+  - Short-lived command-line utilities, nightly ETL migration scripts, and CI/CD pipelines.
+  - IoT devices, mobile native applications, and edge nodes behind restrictive NATs.
+- **Adopt the Local Agent Pattern (Hybrid):** Run an OpenTelemetry Collector or Datadog Agent as a DaemonSet or sidecar. Applications emit metrics locally via fast localhost UDP/gRPC; the collector handles batching, rate-limiting, and central export.
+
+## Implementation
+
+### 1. Exposing Pull Metrics in Express with `prom-client`:
+
+```typescript
+import express from 'express';
+import client from 'prom-client';
+
+const app = express();
+
+// Initialize default Node.js runtime metrics (heap, event loop, CPU)
+client.collectDefaultMetrics();
+
+// Custom application metrics
+const httpRequestCounter = new client.Counter({
+  name: 'http_requests_total',
+  help: 'Total number of HTTP requests',
+  labelNames: ['method', 'route', 'status_code'],
+});
+
+const httpDurationHistogram = new client.Histogram({
+  name: 'http_request_duration_seconds',
+  help: 'HTTP request duration in seconds',
+  labelNames: ['method', 'route', 'status_code'],
+  buckets: [0.01, 0.05, 0.1, 0.5, 1, 2.5],
+});
+
+// Middleware tracking requests
+app.use((req, res, next) => {
+  const start = Date.now();
+  res.on('finish', () => {
+    const duration = (Date.now() - start) / 1000;
+    httpRequestCounter.inc({ method: req.method, route: req.path, status_code: res.statusCode });
+    httpDurationHistogram.observe({ method: req.method, route: req.path, status_code: res.statusCode }, duration);
+  });
+  next();
+});
+
+// Standardized scrape endpoint for Prometheus
+app.get('/metrics', async (req, res) => {
+  res.set('Content-Type', client.register.contentType);
+  res.end(await client.register.metrics());
+});
+
+app.listen(3000, () => console.log('API listening with /metrics on port 3000'));
+```
+
+### 2. Prometheus Kubernetes Scrape Configuration (`scrape_config.yaml`):
+
+```yaml
+scrape_configs:
+  - job_name: 'kubernetes-pods'
+    scrape_interval: 15s
+    kubernetes_sd_configs:
+      - role: pod
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+        action: keep
+        regex: true
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+        action: replace
+        target_label: __metrics_path__
+        regex: (.+)
+```
+
+## Verification
+
+1. **Scrape endpoint verification:** Run `curl http://localhost:3000/metrics`. Verify that standard Prometheus exposition text format is returned with valid HELP and TYPE declarations.
+2. **Instant death detection test:** Terminate an application pod abruptly (`kill -9`). Confirm that Prometheus sets `up == 0` within 15–30 seconds and fires an immediate `InstanceDown` alert.
+3. **Cardinality explosion guard:** Verify that high-cardinality fields (like UUIDs or user email addresses) are never included in metric label names, preventing memory bloat on the Prometheus server.
+
+## Why
+
+Monitoring is an active communication between the watcher and the watched:
+- **Pull makes the watcher in control:** The monitoring system decides how much data it can ingest, protects itself from being overwhelmed, and immediately notices when a subject goes silent.
+- **Push makes the subject in control:** The monitored process shares its state whenever it wants, making it agile enough to report its existence even if it lives for only a few milliseconds.
+
+Matching the telemetry model to the lifecycle of your workload ensures comprehensive observability without self-inflicted monitoring outages.
+
+## When Not To Use
+
+- **Pull for serverless Lambda functions:** Trying to scrape an ephemeral Lambda container that freezes its execution environment between requests will result in connection timeouts.
+- **Push directly to a database on every user click:** Emitting a synchronous HTTP write to a metrics database on every user interaction adds latency to user requests and creates an unnecessary failure dependency.
+
+## Common Mistakes
+
+- **High-cardinality label explosion:** Adding `user_id` as a Prometheus label on `http_requests_total` creates 1,000,000 separate time-series in memory, crashing the Prometheus server with an OOM error.
+- **Assuming silence means health in push monitoring:** Forgetting to configure deadman alerts for push metrics; when a reporting agent crashes, dashboards show flat lines that look identical to zero errors.
+- **Overly aggressive scrape intervals:** Setting a 1-second scrape interval across 500 pods burns 15% of your application CPU just serializing text metrics. Use standard 15-second or 30-second intervals.

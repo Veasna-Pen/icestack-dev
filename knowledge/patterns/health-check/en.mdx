@@ -1,0 +1,182 @@
+---
+title: "Health Checks"
+question: "How do I tell load balancers and Kubernetes whether an instance is healthy, ready for traffic, or dead?"
+summary: "Separate service health into distinct liveness, readiness, and startup probe endpoints. A dead process is restarted; an unready or overloaded process is temporarily drained from traffic without being killed."
+tags: [devops, kubernetes, reliability, health-check, monitoring]
+related: [patterns/graceful-shutdown, problems/slow-first-request]
+order: 10
+updated: "2026-09-12"
+contributors: [veasna]
+---
+
+## Context
+
+Container orchestrators (Kubernetes, AWS ECS, Nomad) and reverse proxies (NGINX, AWS ALB, Cloudflare) need continuous feedback to know whether a container should receive traffic, wait, or be restarted.
+
+Many applications expose a single `/health` endpoint that blindly checks everything: database, Redis, third-party payment APIs, and memory. If the database experiences a temporary spike, the `/health` endpoint returns 500. Kubernetes interprets this as a fatal crash and abruptly terminates all pods simultaneously, turning a minor database slow-down into a complete application catastrophe.
+
+## Symptoms
+
+- Kubernetes enters a "crash loop" during deployments because the container takes 15 seconds to warm up caches, but the health check fails after 3 seconds.
+- A transient database slowdown causes Kubernetes to kill all healthy web app containers at the same time, causing a total blackout.
+- Users receive 502 Bad Gateway errors during rolling updates because the load balancer routes traffic to newly launched pods before their connection pools are warmed up.
+- A deadlocked Node.js event loop or blocked Go runtime continues receiving traffic because a naive static health check responds from an unmonitored background socket.
+
+<Callout type="warning" title="Never bundle dependency health into liveness probes">
+A liveness probe should answer only one question: "Is this container process alive, or is it deadlocked?" Checking external databases in liveness probes causes mass pod termination during database hiccups.
+</Callout>
+
+## Diagnose
+
+1. **Check probe definitions:** Inspect `deployment.yaml` in your Kubernetes repo. Are `livenessProbe` and `readinessProbe` pointing to the exact same URL?
+2. **Review restart metrics:** Run `kubectl get pods`. Do your pods have restart counts in the dozens despite having no unhandled exceptions in the application logs?
+3. **Inspect deployment logs:** During rolling deploys, do 502 Bad Gateway errors appear in ingress logs for 5 to 10 seconds right after new pods start?
+4. **Audit probe dependencies:** Does hitting `/health` execute network queries against PostgreSQL, Redis, or external third-party APIs?
+
+## Options
+
+1. **Single static `/health` endpoint:** Returns `200 OK` if the web framework is listening. (Cannot detect internal deadlocks, cold starts, or database outages).
+2. **Deep monolithic health check:** Pings every database, cache, and third-party API. Returns 500 if any dependency fails. (Dangerous: causes cascading container restarts).
+3. **Three-tier probe separation (Startup, Liveness, Readiness):**
+   - **Startup (`/health/startup`):** Gives slow applications time to compile JIT code, warm pools, or run migrations before other probes begin.
+   - **Liveness (`/health/live`):** Checks only local process health (event loop responsiveness, heap limits). Restarts the container if it fails.
+   - **Readiness (`/health/ready`):** Verifies local connectivity to critical dependencies and circuit breaker states. Temporarily removes the pod from load balancer routing without restarting if it fails.
+
+## Trade-offs
+
+| Strategy | Outage Prevention | Deployment Safety | Implementation Effort | Operational Risk |
+| :--- | :--- | :--- | :--- | :--- |
+| **Single Static Check** | Low | Low (502s on cold start) | Lowest | Deadlocked pods keep receiving traffic |
+| **Deep Monolithic Check** | None | Low | Low | **Catastrophic (mass pod restarts)** |
+| **Separated Probes (3-tier)** | Maximum | Maximum (Zero-downtime) | Moderate | Lowest (self-healing orchestration) |
+
+## Decision
+
+- **Separate Liveness and Readiness completely:**
+  - `GET /health/live`: Must be lightweight and local. No database queries, no network calls. Return 200 if the process event loop can answer the HTTP request within 500 ms.
+  - `GET /health/ready`: Check essential local readiness: database connection pool initialized, warm cache ready, and application not currently shutting down. If failing, return 503 so the ingress router stops sending traffic.
+- **Use a Startup Probe for slow initialization:** If your application takes 30 seconds to boot, configure a `startupProbe` with `failureThreshold: 30` and `periodSeconds: 2`. This gives the pod 60 seconds to boot without liveness probes killing it prematurely.
+- **Support graceful drainage:** When the process receives `SIGTERM`, immediately switch `/health/ready` to return 503 while allowing in-flight requests 15 seconds to drain cleanly.
+
+## Implementation
+
+### 1. Robust Health Check Router in TypeScript (Express):
+
+```typescript
+import { Router } from 'express';
+import { dbPool } from './database';
+
+export const healthRouter = Router();
+
+let isShuttingDown = false;
+
+// Signal shutdown on SIGTERM
+process.on('SIGTERM', () => {
+  isShuttingDown = true;
+});
+
+// 1. LIVENESS: Is the Node process event loop alive?
+// NO database queries or remote network calls here!
+healthRouter.get('/live', (req, res) => {
+  if (isShuttingDown) {
+    return res.status(503).json({ status: 'shutting_down' });
+  }
+
+  // Check event loop lag or memory threshold if desired
+  const memoryUsage = process.memoryUsage().heapUsed / 1024 / 1024;
+  if (memoryUsage > 1800) { // Near 2GB container limit
+    return res.status(500).json({ status: 'oom_imminent', heapMb: memoryUsage });
+  }
+
+  return res.status(200).json({ status: 'alive' });
+});
+
+// 2. READINESS: Can this instance serve user requests right now?
+healthRouter.get('/ready', async (req, res) => {
+  if (isShuttingDown) {
+    return res.status(503).json({ status: 'draining_traffic' });
+  }
+
+  try {
+    // Quick ping to verify DB connection pool has at least 1 idle connection
+    const client = await dbPool.connect();
+    await client.query('SELECT 1');
+    client.release();
+
+    return res.status(200).json({ status: 'ready' });
+  } catch (err) {
+    return res.status(503).json({
+      status: 'unready',
+      reason: 'Database pool unavailable',
+      error: (err as Error).message,
+    });
+  }
+});
+```
+
+### 2. Kubernetes Deployment Configuration (`deployment.yaml`):
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: core-api
+spec:
+  replicas: 5
+  template:
+    spec:
+      containers:
+        - name: app
+          image: core-api:v2.4.0
+          ports:
+            - containerPort: 3000
+          # Give up to 60s for cold boot before any probe can fail it
+          startupProbe:
+            httpGet:
+              path: /health/ready
+              port: 3000
+            failureThreshold: 30
+            periodSeconds: 2
+          # Restart pod only if process is deadlocked or unalive
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: 3000
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          # Drain traffic if DB is unreachable without restarting container
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: 3000
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 2
+```
+
+## Verification
+
+1. **Startup test:** Deploy a new version and inspect `kubectl describe pod`. Verify that `startupProbe` handles initialization without premature restarts.
+2. **Readiness removal verification:** Temporarily block database access on one pod using `iptables` or an admin flag. Verify that the ingress controller stops routing traffic to that pod within 5 seconds (`kubectl get endpoints`), but the pod remains running without restarting.
+3. **Liveness deadlock verification:** Simulate event loop lockup (`while(true){}`) on a test container. Verify that after 30 seconds (3 failed probes at 10s intervals), Kubernetes terminates and restarts the deadlocked pod.
+4. **Graceful shutdown verification:** Send `kill -SIGTERM <pid>`. Verify that `/health/ready` immediately returns 503 while existing connections finish cleanly.
+
+## Why
+
+Operating software at scale requires distinguishing between two fundamentally different failure states:
+1. **Unhealthy process:** The process has hung, deadlocked, or crashed. It will never recover on its own; it must be killed and restarted.
+2. **Temporarily unavailable service:** The database is experiencing a failover or the connection pool is warming up. Killing the web app achieves nothing except destroying in-flight requests and overloading Kubernetes.
+
+Separating Liveness from Readiness gives orchestration engines the precise nuance they need to automate high availability without human intervention.
+
+## When Not To Use
+
+- **Static file hosting (S3, Cloudflare Pages):** Serverless static sites have no long-running containers or connection pools to monitor.
+- **Short-lived batch jobs (Kubernetes Jobs, AWS Lambda):** Ephemeral run-to-completion tasks execute once and exit; probe lifecycles do not apply.
+
+## Common Mistakes
+
+- **Hitting the database in liveness probes:** When the database gets slow, Kubernetes kills all backend pods, multiplying the database crisis into a total site outage.
+- **Identical liveness and readiness URLs:** Pointing both probes to the same endpoint destroys the benefits of the pattern.
+- **Probe timeout shorter than network latency:** Setting `timeoutSeconds: 1` when the database ping takes 1.2 seconds causes healthy pods to be continuously evicted.

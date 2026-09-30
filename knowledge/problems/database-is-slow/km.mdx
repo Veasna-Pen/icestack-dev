@@ -1,0 +1,172 @@
+---
+title: "ហេតុអ្វីបានជា database របស់ខ្ញុំយឺត?"
+summary: "ជាធម្មតាមូលហេតុគឺ query មួយ ឬពីរ មិនមែន database ទាំងមូលទេ។ ស្វែងរកវាដោយប្រើ pg_stat_statements និង EXPLAIN មុននឹងគិតដល់ cache, read replica ឬម៉ាស៊ីនធំជាង។"
+tags: [database, postgres, performance, indexing]
+related: [problems/should-i-use-redis, patterns/caching, tradeoffs/sql-vs-nosql]
+order: 3
+updated: "2026-09-11"
+translation: draft
+---
+
+## Context
+
+Checkout API មួយដំណើរការលើ Node.js service ជាមួយ Postgres 16 primary មួយ (8 vCPU, RAM 32 GB) ហើយមានប្រហែល 40 លាន rows នៅក្នុង table `orders`។ ចរាចរណ៍ (traffic) បានកើនទ្វេដងក្នុងត្រីមាសនេះ បន្ទាប់ពីយុទ្ធនាការផ្សព្វផ្សាយ។ ក្រុមការងារមាន backend developer បួននាក់ ហើយគ្មាន DBA ផ្ទាល់ទេ។
+
+នេះគឺជាទម្រង់ទូទៅបំផុតនៃសំណួរនេះ៖ relational database ទំហំមធ្យមមួយ ដែលដំណើរការល្អអស់រយៈពេលមួយឆ្នាំ ហើយស្រាប់តែលែងល្អ។ ឧទាហរណ៍ខាងក្រោមប្រើ Postgres ប៉ុន្តែរបៀបគិតនេះក៏អាចយកទៅប្រើជាមួយ MySQL បានដែរ។
+
+## Symptoms
+
+- Checkout p95 កើនពី **120 ms ទៅ 2.4 s** ក្នុងរយៈពេលប្រហែលបីសប្តាហ៍ មិនមែនភ្លាមៗក្នុងមួយយប់ទេ។
+- Database CPU នៅចន្លោះ 85–95% ក្នុងម៉ោងធ្វើការ ខណៈដែលពីមុនវានៅក្រោម 40%។
+- Connection pool timeout (`TimeoutError: acquiring connection`) កើតឡើងនៅម៉ោងមមាញឹក។
+- ការស្មានដំបូងរបស់មនុស្សគ្រប់គ្នាគឺ «traffic កើនទ្វេដង ដូច្នេះ database ត្រូវតែធំជាងនេះ»។
+
+<Callout type="warning" title="Database យឺត គឺជារោគសញ្ញា">
+ភាពយឺតស្ទើរតែមិនដែលបែងចែកស្មើៗគ្នានោះទេ។ ក្នុងករណីភាគច្រើន មាន query តែប៉ុន្មានប៉ុណ្ណោះដែលស៊ីពេលវេលាភាគច្រើនរបស់ database។ សូមស្វែងរកវាឱ្យឃើញ មុននឹងផ្លាស់ប្តូរអ្វីទាំងអស់។
+</Callout>
+
+## Diagnose
+
+ធ្វើការពីលើចុះក្រោម៖ ដំបូងរក query ណាដែលស៊ីពេល **សរុប** ច្រើនបំផុត បន្ទាប់មកស្វែងយល់ថាហេតុអ្វីបានជា query នីមួយៗយឺត។
+
+**១. តម្រៀប queries តាមពេលវេលាសរុប។** `pg_stat_statements` មកជាមួយ Postgres ស្រាប់។ បើកវាម្តង ហើយទុកវាឱ្យដំណើរការជានិច្ច។
+
+```sql
+-- postgresql.conf: shared_preload_libraries = 'pg_stat_statements' (one restart)
+CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
+
+SELECT
+  round(total_exec_time)                                          AS total_ms,
+  calls,
+  round(mean_exec_time::numeric, 1)                               AS mean_ms,
+  round((100 * total_exec_time / sum(total_exec_time) OVER ())::numeric, 1) AS pct,
+  left(query, 80)                                                 AS query
+FROM pg_stat_statements
+ORDER BY total_exec_time DESC
+LIMIT 10;
+```
+
+ក្នុងឧទាហរណ៍នេះ query មួយស៊ីពេល **61% នៃពេលវេលាទាំងអស់របស់ database**៖
+
+```sql
+SELECT * FROM orders
+WHERE customer_id = $1
+ORDER BY created_at DESC
+LIMIT 20;
+```
+
+**២. សួរ planner ថាវាកំពុងធ្វើអ្វី។** ដំណើរការ query ជាមួយ parameters ពិតៗ៖
+
+```sql
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT * FROM orders WHERE customer_id = 4821 ORDER BY created_at DESC LIMIT 20;
+```
+
+```text
+Limit  (actual time=1912.4..1912.6 rows=20 loops=1)
+  ->  Index Scan Backward using orders_created_at_idx on orders
+        (actual time=0.9..1912.5 rows=20 loops=1)
+        Filter: (customer_id = 4821)
+        Rows Removed by Filter: 3148022
+        Buffers: shared hit=91210 read=38112
+```
+
+Postgres កំពុងដើរតាម index `created_at` ថយក្រោយ ហើយបោះចោល rows ចំនួន 3.1 លាន ដើម្បីរកឱ្យឃើញ 20 rows ដែលជារបស់អតិថិជននេះ។ មិនមាន index លើ `customer_id` ទេ។ រាល់ order ថ្មីដែលនរណាម្នាក់បញ្ជាទិញ ធ្វើឱ្យ query នេះយឺតជាងមុនសម្រាប់មនុស្សគ្រប់គ្នា ហេតុនេះហើយបានជាវាយឺតបន្តិចម្តងៗរាប់សប្តាហ៍ ជំនួសឱ្យការខូចភ្លាមៗ។
+
+ចំណុចដែលត្រូវរកមើលក្នុង plan ណាមួយ៖
+
+| នៅក្នុង plan | ជាធម្មតាមានន័យថា |
+| :--- | :--- |
+| `Seq Scan` លើ table ធំ | គ្មាន index ដែលអាចប្រើបានសម្រាប់ filter |
+| `Rows Removed by Filter` រាប់លាន | មាន index ប៉ុន្តែនៅលើ column ខុស |
+| `Sort` នៅពីលើ scan | Index មិនត្រូវនឹង `ORDER BY` |
+| ចំនួន `rows` ដែលប៉ាន់ស្មាន ខុសឆ្ងាយពីចំនួនពិត | Statistics ហួសសម័យ; ដំណើរការ `ANALYZE` |
+| `Buffers: shared read` ច្រើន | កំពុងអានពី disk ជំនួសឱ្យ memory |
+
+**៣. ពិនិត្យបញ្ជីផ្សេងទៀត** មុននឹងសម្រេចចិត្ត៖ N+1 patterns (query លឿនមួយត្រូវហៅរាប់ពាន់ដង), lock waits (`pg_stat_activity` ដែល `wait_event_type = 'Lock'`) និងចំនួន connections ធៀបនឹង `max_connections`។
+
+## Options
+
+1. **មិនធ្វើអ្វីសោះ។** មិនអាចទៅរួចទេក្នុងករណីនេះ៖ p95 បានហួសពីគោលដៅរបស់ checkout ឆ្ងាយណាស់ហើយ។
+2. **បន្ថែម index ដែលត្រឹមត្រូវ។** Composite index ដែលត្រូវនឹងទាំង filter និង sort។
+3. **សរសេរ query ឡើងវិញ។** ជ្រើសរើសតែ columns ដែលទំព័រត្រូវការ។
+4. **Cache លទ្ធផលក្នុង Redis។** បម្រើបញ្ជី orders របស់អតិថិជននីមួយៗពី memory។
+5. **បន្ថែម read replica។** ផ្ទេរ read traffic ចេញពី primary។
+6. **ដំឡើងម៉ាស៊ីនឱ្យធំជាងមុន។** CPU និង RAM ច្រើនជាងមុន។
+
+## Trade-offs
+
+| ជម្រើស | ការចំណាយ | រយៈពេលដាក់ឱ្យប្រើ | អាចត្រឡប់វិញបាន? | ចំណុចខូចថ្មីៗ |
+| :--- | :--- | :--- | :--- | :--- |
+| Index | Write យឺតបន្តិច និងស៊ី disk | ប៉ុន្មានម៉ោង | បាន ដោយ `DROP INDEX` | ស្ទើរតែគ្មាន |
+| សរសេរ query ឡើងវិញ | ពេលវេលារបស់ developer | មួយថ្ងៃ | បាន | កូដដែលហៅវាអាចខូច |
+| Redis cache | Service ថ្មី និង logic សម្រាប់ invalidation | ប៉ុន្មានថ្ងៃ | ពិបាក នៅពេលពឹងផ្អែកលើវារួច | ទិន្នន័យចាស់, stampede, Redis គាំង |
+| Read replica | ថ្លៃ database ប្រហែលទ្វេដង | ប៉ុន្មានថ្ងៃ | បាន | Replication lag, bug read-your-writes |
+| ម៉ាស៊ីនធំជាង | ថ្លៃ database ប្រហែលទ្វេដង | ប៉ុន្មាននាទី | បាន | គ្មាន ប៉ុន្តែបញ្ហានឹងត្រឡប់មកវិញនៅពេល table ធំឡើង |
+
+Cache និង replica សុទ្ធតែព្យាបាលរោគសញ្ញា (load ច្រើនពេក) ជំនួសឱ្យមូលហេតុ (query មួយដែលធ្វើការច្រើនជាងការចាំបាច់រាប់លានដង)។ វាក៏បន្ថែមផ្នែកថ្មីៗ ដែលក្រុមមនុស្សបួននាក់ត្រូវដំណើរការនៅម៉ោង ៣ យប់ផងដែរ។
+
+## Decision
+
+**បន្ថែម composite index លើ `(customer_id, created_at DESC)`** ហើយកាត់បន្ថយ query ឱ្យនៅសល់តែ columns ដែលទំព័រប្រើ។
+
+ពិនិត្យជម្រើស cache ឬ replica ឡើងវិញ លុះត្រាតែ database នៅតែជាចំណុចកកស្ទះ **បន្ទាប់ពី** queries កំពូលៗត្រូវបានជួសជុលរួច ឧទាហរណ៍ ប្រសិនបើ CPU នៅតែលើសពីប្រហែល 70% នៅម៉ោងមមាញឹក ទោះបីជា top 10 ក្នុង `pg_stat_statements` មើលទៅល្អហើយក៏ដោយ។
+
+## Implementation
+
+បង្កើត index ដោយមិនរារាំងការ write។ `CONCURRENTLY` ចំណាយពេលយូរជាង ប៉ុន្តែមិន lock table ទេ៖
+
+```sql
+CREATE INDEX CONCURRENTLY IF NOT EXISTS orders_customer_created_idx
+  ON orders (customer_id, created_at DESC);
+```
+
+ប្រសិនបើការបង្កើតបរាជ័យពាក់កណ្តាលផ្លូវ វានឹងបន្សល់ទុក index ដែល `INVALID`។ ស្វែងរកវា លុបវាចោល ហើយសាកល្បងម្តងទៀត៖
+
+```sql
+SELECT indexrelid::regclass FROM pg_index WHERE NOT indisvalid;
+DROP INDEX CONCURRENTLY orders_customer_created_idx;
+```
+
+បន្ទាប់មក ឈប់ទាញយក columns ដែលគ្មាននរណាអាន៖
+
+```sql
+SELECT id, order_number, status, total_cents, created_at
+FROM orders
+WHERE customer_id = $1
+ORDER BY created_at DESC
+LIMIT 20;
+```
+
+ប្រសិនបើអ្នកប្រើ migration tool សូមប្រាកដថា migration នេះមិនដំណើរការនៅក្នុង transaction ទេ ព្រោះ `CREATE INDEX CONCURRENTLY` មិនព្រមដំណើរការក្នុង transaction។
+
+## Verification
+
+1. **Plan បានផ្លាស់ប្តូរ។** `EXPLAIN (ANALYZE, BUFFERS)` ឥឡូវបង្ហាញ `Index Scan using orders_customer_created_idx` គ្មាន `Rows Removed by Filter` ហើយប្រើ buffers តែប៉ុន្មានដប់ ជំនួសឱ្យ 129,000។
+2. **លេខពីបញ្ហាដើមបានប្រសើរឡើង។** Checkout p95 ត្រឡប់មកប្រហែល **140 ms** វិញ ហើយ database CPU នៅម៉ោងមមាញឹកនៅប្រហែល 35%។
+3. **គ្មានអ្វីផ្សេងទៀតកាន់តែអាក្រក់ទេ។** Insert latency លើ `orders` មិនផ្លាស់ប្តូរ។
+4. **វានៅតែល្អជាប់លាប់។** Reset statistics (`SELECT pg_stat_statements_reset();`) ហើយពិនិត្យ top 10 ម្តងទៀតក្នុងមួយសប្តាហ៍ក្រោយ។ ដាក់ alert លើ p95 របស់ endpoint មិនមែនត្រឹមតែលើ database CPU ទេ។
+
+## Why
+
+ការចំណាយរបស់ query អាស្រ័យលើបរិមាណទិន្នន័យដែល database ត្រូវប៉ះពាល់ មិនមែនត្រឹមតែចំនួនដងដែលអ្នកសួរនោះទេ។ បើគ្មាន index ត្រឹមត្រូវ «orders ចុងក្រោយ 20 របស់អតិថិជនម្នាក់» មានន័យថាត្រូវរំលងគ្រប់ orders ថ្មីៗទាំងអស់នៅក្នុង table ហើយចំនួននោះកើនឡើងតាមទំហំ table។ Traffic ដែលកើនទ្វេដងគ្រាន់តែធ្វើឱ្យបញ្ហាលេចចេញ; table ដែលធំឡើងទើបជាអ្នកបង្កើតបញ្ហា។
+
+Index ប្រែក្លាយ query ដែលកើនតាមទំហំ table ទៅជា query ដែលកើនតាមទំហំលទ្ធផល។ នោះហើយជាមូលហេតុដែលវាឈ្នះជម្រើស infrastructure ទាំងអស់៖ វាលុបការងារចោល ជំនួសឱ្យការទិញសមត្ថភាពបន្ថែមដើម្បីធ្វើការងារនោះ។
+
+## When Not To Use
+
+«បន្ថែម index» មិនមែនតែងតែជាចម្លើយនោះទេ៖
+
+- **Tables ដែល write ច្រើន** ដូចជា event logs ឬ metrics ដែល index បន្ថែមនីមួយៗធ្វើឱ្យរាល់ insert យឺត។ សូមពិចារណា partitioning ឬ store ផ្សេង។
+- **Columns ដែលមានតម្លៃខុសគ្នាតិច** ដូចជា boolean `is_active`។ Planner ជាញឹកញាប់មិនប្រើ index នោះទេ។
+- **Analytical queries** ដែលអានស្ទើរតែទាំង table (របាយការណ៍ប្រចាំខែ)។ Queries ទាំងនោះត្រូវការ replica, materialized view ឬ data warehouse។
+- **នៅពេលគ្មាន query ណាមួយលេចធ្លោ។** ប្រសិនបើពេលវេលាត្រូវបានបែងចែកស្មើៗគ្នាលើ queries តូចៗរាប់ពាន់ សូមពិនិត្យ N+1 patterns, connection pooling ឬ traffic ដែលច្រើនពេកពិតប្រាកដ។
+
+## Common Mistakes
+
+- **ដំឡើងម៉ាស៊ីនជាមុនសិន។** ម៉ាស៊ីនធំជាងអាចទិញពេលបានប៉ុន្មានខែ បន្ទាប់មក table នឹងធំហួសវាម្តងទៀត ជាមួយវិក្កយបត្រប្រចាំខែទ្វេដង។
+- **ដាក់ cache ពីលើ index ដែលខ្វះ។** ឥឡូវអ្នកមានទាំង query យឺត *និង* បញ្ហា invalidation។ សូមមើល [តើខ្ញុំគួរប្រើ Redis ដែរឬទេ?](../should-i-use-redis)។
+- **បង្កើត index គ្រប់ columns «ក្រែងលោត្រូវការ»។** Indexes ដែលមិនប្រើធ្វើឱ្យ write យឺត និងស៊ី disk។ រកមើល `idx_scan = 0` នៅក្នុង `pg_stat_user_indexes`។
+- **លំដាប់ columns ខុស។** `(created_at, customer_id)` បម្រើ `WHERE customer_id = ? ORDER BY created_at` បានអាក្រក់ជាងច្រើន។ ដាក់ columns ដែលប្រៀបធៀបស្មើ (equality) មុន បន្ទាប់មក column សម្រាប់ sort។
+- **ប្រើ `CREATE INDEX` ធម្មតាលើ table ដែលកំពុងមមាញឹកក្នុង production** ដែលរារាំងការ write រហូតដល់វាបញ្ចប់។
+- **សាកល្បងលើកុំព្យូទ័រផ្ទាល់ខ្លួនដែលមានតែមួយពាន់ rows** ដែលគ្រប់ plan សុទ្ធតែលឿន។ សាកល្បងជាមួយទិន្នន័យទំហំប៉ុន production ឬអាន plan ពី production ផ្ទាល់។

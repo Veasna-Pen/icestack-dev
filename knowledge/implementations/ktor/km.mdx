@@ -1,0 +1,179 @@
+---
+title: "Ktor (Kotlin)"
+question: "តើត្រូវរៀបចំ Coroutine Timeouts, Exposed Connection Pooling, និង Rate Limiting ក្នុង Ktor ដោយរបៀបណា?"
+summary: "Coroutine Timeouts, Ktor Client Retry ជាមួយ Jitter, Exposed ORM ជាមួយ HikariCP, RateLimit Plugin, និង Atomic Idempotency ក្នុង Kotlin។"
+tags: [kotlin, ktor, coroutines, exposed, implementation]
+related: [patterns/retry, patterns/idempotency, patterns/caching, patterns/rate-limiting]
+order: 15
+updated: "2026-09-12"
+contributors: [veasna]
+translation: draft
+---
+
+ការអនុវត្ត Patterns សម្រាប់ Ktor 3+ និង Kotlin 2+ ក្នុង Production។ ផ្តោតលើ Structured Concurrency Timeouts ជាមួយ Coroutines, Ktor Client Retries, Exposed ORM ជាមួយ HikariCP Connection Pool, និង Route Rate Limiting។
+
+## Timeouts first (Coroutines)
+
+ក្នុង Kotlin យន្តការ Structured Concurrency អនុញ្ញាតឱ្យកំណត់ Timeout លើ Suspending Function យ៉ាងងាយតាមរយៈ `withTimeout`៖
+
+```kotlin
+package com.example.rates
+
+import io.ktor.client.*
+import io.ktor.client.request.*
+import io.ktor.client.statement.*
+import io.ktor.server.application.*
+import io.ktor.server.response.*
+import io.ktor.server.routing.*
+import io.ktor.http.*
+import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.TimeoutCancellationException
+
+fun Route.ratesRouting(client: HttpClient) {
+    get("/rates") {
+        try {
+            val body = withTimeout(2000L) {
+                val response = client.get("https://api.example.com/rates")
+                if (response.status != HttpStatusCode.OK) {
+                    throw IllegalStateException("Upstream ឆ្លើយតប ${response.status}")
+                }
+                response.bodyAsText()
+            }
+            call.respondText(body, ContentType.Application.Json)
+        } catch (e: TimeoutCancellationException) {
+            call.respond(HttpStatusCode.GatewayTimeout, mapOf("error" to "Exchange rates service ផុតម៉ោងកំណត់"))
+        }
+    }
+}
+```
+
+## Retry with backoff (Ktor Client Plugins)
+
+តម្លើង `HttpTimeout` និង `HttpRequestRetry` ផ្ទាល់នៅលើ Ktor `HttpClient`៖
+
+```kotlin
+import io.ktor.client.*
+import io.ktor.client.engine.cio.*
+import io.ktor.client.plugins.*
+import io.ktor.client.plugins.HttpRequestRetry
+import io.ktor.http.*
+
+val httpClient = HttpClient(CIO) {
+    install(HttpTimeout) {
+        requestTimeoutMillis = 3000
+        connectTimeoutMillis = 1500
+        socketTimeoutMillis = 3000
+    }
+
+    install(HttpRequestRetry) {
+        maxRetries = 3
+        exponentialDelay(base = 0.2, maxDelayMs = 2000)
+        retryIf { _, response ->
+            response.status.value in listOf(408, 429, 500, 502, 503, 504)
+        }
+        retryOnExceptionIf { _, cause ->
+            cause is java.io.IOException
+        }
+    }
+}
+```
+
+## Database connection pool (HikariCP + Exposed)
+
+កំណត់រចនាសម្ព័ន្ធ HikariCP ជាមួយ Statement Timeouts និងដំណើរការ Queries ក្នុង `newSuspendedTransaction`៖
+
+```kotlin
+import com.zaxxer.hikari.HikariConfig
+import com.zaxxer.hikari.HikariDataSource
+import org.jetbrains.exposed.sql.Database
+import org.jetbrains.exposed.sql.transactions.experimental.newSuspendedTransaction
+import kotlinx.coroutines.Dispatchers
+
+fun initDatabase(jdbcUrl: String): Database {
+    val config = HikariConfig().apply {
+        this.jdbcUrl = jdbcUrl
+        driverClassName = "org.postgresql.Driver"
+        maximumPoolSize = 20
+        minimumIdle = 5
+        connectionTimeout = 3_000
+        addDataSourceProperty("options", "-c statement_timeout=5000ms")
+    }
+
+    val dataSource = HikariDataSource(config)
+    return Database.connect(dataSource)
+}
+
+suspend fun <T> dbQuery(block: suspend () -> T): T =
+    newSuspendedTransaction(Dispatchers.IO) { block() }
+```
+
+## Idempotency keys
+
+ការពារការកាត់ប្រាក់ ឬបង្កើត Order ស្ទួនដោយប្រើ Database Constraints៖
+
+```kotlin
+import io.ktor.server.application.*
+import io.ktor.server.request.*
+import io.ktor.server.response.*
+import io.ktor.http.*
+import org.jetbrains.exposed.sql.*
+
+suspend fun handleCreateOrder(call: ApplicationCall) {
+    val key = call.request.headers["Idempotency-Key"]
+    if (key.isNullOrBlank()) {
+        call.respond(HttpStatusCode.BadRequest, mapOf("error" to "តម្រូវឱ្យមាន Idempotency-Key header"))
+        return
+    }
+
+    val result = dbQuery {
+        val existing = IdempotencyTable.select { IdempotencyTable.key eq key }.singleOrNull()
+        if (existing != null) {
+            val cached = existing[IdempotencyTable.response]
+            return@dbQuery if (cached != null) {
+                HttpStatusCode.OK to cached
+            } else {
+                HttpStatusCode.Conflict to "{\"error\":\"សំណើកំពុងដំណើរការ\"}"
+            }
+        }
+
+        IdempotencyTable.insert {
+            it[IdempotencyTable.key] = key
+        }
+
+        val newId = OrdersTable.insertAndGetId {
+            it[customerId] = "cust_99"
+            it[totalCents] = 5000
+        }
+
+        val json = "{\"orderId\":${newId.value},\"status\":\"created\"}"
+        IdempotencyTable.update({ IdempotencyTable.key eq key }) {
+            it[response] = json
+        }
+
+        HttpStatusCode.Created to json
+    }
+
+    call.respondText(result.second, ContentType.Application.Json, result.first)
+}
+```
+
+## Rate limiting (`RateLimit` plugin)
+
+Ktor មាន Plugin Rate Limiter ស្រាប់ជាមួយ Token Bucket៖
+
+```kotlin
+import io.ktor.server.application.*
+import io.ktor.server.plugins.ratelimit.*
+import kotlin.time.Duration.Companion.seconds
+
+fun Application.configureRateLimiting() {
+    install(RateLimit) {
+        register(RateLimitName("public-api")) {
+            rateLimiter(limit = 60, refillPeriod = 60.seconds)
+            requestKey { call ->
+                call.request.origin.remoteAddress
+            }
+        }
+    }
+}
+```

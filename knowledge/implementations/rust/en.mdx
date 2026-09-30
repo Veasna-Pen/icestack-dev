@@ -1,0 +1,195 @@
+---
+title: "Rust"
+question: "How do I implement cancel-safe Tokio timeouts, SQLx connection pooling, and Governor in Rust?"
+summary: "Cancel-safe timeouts with Tokio, retry with exponential backoff and full jitter, connection pooling with SQLx, and rate limiting with Governor in async Rust."
+tags: [rust, systems, backend, implementation, tokio]
+related: [patterns/retry, patterns/circuit-breaker, patterns/rate-limiting, patterns/idempotency]
+order: 7
+updated: "2026-09-12"
+contributors: [veasna]
+---
+
+Idiomatic async resilience patterns for Rust 1.78+. Demonstrates cancel-safe Tokio timeouts, exponential backoff retries with full jitter, SQLx connection pool lifecycle tuning, Governor token-bucket limiters, and atomic transaction idempotency.
+
+## Timeouts first
+
+In async Rust, dropping a future cancels it. Tokio's `tokio::time::timeout` enforces a deadline by dropping the inner future if it does not complete within the specified duration:
+
+```rust
+use std::time::Duration;
+use reqwest::Client;
+
+pub async fn fetch_rates(client: &Client) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let request_future = async {
+        let res = client
+            .get("https://api.example.com/rates")
+            .send()
+            .await?
+            .error_for_status()?
+            .text()
+            .await?;
+        Ok::<String, reqwest::Error>(res)
+    };
+
+    // Wrap the future in a 2-second timeout
+    match tokio::time::timeout(Duration::from_secs(2), request_future).await {
+        Ok(Ok(body)) => Ok(body),
+        Ok(Err(req_err)) => Err(Box::new(req_err)),
+        Err(_elapsed) => Err("Request timed out after 2 seconds".into()),
+    }
+}
+```
+
+<Callout type="warning" title="Beware of cancel-safety in Rust">
+Because Tokio cancels futures by dropping them, make sure any future passed to `timeout` is **cancel-safe** (like network reads). If you drop a future in the middle of writing state to an internal buffer or channel, data corruption can occur.
+</Callout>
+
+## Retry with backoff
+
+Retry transient network failures with exponential backoff, full jitter, and maximum attempts:
+
+```rust
+use std::time::Duration;
+use rand::Rng;
+
+pub async fn with_retry<F, Fut, T, E>(
+    max_attempts: usize,
+    base_delay: Duration,
+    mut operation: F,
+) -> Result<T, E>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, E>>,
+{
+    let mut rng = rand::rng();
+
+    for attempt in 1..=max_attempts {
+        match operation().await {
+            Ok(val) => return Ok(val),
+            Err(err) if attempt == max_attempts => return Err(err),
+            Err(_) => {
+                // Exponential backoff with full jitter
+                let max_ms = base_delay.as_millis() * (1 << (attempt - 1));
+                let jittered_ms = rng.random_range(0..=max_ms);
+                tokio::time::sleep(Duration::from_millis(jittered_ms as u64)).await;
+            }
+        }
+    }
+    unreachable!()
+}
+```
+
+## Database connection pool (SQLx)
+
+SQLx provides an asynchronous, compile-time checked connection pool for PostgreSQL:
+
+```rust
+use sqlx::postgres::{PgPool, PgPoolOptions};
+use std::time::Duration;
+
+pub async fn init_db_pool(database_url: &str) -> Result<PgPool, sqlx::Error> {
+    PgPoolOptions::new()
+        // Hardware formula: 2 * CPU_CORES + SPINDLES
+        .max_connections(10)
+        // Keep idle connections warm to avoid handshake delays
+        .min_connections(2)
+        // Maximum time to wait for a free connection from the pool
+        .acquire_timeout(Duration::from_secs(3))
+        // Recycle connections to prevent stale TCP sockets behind AWS NLB
+        .max_lifetime(Duration::from_secs(15 * 60))
+        // Clean up connections idle for longer than 5 minutes
+        .idle_timeout(Duration::from_secs(5 * 60))
+        .connect(database_url)
+        .await
+}
+```
+
+## Rate limiting with Governor
+
+In-memory GCRA / token-bucket rate limiting using the `governor` crate:
+
+```rust
+use governor::{Quota, RateLimiter};
+use nonzero_ext::nonzero;
+use std::sync::Arc;
+
+// Allow 100 requests per second with a burst capacity of 20
+pub fn create_rate_limiter() -> Arc<RateLimiter<governor::state::NotKeyed, governor::state::InMemoryState, governor::clock::DefaultClock>> {
+    let quota = Quota::per_second(nonzero!(100u32)).allow_burst(nonzero!(20u32));
+    Arc::new(RateLimiter::direct(quota))
+}
+
+pub async fn handle_request(limiter: &RateLimiter<governor::state::NotKeyed, governor::state::InMemoryState, governor::clock::DefaultClock>) -> Result<&'static str, &'static str> {
+    if limiter.check().is_ok() {
+        Ok("Request allowed")
+    } else {
+        Err("HTTP 429: Too Many Requests")
+    }
+}
+```
+
+## Idempotency with SQL transactions
+
+Record the idempotency key in the exact same database transaction as the business operation:
+
+```rust
+use sqlx::{PgPool, Postgres, Transaction};
+
+pub async fn create_order_idempotent(
+    pool: &PgPool,
+    idempotency_key: &str,
+    customer_id: &str,
+    amount_cents: i64,
+) -> Result<String, sqlx::Error> {
+    let mut tx: Transaction<'_, Postgres> = pool.begin().await?;
+
+    // 1. Try to claim or check idempotency key
+    let existing_response: Option<String> = sqlx::query_scalar!(
+        r#"
+        INSERT INTO idempotency_keys (key, status, created_at)
+        VALUES ($1, 'processing', NOW())
+        ON CONFLICT (key) DO UPDATE SET key = EXCLUDED.key
+        RETURNING response
+        "#,
+        idempotency_key
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+
+    if let Some(cached) = existing_response {
+        // Return stored cached response
+        tx.rollback().await?;
+        return Ok(cached);
+    }
+
+    // 2. Perform business logic
+    let order_id = sqlx::query_scalar!(
+        r#"
+        INSERT INTO orders (customer_id, amount_cents, status)
+        VALUES ($1, $2, 'confirmed')
+        RETURNING id
+        "#,
+        customer_id,
+        amount_cents
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+
+    // 3. Save stored response and commit
+    let response_body = format!(r#"{{"order_id":"{}","status":"confirmed"}}"#, order_id);
+    sqlx::query!(
+        r#"
+        UPDATE idempotency_keys
+        SET status = 'completed', response = $1
+        WHERE key = $2
+        "#,
+        response_body,
+        idempotency_key
+    )
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    Ok(response_body)
+}
+```

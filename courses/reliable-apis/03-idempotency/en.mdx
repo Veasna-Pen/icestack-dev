@@ -1,0 +1,98 @@
+---
+title: "Make retries safe with idempotency keys"
+summary: "Let a client retry a payment or an order without doing it twice."
+minutes: 15
+related: [patterns/idempotency, patterns/retry]
+updated: "2026-09-29"
+contributors: [Veasna-Pen]
+---
+
+## The problem
+
+A customer taps **Pay**. Your server charges the card, but the response is lost on a weak mobile connection. The app sees a timeout and, being well-behaved, **retries**. The card is charged **twice**.
+
+The retry was correct. The server just couldn't tell it apart from a new payment.
+
+## The idea
+
+An operation is **idempotent** when doing it twice has the same effect as doing it once. Reading data is naturally idempotent. "Set the price to $40" is too. "Charge $40" and "create an order" are not.
+
+To make a non-idempotent request safe to retry, the client sends an **idempotency key**: a unique ID created **once per action**, not once per attempt, sent with every retry of that action.
+
+The server remembers each key it has seen and what it answered:
+
+1. **New key**: do the work, then store the key with the result.
+2. **Key already done**: don't do the work again; return the stored result.
+3. **Key still in progress**: answer "try again shortly" (`409 Conflict`), so two attempts never run at once.
+
+Store the key in the **same database transaction** as the work itself, so you never end up with "charged but not recorded", or the opposite.
+
+## Example
+
+The client creates one key per checkout and reuses it for every retry:
+
+```ts
+const key = crypto.randomUUID(); // once, when the user taps Pay
+await withRetry(() =>
+  fetch('/payments', { method: 'POST', headers: { 'Idempotency-Key': key }, body: JSON.stringify(payment) })
+);
+```
+
+The server records the key with a unique constraint, inside the transaction:
+
+```ts
+app.post('/payments', async (req, res) => {
+  const key = req.header('Idempotency-Key');
+  if (!key) return res.status(400).json({ error: 'Idempotency-Key header is required' });
+
+  const result = await db.transaction(async tx => {
+    const saved = await tx.idempotency.findUnique({ where: { key } });
+    if (saved) return saved.response; // a retry: return the first answer
+
+    const payment = await chargeCard(tx, req.body); // the real work, once
+    await tx.idempotency.create({ data: { key, response: payment } }); // unique key
+    return payment;
+  });
+  res.json(result);
+});
+```
+
+The first attempt charges the card and stores the key. The retry finds the key and returns the **same** payment. The customer is charged once.
+
+<Info title="Two retries at the same moment">
+If two attempts arrive together, both may miss the lookup. The unique constraint on `key` makes the second insert fail, so its transaction rolls back and it can return `409`. Many payment providers, such as Stripe, accept an idempotency key on their own API too; pass yours through.
+</Info>
+
+## Try it
+
+1. Pick one endpoint that creates something: an order, a payment, a sign-up.
+2. Call it twice in a row with the same body. Do you get two records?
+3. Add an idempotency key header and a table with a **unique** key column.
+4. Call it twice with the same key: you should get one record and the same response both times.
+
+## Check yourself
+
+**1. Should the client create a new idempotency key for each retry?**
+
+<Answer>
+No. The key identifies the action, so every retry of the same payment must send the same key. A new key per attempt makes each retry look like a new payment.
+</Answer>
+
+**2. Is `PUT /users/7/email` with the new address naturally idempotent?**
+
+<Answer>
+Yes. Setting the email to the same value twice leaves the same result. Creating, charging, sending and incrementing are the operations that usually need a key.
+</Answer>
+
+**3. Why store the key in the same transaction as the work?**
+
+<Answer>
+So both happen or neither does. If the charge succeeds but saving the key fails, a retry would charge again. If the key is saved but the work fails, a retry would wrongly be told it succeeded.
+</Answer>
+
+## Key takeaways
+
+- **Idempotent** means repeating it has the same effect as doing it once.
+- Retries of creates and payments need an **idempotency key**: one per action, reused on every retry.
+- The server stores each key with its result and **returns the stored result** for repeats.
+- Save the key in the **same transaction** as the work, behind a **unique constraint**.

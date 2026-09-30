@@ -1,0 +1,89 @@
+---
+title: "Graceful shutdown: finish what you started"
+summary: "Stop an instance without failing the requests and jobs it is working on."
+minutes: 10
+related: [patterns/graceful-shutdown, patterns/health-check]
+updated: "2026-09-30"
+contributors: [Veasna-Pen]
+---
+
+## The problem
+
+Health checks fixed the errors at the **start** of each deploy. But at the **end**, a few requests still fail: uploads cut off halfway, checkouts that return `502`, a background job that stopped after charging a card but before saving the order.
+
+The old instances are being stopped in the middle of their work.
+
+## The idea
+
+When a platform stops a container (a deploy, scaling down, moving to another machine), it first sends the process a **`SIGTERM`** signal: "please stop". Only after a grace period, 30 seconds by default in Kubernetes, does it send `SIGKILL`, which ends the process at once.
+
+Most apps ignore `SIGTERM` and simply die, dropping everything in flight. A **graceful shutdown** uses the grace period:
+
+1. **Stop receiving new work.** Fail the readiness check so the load balancer stops sending traffic, and stop taking new jobs from the queue.
+2. **Finish the work already started**: open requests and running jobs.
+3. **Close connections cleanly**: database pool, Redis, message broker.
+4. **Exit**, before the grace period runs out.
+
+The load balancer needs a few seconds to notice the failed readiness check, so wait briefly before closing the server.
+
+## Example
+
+A shutdown handler for an Express app with a queue worker:
+
+```ts
+let shuttingDown = false;
+app.get('/readyz', (_req, res) => res.sendStatus(shuttingDown ? 503 : 200));
+
+process.on('SIGTERM', async () => {
+  shuttingDown = true; // 1. readiness fails; no new traffic
+  await sleep(5_000); // give the load balancer time to notice
+
+  await Promise.all([
+    new Promise(resolve => server.close(resolve)), // 2. finish open requests
+    worker.close() // finish running jobs, take no new ones
+  ]);
+
+  await db.$disconnect(); // 3. close connections
+  process.exit(0); // 4. done, well within the 30-second grace period
+});
+```
+
+The deploy now drains each old instance: no new requests arrive, the ones in flight complete, and the process exits cleanly. The 502s and half-finished jobs at the end of deploys disappear.
+
+<Warning title="Make sure the signal reaches your app">
+In Docker, `CMD npm start` runs npm as the main process, and npm may not pass `SIGTERM` on to Node. Use `CMD ["node", "server.js"]` so your process receives the signal itself.
+</Warning>
+
+## Try it
+
+1. Add a slow endpoint to your app, for example one that waits 10 seconds before answering.
+2. Call it, and while it is waiting, stop the app with `kill -TERM <pid>` or `docker stop`.
+3. Without a handler, the request fails. Add the handler above and try again: the request should complete before the process exits.
+4. Check your platform's grace period, and make sure your slowest request or job fits inside it.
+
+## Check yourself
+
+**1. What is the difference between `SIGTERM` and `SIGKILL`?**
+
+<Answer>
+`SIGTERM` asks the process to stop and can be handled, which is where graceful shutdown happens. `SIGKILL` ends it immediately and cannot be caught. The platform sends `SIGKILL` if the process is still running when the grace period ends.
+</Answer>
+
+**2. Why wait a few seconds after failing readiness before closing the server?**
+
+<Answer>
+The load balancer only checks readiness every few seconds, so it may still route requests to the instance for a short time. Closing at once would refuse those requests.
+</Answer>
+
+**3. A job can take up to 2 minutes, and the grace period is 30 seconds. What do you do?**
+
+<Answer>
+Either raise the grace period above the longest job, or make the job safe to stop and restart: split it into smaller steps and make it idempotent, so another worker can pick it up after the queue returns it.
+</Answer>
+
+## Key takeaways
+
+- Platforms send **`SIGTERM`**, wait a grace period, then **`SIGKILL`**.
+- On `SIGTERM`: **stop new work, finish current work, close connections, exit**.
+- Fail readiness first and **give the load balancer a moment**.
+- Keep your slowest request or job **inside the grace period**.

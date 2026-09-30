@@ -1,0 +1,152 @@
+---
+title: "តើខ្ញុំដោះស្រាយ CORS errors ដោយរបៀបណា?"
+question: "ហេតុអ្វីបានជា API Requests របស់ខ្ញុំជួបប្រទះ CORS Errors ក្នុង Production?"
+summary: "CORS គឺជាយន្តការសុវត្ថិភាពរបស់ Browser មិនមែនជា firewall របស់ backend ឡើយ។ បញ្ហា CORS ក្នុង production ជាទូទៅបណ្តាលមកពីការបរាជ័យលើ preflight OPTIONS requests, reverse proxy កាត់ headers ចោលពេលមាន error 5xx, ឬការកំណត់ credentials mode មិនត្រូវគ្នា។"
+tags: [cors, security, api, browsers, http, production]
+related: [problems/slow-first-request, tradeoffs/rest-vs-grpc]
+order: 17
+updated: "2026-09-12"
+contributors: [veasna]
+translation: draft
+---
+
+## Context
+
+កម្មវិធីវេបសាយទំនើបមួយដែលមាន frontend ជា Single Page Application (React / Next.js) ស្ថិតនៅលើ `https://app.example.com` និង backend REST API ស្ថិតនៅលើ `https://api.example.com`។
+
+អំឡុងពេលធ្វើតេស្តលើកុំព្យូទ័រក្នុងស្រុកតាម `localhost:3000` និង `localhost:8000` អ្នកអភិវឌ្ឍន៍បានកំណត់ `Access-Control-Allow-Origin: *`។ អ្វីៗដំណើរការយ៉ាងរលូនល្អ។
+
+ប៉ុន្តែភ្លាមៗក្រោយពេល deploy ទៅកាន់ production ផ្ទាំង Console របស់ browser ពោរពេញទៅដោយអក្សរ error ពណ៌ក្រហម៖
+```text
+Access to fetch at 'https://api.example.com/orders' from origin 'https://app.example.com' 
+has been blocked by CORS policy: Response to preflight request doesn't pass access control check: 
+No 'Access-Control-Allow-Origin' header is present on the requested resource.
+```
+
+ក្រុមការងារព្យាយាមដោះស្រាយតាមទម្លាប់៖ បន្ថែម wildcard `*` headers, បើក CORS plugin ក្នុង Express ប៉ុន្តែកំហុសនៅតែបន្តកើតឡើង ឬប្រែប្រួលទៅជា `The value of the 'Access-Control-Allow-Origin' header must not be the wildcard '*' when credentials mode is 'include'`។
+
+## Symptoms
+
+- Request របស់ Browser ត្រូវបរាជ័យមុនពេលទៅដល់ business logic របស់ backend ទៅទៀត។
+- ផ្ទាំង Network tab បង្ហាញ request ពីរសម្រាប់ action តែមួយ៖ request `OPTIONS` បរាជ័យជាមួយ HTTP 404, 401 ឬ 502 រួច request `POST` បន្ទាប់មកត្រូវ canceled។
+- នៅពេលតេស្ត endpoint ដដែលនោះតាមរយៈ `curl` ឬ Postman **ដំណើរការជោគជ័យ ១០០%** ជាមួយ HTTP 200 ដែលធ្វើឱ្យ developers ងឿងឆ្ងល់យ៉ាងខ្លាំង។
+- នៅពេលមានកំហុស Internal Server Error (HTTP 500) កើតឡើង browser បែរជាលាក់ error ពិតប្រាកដ រួចបង្ហាញសារច្រឡំថាជា CORS error ទៅវិញ។
+
+<Callout type="warning" title="CORS ត្រូវបានអនុវត្តដោយ Browser មិនមែនដោយ Server ទេ">
+CORS មិនបានរារាំង backend មិនឱ្យដំណើរការ request ឡើយ; វាគ្រាន់តែរារាំង browser របស់អ្នកប្រើប្រាស់កុំឱ្យអាន response តែប៉ុណ្ណោះ។ ប្រសិនបើ backend របស់អ្នកគាំង (crash) មុនពេល CORS middleware បានបិទភ្ជាប់ headers នោះ browser នឹងចាត់ទុកការគាំងនោះថាជាការបំពាន CORS ភ្លាម។
+</Callout>
+
+## Diagnose
+
+1. **សាកល្បងជាមួយ `curl -I` ដោយក្លែងជា Browser Preflight៖**
+   ```bash
+   curl -I -X OPTIONS https://api.example.com/orders \
+     -H "Origin: https://app.example.com" \
+     -H "Access-Control-Request-Method: POST" \
+     -H "Access-Control-Request-Headers: Content-Type, Authorization"
+   ```
+   ពិនិត្យមើល response៖
+   - តើវាឆ្លើយតប **HTTP 204** ឬ **HTTP 200** ដែរឬទេ? (បើវាឆ្លើយតប 404 ឬ 401 មានន័យថា authentication middleware របស់អ្នកបានច្រានចោល request OPTIONS មុនពេល CORS អាចដំណើរការបាន!)។
+   - តើ `Access-Control-Allow-Origin` បង្ហាញត្រឹមត្រូវជា `https://app.example.com` ដែរឬទេ?
+2. **ពិនិត្យមើល Reverse Proxy / API Gateway៖** Nginx, Cloudflare ឬ AWS CloudFront ជារឿយៗតែងតែកាត់ header ចោលលើរាល់ response ដែលមានកំហុស 5xx លុះត្រាតែមានការកំណត់ឱ្យរក្សាទុក។
+
+## Options
+
+1. **Same-Origin Proxy។** ដាក់ទាំង frontend និង backend នៅក្រោម origin តែមួយ (`https://example.com/api`) តាមរយៈ reverse proxy path routing។ (លុបបំបាត់បញ្ហា CORS ទាំងស្រុង!)។
+2. **ការគ្រប់គ្រង Preflight OPTIONS ឱ្យបានត្រឹមត្រូវ។** ដាក់ CORS middleware នៅជួរលើបង្អស់នៃ middleware chain មុនពេល authentication guards ទាំងអស់។
+3. **Dynamic Origin Whitelisting ជាមួយ Credentials។** ឆ្លើយតប origin ជាក់លាក់របស់អ្នកស្នើសុំ ជំនួសឱ្យការប្រើ wildcard `*` នៅពេលមានការបញ្ជូន cookies ឬ authorization tokens។
+4. **Cache Preflight Requests (`Access-Control-Max-Age`)។** ប្រាប់ browser ឱ្យចងចាំការអនុញ្ញាត OPTIONS ទុក ២៤ ម៉ោង ដើម្បីកុំឱ្យរាល់ API call ទាំងអស់ត្រូវហៅទៅមកពីរដង។
+
+## Trade-offs
+
+| យុទ្ធសាស្ត្រ | សុវត្ថិភាព | ផលប៉ះពាល់លើ Latency | ភាពស្មុគស្មាញនៃប្រតិបត្តិការ |
+| :--- | :--- | :--- | :--- |
+| **Same-Origin (`/api`)** | **ខ្ពស់បំផុត** | **0 ms (គ្មាន Preflight ឡើយ)** | ទាមទារការកំណត់ reverse proxy រួមគ្នា |
+| **ប្រើ Wildcard `*`** | គ្មានសុវត្ថិភាព (មិនអាចប្រើ cookie) | ខ្ពស់ (មាន Preflight គ្រប់ call) | ទាប (តែធ្វើឱ្យខូច authenticated APIs) |
+| **CORS ត្រឹមត្រូវ + Max-Age** | ខ្ពស់ | **ទាប (Preflight ចងចាំ ២៤ ម៉ោង)** | មធ្យម (config ត្រឹម ១៥ ជួរ) |
+
+## Decision
+
+1. **បើអាចធ្វើបាន សូមប្រើប្រាស់ Same-Domain Routing៖** កំណត់ route `/api` ទៅកាន់ backend និង `/` ទៅកាន់ frontend តាមរយៈ CDN/reverse proxy (Cloudflare/Nginx)។ វិធីនេះលុបបំបាត់ព្រំដែន cross-origin ទាំងស្រុង។
+2. **ប្រសិនបើ domains ត្រូវតែនៅដាច់ពីគ្នា (`app.` និង `api.`)៖**
+   - ត្រូវដាក់ CORS middleware **នៅពីមុខ Authentication Middleware ជានិច្ច**។ Request ប្រភេទ `OPTIONS` មិនដែលកាន់កាប់ auth token ឡើយ ហើយមិនត្រូវឱ្យជួបកំហុស HTTP 401 ជាដាច់ខាត។
+   - Whitelist origins ជាក់លាក់; កុំប្រើ `*` ឱ្យសោះនៅពេល `credentials: 'include'` ត្រូវបានប្រើប្រាស់។
+   - កំណត់ cache លើ preflight រយៈពេល ២៤ ម៉ោង (`Access-Control-Max-Age: 86400`) ដើម្បីកាត់បន្ថយ network round-trips ពាក់កណ្តាល។
+   - ភ្ជាប់ CORS headers នៅខាងក្នុង global error handler ជានិច្ច ដើម្បីឱ្យពេលមាន error 500 កើតឡើង browser អាចបង្ហាញ error message ពិតប្រាកដ។
+
+## Implementation
+
+### ការកំណត់រចនាសម្ព័ន្ធ CORS កម្រិត Production (Node.js / Express)៖
+
+```typescript
+import express from 'express';
+import cors from 'cors';
+
+const app = express();
+
+const ALLOWED_ORIGINS = new Set([
+  'https://app.example.com',
+  'https://admin.example.com',
+]);
+
+// 1. កំណត់ CORS ជា MIDDLEWARE ទីមួយបង្អស់ មុន routes និង auth ទាំងអស់
+app.use(
+  cors({
+    origin: (origin, callback) => {
+      // អនុញ្ញាត request ណាដែលគ្មាន origin (mobile apps, curl, server-to-server)
+      if (!origin || ALLOWED_ORIGINS.has(origin)) {
+        return callback(null, true);
+      }
+      callback(new Error('ត្រូវបានរារាំងដោយ CORS'));
+    },
+    credentials: true, // អនុញ្ញាត cookies និង Authorization headers
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
+    maxAge: 86400, // Cache preflight រយៈពេល ២៤ ម៉ោង (86,400 វិនាទី)
+  })
+);
+
+// 2. ឆ្លើយតប preflight OPTIONS សម្រាប់គ្រប់ routes ទាំងអស់
+app.options('*', cors());
+
+// 3. Global Error Handler ត្រូវតែរក្សាទុក CORS headers ជានិច្ច
+app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+  const origin = req.headers.origin;
+  if (origin && ALLOWED_ORIGINS.has(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+  }
+  
+  res.status(err.status || 500).json({
+    error: err.message || 'Internal Server Error',
+  });
+});
+```
+
+## Verification
+
+1. **ផ្ទៀងផ្ទាត់ Preflight តាមរយៈ curl៖**
+   ```bash
+   curl -I -X OPTIONS https://api.example.com/orders \
+     -H "Origin: https://app.example.com" \
+     -H "Access-Control-Request-Method: POST"
+   ```
+   ត្រូវតែឆ្លើយតប **HTTP 204 No Content** ជាមួយ `Access-Control-Max-Age: 86400` និង `Access-Control-Allow-Origin: https://app.example.com`។
+2. **ពិនិត្យផ្ទាំង Browser Network៖** ធានាថា API calls បន្តបន្ទាប់ទៅកាន់ endpoint ដដែល **មិនបញ្ជូន** request `OPTIONS` ស្ទួនដដែលៗទៀតឡើយក្នុងរយៈពេល ២៤ ម៉ោង។
+3. **តេស្ត Error Payload៖** បង្កើត error 500 សិប្បនិម្មិត។ Browser Console ត្រូវតែបង្ហាញ JSON error payload ពិតប្រាកដ ដោយមិនត្រូវបានបិទបាំងដោយ CORS ឡើយ។
+
+## Why
+
+គោលការណ៍ Same-Origin Policy (SOP) ត្រូវបានអនុវត្តដោយ browser ដើម្បីការពារអ្នកប្រើប្រាស់ពីការវាយប្រហារ Cross-Site Request Forgery (CSRF) និងការលួចទិន្នន័យសម្ងាត់។ បើគ្មាន SOP ទេ វេបសាយក្លែងបន្លំ (`https://evil.com`) អាចបញ្ជូន fetch request ទៅកាន់ `https://bank.com/transfer` ដោយប្រើប្រាស់ login cookie របស់អ្នកប្រើប្រាស់ដោយស្វ័យប្រវត្តិ។
+
+Cross-Origin Resource Sharing (CORS) គឺជាពិធីការចរចា (handshake) ដែល `api.example.com` ផ្តល់ការអនុញ្ញាតជាផ្លូវការឱ្យ `app.example.com` អាចអានទិន្នន័យរបស់ខ្លួនបាន។
+
+## When Not To Use
+
+- **Server-to-Server ឬ Mobile App APIs៖** CORS មិនត្រូវបានអនុវត្តលើ iOS apps, Android apps ឬ backend services ឡើយ។ កុំចំណាយពេល debug CORS បើ client មិនមែនជា web browser។
+
+## Common Mistakes
+
+- **ដាក់ Authentication Middleware នៅពីមុខ CORS។** Request `OPTIONS` មិនដែលកាន់កាប់ auth headers ឡើយ។ បើ auth ដើរមុន វានឹង return 401 ដែលធ្វើឱ្យខូច preflight check ទាំងស្រុង។
+- **ប្រើ Wildcard `*` ជាមួយ Credentials។** លក្ខន្តិកៈរបស់ CORS ហាមឃាត់ជាដាច់ខាតមិនឱ្យប្រើ `Access-Control-Allow-Origin: *` នៅពេល `Access-Control-Allow-Credentials: true` ឡើយ។
+- **ដាក់ CORS Headers ស្ទួនពីរដង។** ការកំណត់ header ទាំងក្នុង Nginx ផង និងក្នុង Express ផង នឹងបង្កើតជា `Access-Control-Allow-Origin: https://app.com, https://app.com` ដែល browser នឹងច្រានចោលភ្លាម។

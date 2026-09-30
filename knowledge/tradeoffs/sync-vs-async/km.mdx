@@ -1,0 +1,122 @@
+---
+title: "Sync vs async"
+question: "តើ operation នេះគួរជា synchronous ឬ asynchronous?"
+summary: "រក្សាវាជា synchronous នៅពេលអ្នកហៅត្រូវការលទ្ធផលដើម្បីបន្ត ហើយការហៅនោះលឿន និងអាចទុកចិត្តបាន។ ធ្វើឱ្យវាជា asynchronous នៅពេលការងារយឺត អាចបរាជ័យដោយខ្លួនឯង ឬមាន consumers ច្រើនជាងមួយ។ បន្ទាប់មក អ្នកជំពាក់អ្នកប្រើនូវ status មួយ ហើយជំពាក់ប្រព័ន្ធនូវ idempotency។"
+tags: [architecture, queues, events, latency, reliability]
+related: [problems/should-i-use-kafka, patterns/idempotency, patterns/retry, tradeoffs/monolith-vs-microservices]
+order: 2
+updated: "2026-09-11"
+translation: draft
+---
+
+## Context
+
+រាល់ operation ដែលឆ្លងកាត់ព្រំដែនមួយ (service ផ្សេង, API ភាគីទីបី ឬការគណនាដែលយឺត) បង្កើតជម្រើសដដែល៖ រង់ចាំវានៅក្នុង request ឬកត់ត្រាបំណង ហើយធ្វើការងារនៅពេលក្រោយ។ Checkout, ការចុះឈ្មោះ, ការ upload ឯកសារ, របាយការណ៍, notifications និង webhooks សុទ្ធតែជួបជម្រើសនេះ។
+
+*Synchronous* នៅទីនេះមានន័យថា អ្នកហៅរង់ចាំលទ្ធផលនៅក្នុង request ដដែល។ *Asynchronous* មានន័យថា អ្នកហៅទទួលបានការបញ្ជាក់ទទួល (acknowledgement) ឥឡូវនេះ ហើយការងារកើតឡើងនៅពីក្រោយ តាមរយៈ queue, job ឬ event។
+
+## Symptoms
+
+- Requests timeout ព្រោះវារង់ចាំការងារបន្ទាប់បន្សំដែលយឺត៖ ការបង្កើត PDF ការដំណើរការរូបភាព ការផ្ញើ emails។
+- Outage របស់ភាគីទីបី ធ្វើឱ្យ endpoint របស់អ្នកផ្ទាល់បរាជ័យ។
+- p99 latency ត្រូវបានគ្របដណ្តប់ដោយការហៅទៅ downstream តែមួយ។
+- ឬផ្ទុយមកវិញ៖ អ្នកប្រើឃើញ «កំពុងដំណើរការ…» សម្រាប់អ្វីដែលគួរតែភ្លាមៗ ហើយផ្នែកជំនួយទទួលសំបុត្រ «តើការបង់ប្រាក់របស់ខ្ញុំជោគជ័យឬទេ?»។
+
+## Diagnose
+
+សម្រាប់ operation ដែលកំពុងពិចារណា៖
+
+1. **តើអ្នកហៅត្រូវការលទ្ធផលដើម្បីបន្តដែរឬទេ?** Login ត្រូវការ session ឥឡូវនេះ។ Email ស្វាគមន៍មិនត្រូវការទេ។
+2. **តើវាចំណាយពេលប៉ុន្មាននៅ p99?** អ្វីក៏ដោយដែលជាប្រចាំលើសពីមួយ ឬពីរវិនាទីនៅក្នុង request របស់អ្នកប្រើ គឺជាបេក្ខភាពសម្រាប់ async។
+3. **តើមានអ្វីកើតឡើងនៅពេលវាបរាជ័យ?** ប្រសិនបើអ្នកប្រើត្រូវតែដឹងភ្លាមៗ (កាតត្រូវបានបដិសេធ) រក្សាវាជា sync។ ប្រសិនបើវាអាច retry ដោយស្ងាត់ៗ (ផ្ញើបង្កាន់ដៃ) ធ្វើឱ្យវាជា async។
+4. **តើមានភាគីប៉ុន្មានដែលខ្វល់?** អ្នកហៅតែមួយ៖ ការហៅដោយផ្ទាល់គឺល្អ។ ប្រតិកម្មឯករាជ្យច្រើនចំពោះការពិតដដែល៖ publish event មួយ។
+5. **តើ dependency អាចទុកចិត្តបានដែរឬទេ?** នៅក្នុងខ្សែសង្វាក់ synchronous availability របស់អ្នកគឺយ៉ាងច្រើនស្មើនឹងផលគុណនៃ availability របស់អ្នកដទៃទាំងអស់។
+
+## Options
+
+1. **ការហៅ synchronous** ជាមួយ timeout។
+2. **Hybrid៖** ធ្វើផ្នែកសំខាន់ជា synchronous ហើយពន្យារផ្នែកដែលនៅសល់។
+3. **Asynchronous job៖** ដាក់ការងារចូល queue ឆ្លើយតប `202 Accepted` ជាមួយ status URL ហើយឱ្យ client poll ឬទទួលការជូនដំណឹង។
+4. **Asynchronous event៖** publish «order ត្រូវបានបញ្ជាទិញ» ហើយឱ្យ consumers ប៉ុន្មានក៏បានឆ្លើយតបដោយឯករាជ្យ។
+
+## Trade-offs
+
+| | Synchronous | Hybrid | Async job | Async event |
+| :--- | :--- | :--- | :--- | :--- |
+| លទ្ធផលមាន | ភ្លាមៗ | ផ្នែកសំខាន់ឥឡូវនេះ | ពេលក្រោយ តាម polling ឬការជូនដំណឹង | ពេលក្រោយ តាម consumer នីមួយៗ |
+| បទពិសោធន៍អ្នកប្រើ | សាមញ្ញ | សាមញ្ញសម្រាប់ផ្នែកស្នូល | ត្រូវការ UI បង្ហាញ status | ត្រូវការ UI បង្ហាញ status |
+| ការជាប់ទាក់ទងជាមួយ dependency | តឹង៖ outage របស់វាជារបស់អ្នក | តឹងសម្រាប់ផ្នែកស្នូលប៉ុណ្ណោះ | រលុង | រលុងបំផុត |
+| Latency | ផលបូកនៃខ្សែសង្វាក់ | ផ្នែកស្នូលប៉ុណ្ណោះ | ត្រឹមតែការដាក់ចូល queue | ត្រឹមតែការ publish |
+| ការគ្រប់គ្រងការបរាជ័យ | អ្នកហៅដោះស្រាយវាឥឡូវនេះ | បែងចែក | Retries និង dead-letter queue | តាម consumer នីមួយៗ |
+| ភាពស៊ីសង្វាក់ | ភ្លាមៗ | លាយគ្នា | Eventual | Eventual |
+| Debugging | Trace តែមួយ | ផ្លូវពីរ | ត្រូវការ job IDs និង tracing | ត្រូវការ correlation ឆ្លង consumers |
+| ត្រូវការ idempotency | លុះត្រាតែមាន retry | សម្រាប់ផ្នែកដែលពន្យារ | ត្រូវការ | ត្រូវការ |
+
+ការដោះដូរចម្បង៖ **async ទិញ latency និងការញែកដាច់ ហើយបង់ដោយភាពភ្លាមៗ និងភាពសាមញ្ញ។** អ្នកប្តូរ «វាដំណើរការ ឬមិនដំណើរការ» ទៅជា «វានឹងដំណើរការនៅទីបំផុត ហើយនេះជារបៀបដើម្បីដឹង»។
+
+## Decision
+
+- **Synchronous** នៅពេលអ្នកហៅត្រូវការចម្លើយដើម្បីបន្ត ហើយការហៅនោះលឿន (រាប់សិប milliseconds) និងអាចទុកចិត្តបាន៖ authentication, reads, validation, ការគណនាតម្លៃ។
+- **Hybrid** សម្រាប់ business flows ភាគច្រើន៖ ធ្វើអ្វីដែលអ្នកប្រើត្រូវតែឃើញឥឡូវនេះ (បង្កើត order, authorize ការបង់ប្រាក់) ជា synchronous ហើយពន្យារផ្នែកដែលនៅសល់ (បង្កាន់ដៃ, analytics, search indexing, fulfillment)។
+- **Async job** សម្រាប់ការងារយឺតដែលមាន consumer តែមួយ៖ របាយការណ៍, exports, ការដំណើរការ media។ ឆ្លើយតប `202` និង status resource។
+- **Async event** នៅពេលផ្នែកឯករាជ្យជាច្រើននៃប្រព័ន្ធ ឆ្លើយតបនឹងការពិតដដែល។
+
+ពិនិត្យឡើងវិញ ប្រសិនបើការងារ async ជាប្រចាំបញ្ចប់យឺតជាងអ្វីដែលអ្នកប្រើរំពឹង ឬប្រសិនបើ outages របស់ dependency synchronous មួយ បន្តក្លាយជា outages របស់អ្នក។
+
+## Implementation
+
+Hybrid pattern ក្នុង Express handler។ ការបង្កើត order និងការ authorize ការបង់ប្រាក់គឺ synchronous; អ្វីៗផ្សេងទៀតឆ្លងកាត់ outbox ដូច្នេះវាត្រូវបានដាក់ចូល queue លុះត្រាតែ order ត្រូវបាន commit៖
+
+```ts
+app.post('/orders', async (req, res) => {
+  // Synchronous: the user needs to know these succeeded.
+  const order = await db.transaction(async tx => {
+    const created = await tx.orders.insert(req.body);
+    await tx.outbox.insert({ topic: 'order.placed', key: created.id, payload: { orderId: created.id } });
+    return created;
+  });
+  await payments.authorize(order, { idempotencyKey: `auth:${order.id}`, timeoutMs: 3000 });
+
+  // Receipts, analytics and fulfillment run later, from the outbox.
+  res.status(201).json(order);
+});
+```
+
+សម្រាប់ការងារដែលដំណើរការយូរ បញ្ជាក់ទទួល request ហើយផ្តល់ឱ្យ client នូវមធ្យោបាយសម្រាប់ពិនិត្យវា៖
+
+```ts
+app.post('/reports', async (req, res) => {
+  const job = await jobs.enqueue('generate-report', { userId: req.user.id, range: req.body.range });
+  res.status(202).location(`/reports/jobs/${job.id}`).json({ id: job.id, status: 'queued' });
+});
+
+app.get('/reports/jobs/:id', async (req, res) => {
+  const job = await jobs.get(req.params.id);
+  res.json({ id: job.id, status: job.status, resultUrl: job.resultUrl ?? null });
+});
+```
+
+## Verification
+
+- **Latency៖** request p95 និង p99 លែងរួមបញ្ចូលការងារដែលបានពន្យារ។
+- **ការញែកដាច់៖** បិទ email provider នៅក្នុង staging។ Orders នៅតែជោគជ័យ ហើយបង្កាន់ដៃត្រូវបានផ្ញើចេញនៅពេលវាងើបឡើងវិញ។
+- **ការបញ្ចប់៖** វាស់ពេលវេលាពី request ដល់ការបញ្ចប់ async នៅ p95 ហើយដាក់ alert លើអាយុរបស់ item ចាស់បំផុតក្នុង queue មិនមែនត្រឹមតែប្រវែង queue ទេ។
+- **ភាពត្រឹមត្រូវ៖** replay jobs និង events។ Consumers គឺ idempotent ដូច្នេះគ្មានអ្វីកើតឡើងពីរដងទេ។
+
+## Why
+
+ការហៅ synchronous ខ្ចី availability និង latency របស់ប្រព័ន្ធផ្សេង ក្នុងរយៈពេលនៃ request។ នោះមិនអីទេ នៅពេលប្រព័ន្ធផ្សេងនោះលឿន អាចទុកចិត្តបាន និងចាំបាច់។ ការប្តូរទៅ asynchronous បញ្ឈប់ការខ្ចីនោះ៖ request គ្រាន់តែពឹងលើការសរសេរកត់ត្រាបំណងប៉ុណ្ណោះ។ អ្វីដែលអ្នកបោះបង់គឺភាពប្រាកដប្រជានៅពេលនោះ ហេតុនេះហើយការរចនា asynchronous ត្រូវការ status, retries និង idempotency មុនពេលនរណាម្នាក់អាចទុកចិត្តវាបាន។
+
+## When Not To Use
+
+- **Async សម្រាប់អ្វីដែលអ្នកប្រើរំពឹងថាភ្លាមៗ** ដូចជាលទ្ធផល search ឬ login។ វាបន្ថែមភាពស្មុគស្មាញ ហើយធ្វើឱ្យផលិតផលហាក់ដូចជាខូច។
+- **ខ្សែសង្វាក់ synchronous ឆ្លង services ជាច្រើន** ដែល hop នីមួយៗគុណឱកាសនៃការខូច និងបន្ថែម latency។
+- **Async ដោយគ្មានមធ្យោបាយមើល status ឬការបរាជ័យ** ដែលប្រែក្លាយ errors ទៅជាភាពស្ងៀមស្ងាត់។
+
+## Common Mistakes
+
+- **Fire-and-forget ដោយគ្មាន outbox៖** publish បន្ទាប់ពី commit នៅក្នុង process ដដែល ដូច្នេះការគាំងនៅចន្លោះនោះ ធ្វើឱ្យបាត់ message។
+- **ផ្លាស់ការងារទៅនៅពីក្រោយ តែនៅតែឱ្យអ្នកប្រើរង់ចាំ** ដោយ poll រកលទ្ធផលនៅក្នុង request ដដែល។
+- **គ្មាន dead-letter queue** ដូច្នេះ poison messages retry ជារៀងរហូត ឬបាត់ខ្លួនដោយស្ងាត់ៗ។
+- **ការហៅ synchronous ដោយគ្មាន timeouts** ដូច្នេះ dependency យឺតមួយ កាន់កាប់ threads និង connections រហូតដល់ service ទាំងមូលជាប់គាំង។
+- **សន្មតថាមានលំដាប់៖** async consumers អាចឃើញ events ខុសលំដាប់។ រចនាសម្រាប់វា ឬប្រើ entity ជា key របស់ messages។

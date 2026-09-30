@@ -1,0 +1,157 @@
+---
+title: "ហេតុអ្វីបានជា Node.js CPU ឡើង 100%?"
+question: "ហេតុអ្វីបានជា Node.js CPU ឡើង 100% ខណៈពេល Traffic នៅទាប?"
+summary: "Node.js ដំណើរការ JavaScript លើ single thread តែមួយគត់។ ប្រតិបត្តិការ synchronous ដូចជាការ parse JSON ធំៗ, ការគណនា crypto, ឬ regular expression ដែលមាន backtracking ខ្លាំង នឹង block event loop របស់អ្នកប្រើប្រាស់ទាំងអស់។ ផ្ទេរការងារទាំងនោះទៅ worker threads ឬប្រើ streaming parsers។"
+tags: [nodejs, performance, eventloop, cpu, profiling]
+related: [problems/database-is-slow, problems/memory-leak-in-production]
+order: 11
+updated: "2026-09-12"
+contributors: [veasna]
+translation: draft
+---
+
+## Context
+
+សេវាកម្ម Node.js API មួយដំណើរការក្នុង container នៅលើ production។ ជាធម្មតា សេវាកម្មនេះអាចបម្រើ 1,000 requests ក្នុងមួយវិនាទី ដោយស៊ី CPU ត្រឹមតែ 15% ប៉ុណ្ណោះ។
+
+ស្រាប់តែនៅពេលមួយនោះ ទោះបីជាមាន traffic ត្រឹមតែ 50 requests ក្នុងមួយវិនាទីក៏ដោយ CPU របស់ container ស្រាប់តែស្ទុះឡើងដល់ **100%** លើ core មួយជាប់រហូត។ Health check ចាប់ផ្តើមធ្លាក់, P99 latency កើនឡើងពី 20 ms ដល់ 30,000 ms ហើយសូម្បីតែ request ស្រាលៗធម្មតា (ដូចជា `/healthz`) ក៏ត្រូវ timeout ដែរ។
+
+## Symptoms
+
+- CPU របស់ container ជាប់គាំងនៅត្រឹម 100% (ឬស្មើនឹង core ពេញមួយលើម៉ាស៊ីន multi-core ឧទាហរណ៍ ២៥% លើម៉ាស៊ីន 4-core)។
+- រង្វាស់ Event Loop Delay (តាមរយៈ `perf_hooks` ឬ Datadog) ស្ទុះឡើងពី 2 ms ទៅរាប់ពាន់មិល្លីវិនាទី។
+- Request សាមញ្ញដែលមិនបានដំណើរការ query ទៅ database សោះ ក៏ត្រូវកកស្ទះ និងរង់ចាំនៅពីក្រោយ request ធ្ងន់តែមួយនោះដែរ។
+- ការ restart container អាចជួយបានតែមួយភ្លែតប៉ុណ្ណោះ រហូតដល់មាន action ដដែលនោះកើតឡើងម្តងទៀត។
+
+<Callout type="warning" title="Node.js ដំណើរការបែប Asynchronous លើ I/O ប៉ុន្តែ Single-threaded លើ Execution">
+មុខងារ asynchronous (`async/await`) គ្រាន់តែឆ្លាស់វេនគ្នាទៅធ្វើការងារផ្សេងនៅពេលរង់ចាំ network ឬ disk I/O ប៉ុណ្ណោះ។ រាល់កូដ synchronous JavaScript ទាំងអស់ដំណើរការលើ main thread តែមួយគត់។ ប្រសិនបើ function មួយដំណើរការ loop អស់ ៥ វិនាទី នោះអ្នកប្រើប្រាស់ដទៃទៀតទាំងអស់នឹងត្រូវកកស្ទះ (freeze) រយៈពេល ៥ វិនាទីដូចគ្នា។
+</Callout>
+
+## Diagnose
+
+1. **តាមដានមើល Event Loop Delay៖**
+   ```typescript
+   import { monitorEventLoopDelay } from 'perf_hooks';
+   const histogram = monitorEventLoopDelay({ resolution: 20 });
+   histogram.enable();
+
+   setInterval(() => {
+     const p99 = histogram.percentile(99) / 1e6; // បម្លែង nanoseconds មក ms
+     if (p99 > 50) {
+       console.warn(`WARNING: Event loop ត្រូវបានរារាំង! P99 delay: ${p99.toFixed(2)} ms`);
+     }
+     histogram.reset();
+   }, 5000);
+   ```
+2. **ស្វែងរក CPU Hotspots តាមរយៈ Profiling៖** បង្កើត flamegraph ដោយប្រើ profiler ក្នុង Node.js៖
+   ```bash
+   node --prof app.js
+   # វិភាគ log តាមរយៈ៖
+   node --prof-process isolate-*.log > processed.txt
+   ```
+3. **មូលហេតុទូទៅបំផុត៖**
+   - **Catastrophic ReDoS (Regular Expression Denial of Service)៖** Regex ដែលមាន nested quantifiers (ដូចជា `/(a+)+$/`) ត្រូវពិនិត្យមើល input ដែលមានចេតនាអាក្រក់។
+   - **ប្រតិបត្តិការ JSON ធំជ្រុល៖** ការដំណើរការ `JSON.parse()` ឬ `JSON.stringify()` លើ JSON file ទំហំ 50 MB នឹង block thread អស់រយៈពេល 500–1,500 ms។
+   - **Synchronous Crypto៖** ការប្រើប្រាស់ `bcrypt.hashSync()` ជំនួសឱ្យ asynchronous `bcrypt.hash()` ឬការប្រើ synchronous compression (`zlib.gzipSync`)។
+   - **Infinite Loops ដោយអចេតនា៖** `while` loop ដែលលក្ខខណ្ឌចាកចេញមិនដែលកើតឡើង។
+
+## Options
+
+1. **Scale បន្ថែមតាមជួរដេក (Horizontal Scaling)។** បង្កើត pods បន្ថែមទៀត។ (គ្មានប្រសិទ្ធភាពទេ៖ ព្រោះ pod ណាដែលជាប់គាំង នឹងនៅតែធ្វើឱ្យ request គាំងដដែល)។
+2. **ផ្ទេរការងារ CPU ទៅកាន់ Worker Threads (`worker_threads`)។** ដំណើរការការងារគណនាធ្ងន់ៗលើ background worker threads ដោយមិនរំខានដល់ event loop មេ។
+3. **បំបែកការងារជាចំណែកតូចៗតាម `setImmediate`។** បំបែក array ធំៗជាចំណែកតូចៗ រួចប្រគល់វេនឱ្យ event loop ដើរចន្លោះចំណែកនីមួយៗ។
+4. **ប្រើប្រាស់ Streaming JSON Parsers។** Parse ទិន្នន័យម្តងមួយដុំ (chunk-by-chunk) ជំនួសឱ្យការផ្ទុក string ទាំងមូលក្នុង memory។
+5. **សម្អាត Regular Expressions។** ជំនួស exponential regex ដោយ state machine ត្រង់ៗ ឬប្រើ safe regex engine ដូចជា `re2`។
+
+## Trade-offs
+
+| យុទ្ធសាស្ត្រ | ការការពារ Event Loop | ផលប៉ះពាល់លើ Latency | កម្លាំងអនុវត្ត |
+| :--- | :--- | :--- | :--- |
+| **Worker Threads** | **មិនជាប់គាំង ១០០%** | គ្មាន delay លើ main thread | មធ្យម (មាន overhead បន្តិចបន្តួច) |
+| **Chunking (`setImmediate`)** | មធ្យម | ធ្វើឱ្យការងារសរុបដើរយូរបន្តិច | ទាប |
+| **Async Crypto / Zlib** | **មិនជាប់គាំង ១០០%** | ផ្ទេរទៅ libuv threadpool | ទាបបំផុត (គ្រាន់តែប្តូរទៅ async API) |
+| **Safe Regex (`re2`)** | មិនខ្លាច ReDoS | យឺតជាងបន្តិចលើ regex ធម្មតា | ទាប |
+
+## Decision
+
+- **សម្រាប់ Cryptography និង Hashing៖** កុំប្រើ method `*Sync` នៅក្នុង web request handlers ឱ្យសោះ។ ត្រូវប្រើ asynchronous APIs ជានិច្ច (ដូចជា `await bcrypt.hash(...)` ឬ Node.js native `crypto.subtle`)។
+- **សម្រាប់ការងារគណនាធ្ងន់ៗ (កែរូបភាព, បង្កើត PDF, គណនាគណិតវិទ្យាធំៗ)៖** ផ្ទេរការងារទៅ **Worker Threads** តាមរយៈ worker pool ដែលរៀបចំស្រាប់ (ដូចជា `piscina`)។
+- **សម្រាប់ Regular Expressions៖** ត្រួតពិនិត្យ regex ទាំងអស់កុំឱ្យមានចន្លោះប្រហោង ReDoS និងកំណត់ប្រវែង input អតិបរមាឱ្យបានតឹងរ៉ឹងជានិច្ច។
+
+## Implementation
+
+### 1. ការផ្ទេរការងារ CPU ធ្ងន់ៗទៅកាន់ Worker Threads (`piscina`)
+
+```typescript
+// worker.js - ដំណើរការលើ thread ដាច់ដោយឡែកនៅ background
+export default function heavyCalculation(data: number[]) {
+  // ការងារគណនា CPU ធ្ងន់ៗនៅទីនេះ ដោយមិន block Express event loop ឡើយ
+  let sum = 0;
+  for (let i = 0; i < 50_000_000; i++) {
+    sum += Math.sqrt(i);
+  }
+  return sum;
+}
+```
+
+```typescript
+// server.ts - Thread របស់ HTTP server មេ
+import express from 'express';
+import Piscina from 'piscina';
+import path from 'path';
+
+const app = express();
+const pool = new Piscina({
+  filename: path.resolve(__dirname, 'worker.js'),
+  maxThreads: 4,
+});
+
+app.get('/compute', async (req, res) => {
+  // បញ្ជូនទៅកាន់ background thread pool; HTTP server នៅតែឆ្លើយតបបាន ១០០%!
+  const result = await pool.run([1, 2, 3]);
+  res.json({ result });
+});
+
+app.get('/healthz', (req, res) => {
+  // នៅតែឆ្លើយតបក្នុងរយៈពេល < 1 ms បើទោះបីជា /compute កំពុងគណនាយ៉ាងខ្លាំងក៏ដោយ
+  res.send('OK');
+});
+```
+
+### 2. ការការពារប្រឆាំងនឹង ReDoS
+
+```typescript
+// គ្រោះថ្នាក់៖ Backtracking ខ្លាំងពេល input មានទម្រង់៖ "aaaaaaaaaaaaaaaaaaaaaaaaaaaa!"
+// const regex = /([a-zA-Z0-9]+)+$/;
+
+// សុវត្ថិភាព៖ កំណត់ប្រវែងអតិបរមា និងចៀសវាង nested quantifiers
+app.post('/validate', (req, res) => {
+  const input = req.body.text;
+  if (input.length > 500) {
+    return res.status(400).send('Input វែងជ្រុល');
+  }
+  // Safe linear regex
+  const isMatch = /^[a-zA-Z0-9]+$/.test(input);
+  res.json({ valid: isMatch });
+});
+```
+
+## Verification
+
+1. **វាស់ស្ទង់ Event Loop Delay ពេលមានបន្ទុក៖** ខណៈពេល request គណនាធ្ងន់កំពុងដើរ ចូរហៅ endpoint `/healthz` ជាប់ៗគ្នា។ Latency របស់ health check ត្រូវតែនៅត្រឹម **< 5 ms** ដោយមិនមានការរាំងស្ទះឡើយ។
+2. **ការបែងចែកបន្ទុកលើ CPU Cores៖** លើម៉ាស៊ីន 4-core ពិនិត្យមើលតាមរយៈ `htop`។ បន្ទុក CPU ត្រូវតែបែងចែកស្មើគ្នាលើ worker threads មិនមែនជាប់គាំង core តែមួយនៅ 100% ខណៈ cores ដទៃនៅទំនេរនោះទេ។
+
+## Why
+
+Node.js event loop គ្រប់គ្រង I/O ដោយចុះបញ្ជី file descriptor callbacks ជាមួយ OS kernel (តាមរយៈ `epoll`, `kqueue` ឬ `IOCP`)។ នៅពេលទិន្នន័យមកដល់ kernel នឹងដាស់ thread ឱ្យភ្ញាក់ឡើង។
+
+ប៉ុន្តែ ការដំណើរការ JavaScript instructions ទាមទារកម្លាំង CPU ដោយផ្ទាល់។ ដោយសារ V8 ដំណើរការ JavaScript ជាបន្តបន្ទាប់លើ call stack តែមួយ កូដ synchronous ធ្ងន់ៗនឹងរារាំងមិនឱ្យ event loop អាចទទួលយក network events ថ្មីៗបានឡើយ ដែលធ្វើឱ្យ server ក្លាយជាគរថ្លង់ចំពោះ clients ទាំងអស់។
+
+## When Not To Use
+
+- **កុំប្រើ Worker Threads សម្រាប់ I/O Operations៖** ការបង្កើត worker thread ស៊ី memory និងស៊ីពេល serialize ទិន្នន័យ។ សម្រាប់ database queries, HTTP requests និង file I/O នោះ async event loop ធម្មតារបស់ Node.js គឺលឿនជាង worker threads ឆ្ងាយណាស់។
+
+## Common Mistakes
+
+- **បង្កើត Worker ថ្មីរាល់ពេលមាន Request។** ការបង្កើត thread មួយស៊ីពេលពី 20–50 ms និងស៊ី RAM រាប់សិប megabytes។ ត្រូវប្រើ worker pool ដែលបង្កើតស្រាប់ទុកជាមុន (ដូចជា `piscina`)។
+- **អាន File បែប Synchronous ក្នុង Request Handlers។** ការហៅ `fs.readFileSync()` ក្នុង API handler នឹងផ្អាករាល់ request ទាំងអស់រហូតទាល់តែ disk អានចប់។

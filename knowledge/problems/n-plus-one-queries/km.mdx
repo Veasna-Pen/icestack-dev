@@ -1,0 +1,134 @@
+---
+title: "តើខ្ញុំដោះស្រាយ N+1 queries ដោយរបៀបណា?"
+question: "ហេតុអ្វីបានជា ORM របស់ខ្ញុំដំណើរការ Queries រាប់រយចូល Database?"
+summary: "បញ្ហា N+1 query កើតឡើងនៅពេលការទាញយកបញ្ជីទិន្នន័យមួយ ដំណើរការ query ដំបូង ១ រួចហើយដំណើរការ query បន្ថែម N ដងសម្រាប់ relation របស់ item នីមួយៗ។ ប្រើប្រាស់ eager loading, batch joins, ឬ DataLoader។"
+tags: [database, orm, prisma, performance, sql]
+related: [problems/database-is-slow, patterns/caching]
+order: 10
+updated: "2026-09-12"
+contributors: [veasna]
+translation: draft
+---
+
+## Context
+
+API endpoint មួយដែលត្រូវបញ្ជូនបញ្ជីនៃ 50 blog posts ឬការបញ្ជាទិញ (orders) ថ្មីៗត្រឡប់ទៅកាន់អ្នកប្រើប្រាស់។ Endpoint នេះប្រើប្រាស់ ORM (ដូចជា Prisma, TypeORM, Hibernate ឬ Eloquent) ឬ GraphQL resolver។
+
+អំឡុងពេល development ដែលមានទិន្នន័យសាកល្បងតែ ៣ items ក្នុង database ទំព័រដំណើរការលឿនត្រឹមតែ 15 ms ប៉ុណ្ណោះ។ ប៉ុន្តែនៅក្នុង production ដែលមាន 50 items ក្នុងមួយទំព័រ endpoint នោះស៊ីពេលដល់ទៅ 1,400 ms។ នៅពេលពិនិត្យមើល query log របស់ database គេបានរកឃើញថា API request តែមួយគត់នោះ បានបង្កឱ្យមាន **SQL queries ដាច់ដោយឡែកពីគ្នារហូតដល់ ៥១ queries**។
+
+## Symptoms
+
+- HTTP request តែមួយ បង្កើត SQL statements រាប់សិប ឬរាប់រយក្នុង database logs៖
+  ```sql
+  SELECT * FROM orders LIMIT 50;
+  SELECT * FROM users WHERE id = 1;
+  SELECT * FROM users WHERE id = 2;
+  SELECT * FROM users WHERE id = 3;
+  -- ... បន្តដដែលៗ ៥០ ដង!
+  ```
+- Database connection pool ត្រូវពេញណែន ទោះបីជា traffic មានកម្រិតមធ្យមក៏ដោយ។
+- P95 latency កើនឡើងសមាមាត្រទៅនឹងចំនួនទិន្នន័យលើទំព័រ (២០ items ស៊ីពេល 200 ms, ១០០ items ស៊ីពេល 1,200 ms)។
+- ការខាតបង់ពេលវេលាលើ network round-trip រវាង application server និង cloud database ឡើងខ្ពស់ខ្លាំង។
+
+<Callout type="warning" title="Network Round-trips គឺជាអ្នកបំផ្លាញល្បឿន ORM មិនមែនការ Run SQL នោះទេ">
+ការដំណើរការ query ៥០ ដែល query មួយស៊ីពេល 0.5 ms មិនមែនស្មើនឹង ២៥ ms ក្នុង production ឡើយ។ ប្រសិនបើ network round-trip រវាង app container និង cloud database គឺ ២ ms នោះ query ទាំង ៥០ នឹងស៊ីពេលយ៉ាងហោចណាស់ 50 × 2 ms = 100 ms នៃការរង់ចាំលើបណ្តាញ network ទទេស្អាត។
+</Callout>
+
+## Diagnose
+
+1. **បើក Query Logging៖** នៅក្នុង development environment សូមបើក ORM query logging (ឧ. `DEBUG="prisma:client:query"` ឬ `DB::enableQueryLog()`)។ រាប់ចំនួន queries ដែលដំណើរការសម្រាប់ request តែមួយ។
+2. **ពិនិត្យមើល Loops ក្នុងកូដ៖** ស្វែងរក `for` loop ឬ `.map()` ដែលមានការហៅ `await db...` នៅខាងក្នុង iteration៖
+   ```typescript
+   // កំហុស N+1 ANTI-PATTERN
+   const orders = await db.orders.findMany(); // ១ query
+   for (const order of orders) {
+     order.user = await db.users.findUnique({ where: { id: order.userId } }); // N queries បន្ថែមទៀត!
+   }
+   ```
+3. **GraphQL Resolvers៖** ក្នុង GraphQL បើ field resolver ទាញយក relations ដោយគ្មាន batching នោះការទាញយកអ្នកនិពន្ធ ១០០ នាក់ និងសៀវភៅរបស់ពួកគេ នឹងបង្កើត query ១ សម្រាប់អ្នកនិពន្ធ និង query ១០០ សម្រាប់សៀវភៅ។
+
+## Options
+
+1. **Eager Loading ជាមួយ SQL Joins។** បញ្ជាឱ្យ ORM ទាញយក relation មកជាមួយតាំងពីដំបូងតាមរយៈ SQL `LEFT JOIN` ឬ eager `include`។
+2. **Two-Query In-Memory Joining។** ដំណើរការ query ១ សម្រាប់ទិន្នន័យមេ, ប្រមូល foreign IDs ទាំងអស់, ដំណើរការ query ១ ទៀតដោយប្រើ `WHERE id IN (...)` សម្រាប់ទិន្នន័យកូនទាំងអស់ រួចផ្គុំគ្នា (join) ក្នុង memory របស់ application។
+3. **DataLoader Pattern។** ប្រមូលផ្តុំ (batch) រាល់ request ទាញយកទិន្នន័យចេញពីកន្លែងផ្សេងៗគ្នាក្នុង code tree ឱ្យទៅជា query តែមួយក្នុង event loop tick តែមួយ។
+
+## Trade-offs
+
+| វិធីសាស្ត្រ | ចំនួន Query | ការប្រើប្រាស់ Memory | ស័ក្តិសមសម្រាប់ |
+| :--- | :--- | :--- | :--- |
+| **N+1 (ទម្លាប់មិនល្អ)** | $N + 1$ (៥១ queries) | ទាប | មិនគួរប្រើក្នុង production ជាដាច់ខាត |
+| **SQL Join (`include`)** | **១ query** | មានទិន្នន័យជួរមេស្ទួនលើ network | Relations ១-ទៅ-១ ឬ ១-ទៅ-ចំនួនតិច |
+| **Batch (`IN (...)`)** | **២ queries** | រៀបចំ memory បានស្អាត | Relations ១-ទៅ-ច្រើន (1-to-many) |
+| **DataLoader** | **២ queries ក្នុងមួយ tick** | Cache ក្នុង request scope | GraphQL និងស្ថាបត្យកម្ម nested services |
+
+## Decision
+
+- **សម្រាប់ REST Endpoints ធម្មតា៖** ប្រើប្រាស់ ORM **Eager Loading** (`include` ក្នុង Prisma, `relations` ក្នុង TypeORM, `with()` ក្នុង Laravel/Eloquent)។ វិធីនេះជំនួស ៥១ queries ដោយ query តែ ១ តាម `JOIN` ឬ ២ queries តាម batching។
+- **សម្រាប់ GraphQL ឬ Service Trees ស្មុគស្មាញ៖** ប្រើប្រាស់ **DataLoader pattern** ដើម្បី batch ការទាញយកទិន្នន័យដោយស្វ័យប្រវត្តិឆ្លងកាត់ resolvers ដោយមិនចាំបាច់ចងភ្ជាប់កូដតឹងរ៉ឹងឡើយ។
+
+## Implementation
+
+### 1. ការជួសជុល N+1 ក្នុង Prisma (TypeScript)
+
+```typescript
+// ពីមុន (N+1 queries បង្កភាពយឺតយ៉ាវ)៖
+// const posts = await prisma.post.findMany({ take: 50 });
+// for (const post of posts) {
+//   post.author = await prisma.user.findUnique({ where: { id: post.authorId } });
+// }
+
+// ឥឡូវ (Eager Loading - ដំណើរការតែ batch query សន្សំសំចៃបំផុត)៖
+export async function getRecentPostsWithAuthors() {
+  return await prisma.post.findMany({
+    take: 50,
+    include: {
+      author: {
+        select: { id: true, name: true, avatarUrl: true },
+      },
+    },
+  });
+}
+```
+
+### 2. ការប្រើប្រាស់ DataLoader សម្រាប់ Batching
+
+```typescript
+import DataLoader from 'dataloader';
+
+// បូកបញ្ចូល ៥០ calls ផ្សេងៗគ្នាឱ្យទៅជា៖ SELECT * FROM users WHERE id IN ($1, $2, ...)
+const userLoader = new DataLoader(async (userIds: readonly string[]) => {
+  const users = await prisma.user.findMany({
+    where: { id: { in: [...userIds] } },
+  });
+
+  const userMap = new Map(users.map((u) => [u.id, u]));
+  // DataLoader តម្រូវឱ្យ return លទ្ធផលតាមលំដាប់ដូចគ្នាបេះបិទនឹង keys
+  return userIds.map((id) => userMap.get(id) || null);
+});
+
+// អាចហៅប្រើពីទីណាក៏បានក្នុង resolvers៖
+export async function getAuthorForPost(authorId: string) {
+  return await userLoader.load(authorId); // ត្រូវបាន batch ដោយស្វ័យប្រវត្តិ!
+}
+```
+
+## Verification
+
+1. **Assert ចំនួន Query ក្នុង Unit Tests៖** បង្កើត test ផ្ទៀងផ្ទាត់ថាការទាញយកទិន្នន័យ ១០ items និង ១០០ items ដំណើរការ **ចំនួន SQL query ដូចគ្នា** (ឧទាហរណ៍ ត្រឹម ១ ឬ ២ queries ថេរ)។
+2. **ស្ថិរភាព Latency៖** ប្រៀបធៀបពេលវេលាឆ្លើយតប៖ latency គួរតែនៅថេរស្ទើរតែដូចគ្នា មិនថាអ្នកទាញយកទិន្នន័យ ១០ ជួរ ឬ ១០០ ជួរឡើយ។
+
+## Why
+
+Relational database engines ត្រូវបានរចនាឡើងយ៉ាងពិសេសសម្រាប់ប្រតិបត្តិការលើសំណុំទិន្នន័យ (set-based operations)។ ពួកវាអាច scan, filter, និង join ទិន្នន័យ ១០,០០០ rows ក្នុងរយៈពេលត្រឹមតែ ៥ មិល្លីវិនាទីប៉ុណ្ណោះ។
+
+ផ្ទុយទៅវិញ network protocol រវាង client និង server ដំណើរការជាលំដាប់លំដោយ (serialized)។ ការបញ្ជូន query ផ្ទាល់ខ្លួន ១០០ ដង នាំមកនូវ network round-trips ១០០ ដង, ការ parse query ១០០ ដង, ការពិនិត្យសិទ្ធិ ១០០ ដង, និងការទាញយក transaction lock ១០០ ដង។
+
+## When Not To Use
+
+- **Many-to-Many Cartesian Products ធំៗ៖** ប្រសិនបើ post មួយមាន 50 tags, 100 comments, និង 20 attachments ហើយអ្នកប្រើ SQL `JOIN` តែមួយ នោះ database នឹង return ទិន្នន័យស្ទួនរហូតដល់ $50 \times 100 \times 20 = 100,000$ rows។ ក្នុងករណីនេះ ការបំបែកជា 3 queries ដាច់ដោយឡែកតាម `WHERE id IN (...)` គឺលឿនជាង join យកទាំងអស់។
+
+## Common Mistakes
+
+- **ស្មានថា ORM ចេះ optimize ដោយស្វ័យប្រវត្តិ។** ORM ភាគច្រើនកំណត់ lazy loading តាមលំនាំដើមដើម្បីសន្សំ memory។ បើមិនសរសេរ `include` ឬ `with` ទេ នោះបញ្ហា N+1 នឹងកើតឡើងជានិច្ច។
+- **N+1 បង្កប់ក្នុង Serializer Methods។** ការបង្កើត virtual properties (ដូចជា `get fullName()` ឬ `get commentCount()`) លើ model ដែលដំណើរការ query ពីក្រោយខ្នងដោយមិនដឹងខ្លួន។

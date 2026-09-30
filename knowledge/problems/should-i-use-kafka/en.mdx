@@ -1,0 +1,144 @@
+---
+title: "Should I use Kafka?"
+question: "Do I need Kafka?"
+summary: "Probably not yet. Kafka is a durable, replayable log for high-volume event streams read by many independent consumers. If you need background jobs, or to decouple two services, a queue (or your database) is simpler and enough."
+tags: [kafka, messaging, queues, events, architecture]
+related: [tradeoffs/sync-vs-async, patterns/idempotency, patterns/retry, problems/should-i-use-redis]
+order: 2
+updated: "2026-09-11"
+---
+
+## Context
+
+Kafka usually enters the conversation when a system starts doing work in the background: sending emails after an order, syncing a search index, feeding analytics. Picture a team of three to fifteen developers, a monolith or a handful of services, and one relational database. Someone says "we should put Kafka in the middle."
+
+Kafka is not a queue in the usual sense. It is a distributed, append-only **log**. Producers append events to topics split into partitions, events are kept for a retention period (days, or forever), and each consumer group tracks its own position. Many consumers can read the same events independently, and any of them can rewind and replay.
+
+## Symptoms
+
+What usually prompts the question:
+
+- A request does slow side work (emails, PDFs, webhooks) and times out.
+- A downstream service goes down and takes requests down with it.
+- Two services need to react to the same event, such as `OrderPlaced`, and point-to-point calls keep multiplying.
+- Analytics or search needs a feed of every change.
+- "Big companies use Kafka." That's not a symptom.
+
+## Diagnose
+
+Answer these before comparing tools:
+
+1. **What is the message?** A *command* ("send this email", with one handler) or an *event* ("an order was placed", with any number of listeners)?
+2. **How many consumers?** One pool of workers, or several independent teams?
+3. **What volume?** Messages per second at peak, and their size. Hundreds per second is small; hundreds of thousands is where Kafka's design pays off.
+4. **Do you need replay?** Will a new consumer have to process last month's events, or will you re-process after fixing a bug?
+5. **What ordering?** Global order is almost never needed. Order *per entity*, such as per order ID, usually is.
+6. **Who operates it?** Kafka needs brokers, partitions, retention settings, consumer-lag monitoring and upgrades, or a managed service with its own bill.
+
+If the honest answers are "commands, one consumer, a few hundred per second, no replay", you need a job queue, not Kafka.
+
+## Options
+
+1. **Stay synchronous, but faster.** Sometimes the slow work can be made faster, or moved after the response is sent.
+2. **A job queue on infrastructure you already run:** Postgres with `SKIP LOCKED` (pg-boss, Oban, GoodJob) or Redis (BullMQ, Sidekiq, Laravel queues).
+3. **A managed queue:** Amazon SQS, Google Cloud Tasks, or RabbitMQ.
+4. **A transactional outbox plus a queue**, when an event must be published if and only if the database write commits.
+5. **Kafka**, self-managed or as a managed service (Confluent Cloud, Amazon MSK, Redpanda).
+
+## Trade-offs
+
+| | Database-backed queue | Redis queue | SQS / RabbitMQ | Kafka |
+| :--- | :--- | :--- | :--- | :--- |
+| Model | Jobs | Jobs | Messages | Replayable log |
+| Several independent consumers | Awkward | Awkward | Through fan-out (SNS, exchanges) | Built in |
+| Replay old messages | No | No | No | Yes, within retention |
+| Comfortable throughput | Up to ~1k/s | ~10k/s | ~10k/s and up | 100k/s and up |
+| Ordering | Roughly per queue | Per queue | FIFO options | Per partition |
+| New infrastructure | None | Maybe | A managed service | A cluster or managed service, schemas, lag monitoring |
+| Skill the team needs | Low | Low | Low to medium | High |
+
+Kafka's real advantage is **many independent consumers reading one durable, ordered, replayable stream at high volume.** If you don't need at least two of those properties, you're paying Kafka's operating cost for a queue's benefits.
+
+## Decision
+
+- **Background jobs and retries** (emails, PDFs, webhooks): a job queue, ideally on infrastructure you already run.
+- **Decoupling from a slow or flaky dependency:** a queue, plus retries and idempotent consumers.
+- **Events that must match database state:** a transactional outbox, published to whatever broker you have.
+- **Choose Kafka** when several teams or services consume the same high-volume stream independently, when they need replay, or when you're building a data pipeline (change data capture, analytics).
+
+Revisit when a second or third independent consumer of the same events appears, or when you need to rebuild a read model from history.
+
+## Implementation
+
+The outbox is the step most teams need before any broker decision: write the event in the same transaction as the business data, then publish it separately.
+
+```sql
+CREATE TABLE outbox (
+  id           bigserial   PRIMARY KEY,
+  topic        text        NOT NULL,
+  key          text        NOT NULL,       -- e.g. the order id, for per-entity ordering
+  payload      jsonb       NOT NULL,
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  published_at timestamptz
+);
+CREATE INDEX outbox_unpublished_idx ON outbox (id) WHERE published_at IS NULL;
+```
+
+```ts
+// In the request: one transaction, so the event exists if and only if the order does.
+await db.transaction(async tx => {
+  const order = await tx.orders.insert(input);
+  await tx.outbox.insert({
+    topic: 'order.placed',
+    key: order.id,
+    payload: { orderId: order.id, totalCents: order.totalCents }
+  });
+});
+
+// A separate relay publishes pending events, then marks them as sent.
+async function relayOnce() {
+  await db.transaction(async tx => {
+    const batch = await tx.query(
+      `SELECT * FROM outbox
+       WHERE published_at IS NULL
+       ORDER BY id
+       LIMIT 100
+       FOR UPDATE SKIP LOCKED`
+    );
+    for (const event of batch) {
+      await broker.publish(event.topic, event.key, event.payload); // a queue today, Kafka later
+      await tx.query('UPDATE outbox SET published_at = now() WHERE id = $1', [event.id]);
+    }
+  });
+}
+```
+
+If the relay crashes between publishing and committing, those events are published again, so consumers must be idempotent; see [Idempotency](../../patterns/idempotency). The broker behind `broker.publish` can change later without touching the request code.
+
+## Verification
+
+- **The original symptom is gone.** Request p95 no longer includes the side work, and an email-service outage no longer fails checkout.
+- **Nothing is lost.** Count outbox rows with no `published_at` that are older than a minute, and alert when the count grows.
+- **Consumers keep up.** Queue depth (or consumer lag, with Kafka) stays flat at peak.
+- **Duplicates are harmless.** Replay a batch in staging and confirm there are no double emails or double charges.
+
+## Why
+
+Kafka solves *distribution*: getting one stream of facts to many independent readers, durably, at scale. Most teams asking about it have a *decoupling* problem: getting slow or unreliable work out of the request path. Any queue plus idempotent consumers solves decoupling. Distribution is what justifies Kafka's cost. Name the problem you actually have and the tool follows.
+
+## When Not To Use
+
+- **Task queues with a single consumer**, such as emails, image resizing or report generation.
+- **Request and response between services.** Kafka adds latency and complexity with no benefit.
+- **Low volume**, hundreds of messages per second, with no need for replay.
+- **Small teams with nobody to own it.** An unwatched Kafka cluster fails quietly: consumer lag grows, disks fill, and retention deletes data nobody has read.
+- **Strict global ordering.** Kafka orders messages only within a partition.
+
+## Common Mistakes
+
+- **Dual writes:** saving to the database and publishing to Kafka as two separate steps. Sooner or later one fails without the other. Use an outbox.
+- **Assuming exactly-once delivery end to end.** Plan for at-least-once and make consumers idempotent.
+- **Too few partitions**, which caps how many consumers can work in parallel, or far too many, which slows the cluster down. Size for peak consumer concurrency.
+- **Random partition keys**, so events for one order land on different partitions and arrive out of order. Key by entity ID.
+- **No lag monitoring.** Consumer lag is the one metric that tells you the system is falling behind.
+- **Treating Kafka as a database** without thinking about retention, compaction and schemas. Event schemas are a public API; version them like one.

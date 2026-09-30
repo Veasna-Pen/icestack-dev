@@ -1,0 +1,174 @@
+---
+title: "Circuit Breaker"
+question: "តើខ្ញុំអាចទប់ស្កាត់ការដួលរលំជាខ្សែសង្វាក់ (cascading failures) ដោយរបៀបណា?"
+summary: "រុំព័ទ្ធ network calls ទៅកាន់ dependencies ខាងក្រៅដោយប្រើ state machine ដែលនឹងផ្តាច់ (trip open) នៅពេលមានកំហុសលើសកម្រិតកំណត់ ដើម្បី fail fast ភ្លាមៗ ជំនួសឱ្យការធ្វើឱ្យអស់ worker threads។ ត្រូវប្រើវាទន្ទឹមនឹង timeouts និង fallbacks។"
+tags: [reliability, resilience, distributed-systems, circuit-breaker, microservices]
+related: [patterns/retry, patterns/rate-limiting, tradeoffs/sync-vs-async]
+order: 5
+updated: "2026-09-12"
+contributors: [veasna]
+translation: draft
+---
+
+## Context
+
+សេវាកម្មមួយត្រូវពឹងផ្អែកលើបណ្តាញ network ខាងក្រៅ៖ payment gateway, សេវាពិនិត្យ credit, recommendation engine, ឬ internal inventory API នៃ microservice ផ្សេងទៀត។
+
+នៅពេល dependency ខាងក្រោមជួបប្រទះការដាច់ ឬ latency ឡើងខ្ពស់ខ្លាំង (ឧទាហរណ៍ ស៊ីពេល ២០ វិនាទីដើម្បីឆ្លើយតប ជំនួសឱ្យ ១០០ មិល្លីវិនាទី) កម្មវិធីខាងលើនៅតែបន្តបញ្ជូន request ទៅកាន់វាឥតឈប់ឈរ។ Worker threads, network sockets និង database connections ត្រូវកកស្ទះដើម្បីរង់ចាំ timeouts។ មិនយូរប៉ុន្មាន សេវាកម្មខាងលើនឹងអស់ធនធាន ហើយដួលរលំខ្លួនឯង ដែលបង្កជាមហន្តរាយដួលរលំជាខ្សែសង្វាក់ (cascading failure) ទៅកាន់ប្រព័ន្ធទាំងមូល។
+
+## Symptoms
+
+- Dependency តូចមួយខាងក្រោមដើរយឺត ស្រាប់តែប៉ុន្មាននាទីក្រោយមក កម្មវិធីទាំងមូលលែងដំណើរការទាំងស្រុង។
+- Server thread pools ឬ Node.js event loops ពេញណែនដោយសារ sockets បើកចោលរង់ចាំ HTTP timeouts។
+- ការ retry ដោយគ្មានការទប់ស្កាត់ បែរជាធ្វើឱ្យបញ្ហាកាន់តែធ្ងន់ធ្ងរ ដោយការសម្រុក request បន្ថែមទៅកាន់សេវាកម្មដែលកំពុងគាំងស្រាប់។
+- Health check បរាជ័យលើ upstream services ដោយសារ worker threads ទាំងអស់ត្រូវបានរារាំង (blocked)។
+
+<Callout type="warning" title="Retry ដោយគ្មាន circuit breaker នឹងបង្កើតជា death spiral">
+នៅពេលសេវាកម្មខាងក្រោមជួបបញ្ហា ការ retry បន្ថែមនឹងបង្កើន traffic ទ្វេដង ហើយធានាថាសេវាកម្មនោះនឹងមិនអាចងើបឡើងវិញបានឡើយ។ Circuit breaker កាត់ផ្តាច់ traffic ភ្លាមៗ ដើម្បីទុកពេលឱ្យប្រព័ន្ធនោះអាចដកដង្ហើម និងស្តារឡើងវិញ។
+</Callout>
+
+## Diagnose
+
+1. **គូសផែនទី dependencies ខាងក្រៅ៖** ចងក្រងបញ្ជីរាល់ការហៅចេញក្រៅតាម network (HTTP, gRPC, third-party SDKs) ក្នុងសេវាកម្មរបស់អ្នក។
+2. **ពិនិត្យការកំណត់ timeout៖** តើមាន network call ណាដែលគ្មានការកំណត់ deadline ច្បាស់លាស់ដែរឬទេ? ការខកខានកំណត់ timeout តែមួយ អាចធ្វើឱ្យ thread ជាប់គាំងរហូត។
+3. **វិភាគទម្រង់នៃការដួលរលំកន្លងមក៖** នៅក្នុងបញ្ហាដែលធ្លាប់កើតឡើង តើការខូចខាតលើមុខងារមិនសូវសំខាន់ (ដូចជា recommendation ឬ analytics) ធ្លាប់ធ្វើឱ្យប៉ះពាល់ដល់មុខងារ checkout ឬ login ដែរឬទេ?
+4. **ពិនិត្យទម្រង់នៃកំហុស៖** តើកំហុសនោះជាបញ្ហាបណ្តោះអាសន្នលើ request តែមួយ ឬជាបញ្ហាជាប្រព័ន្ធដែលសេវាកម្មខាងក្រៅបរាជ័យ ៩៥% នៃ request ទាំងអស់?
+
+## Options
+
+1. **ប្រើត្រឹមតែ Timeout។** កំណត់ timeout ខ្លីៗ (ឧ. ១–២ វិនាទី) លើរាល់ call។ Request នៅតែត្រូវរង់ចាំ និងទប់ស្កាត់ threads រហូតដល់ផុតពេល timeout នោះ។
+2. **ប្រើ Circuit Breaker state machine។** តាមដានអត្រាបរាជ័យក្នុងចន្លោះពេលជាក់លាក់។ ប្តូរទៅកាន់ស្ថានភាព `OPEN` នៅពេលបរាជ័យលើសកំណត់ (ឧ. បរាជ័យ ៥០% ក្នុងចំណោម ១០ requests) ដោយកាត់ផ្តាច់ request បន្ទាប់ភ្លាមៗក្នុងរយៈពេល 0 ms ដោយមិនបាច់ហៅតាម network ទៀតទេ។
+3. **ប្រើ Bulkhead isolation។** បែងចែក thread/connection pools ដាច់ដោយឡែកសម្រាប់ dependency នីមួយៗ ដើម្បីកុំឱ្យបញ្ហានៅកន្លែងមួយស៊ីធនធានរបស់កន្លែងផ្សេង។
+4. **ប្រើ Fallback degradation។** នៅពេល circuit breaker ផ្តាច់ ចូរផ្តល់ទិន្នន័យពី cache, តម្លៃ static លំនាំដើម ឬលាក់ widget នោះចោលបណ្តោះអាសន្ន។
+
+## Trade-offs
+
+| យុទ្ធសាស្ត្រ | កម្រិតការពារ | Latency ពេល dependency ខូច | ភាពស្មុគស្មាញ | ឥរិយាបថ Fallback |
+| :--- | :--- | :--- | :--- | :--- |
+| **ប្រើត្រឹម Timeouts** | ខ្សោយ | ខ្ពស់ (ត្រូវរង់ចាំពេញ timeout) | ទាបបំផុត | បោះ error ក្រោយរង់ចាំចប់ |
+| **Circuit Breaker** | ខ្ពស់ | ជិត 0 ms (fail-fast ភ្លាមៗ) | មធ្យម | បរាជ័យភ្លាមៗ ឬផ្តល់ cached fallback |
+| **Bulkhead** | ខ្ពស់ខ្លាំង | ញែកដាច់ក្នុង pool របស់វា | ខ្ពស់ | កំណត់ធនធានដាច់ដោយឡែក |
+| **Breaker + Fallback** | អតិបរមា | ជិត 0 ms | មធ្យម | អ្នកប្រើប្រាស់នៅតែអាចប្រើប្រាស់បានក្នុងកម្រិតសមរម្យ |
+
+## Decision
+
+- **ប្រើ Circuit Breaker ដែលមាន 3 ស្ថានភាព** (`CLOSED`, `OPEN`, `HALF-OPEN`) លើរាល់ network calls ទៅកាន់ third-party APIs និង internal microservices។
+- **ត្រូវប្រើទន្ទឹមគ្នានឹង Timeout ជានិច្ច។** Breaker នឹងរាប់បញ្ហា timeout ថាជាការបរាជ័យមួយ ដើម្បីសម្រេចចិត្តផ្តាច់ circuit។
+- **រៀបចំ fallback ឱ្យបានគ្រប់កន្លែងដែលអាចធ្វើទៅបាន៖**
+  - សម្រាប់មុខងារមិនសូវសំខាន់ (ទំនិញណែនាំ, reviews)៖ ផ្តល់ទិន្នន័យទទេ ឬទិន្នន័យពី cache ចាស់។
+  - សម្រាប់មុខងារស្នូល (payments)៖ fail fast ជាមួយសារបញ្ជាក់ច្បាស់លាស់ ជាជាងការធ្វើឱ្យប៊ូតុង checkout វិលរហូត។
+- **ស្តារឡើងវិញដោយប្រើ `HALF-OPEN` probes៖** ក្រោយរយៈពេលសម្រាក (ឧទាហរណ៍ ៣០ វិនាទី) អនុញ្ញាតឱ្យ request សាកល្បងមួយឆ្លងកាត់។ ប្រសិនបើជោគជ័យ ចូរបិទ circuit (`CLOSED`) ឡើងវិញ; ប្រសិនបើបរាជ័យ ត្រូវបន្តរង់ចាំតទៅទៀត។
+
+## Implementation
+
+កូដ Circuit Breaker ក្នុង TypeScript ដោយមិនបាច់ពឹងផ្អែកលើ library ខាងក្រៅ៖
+
+```typescript
+type CircuitState = 'CLOSED' | 'OPEN' | 'HALF_OPEN';
+
+interface CircuitBreakerOptions {
+  failureThreshold: number; // ចំនួនបរាជ័យដើម្បីផ្តាច់ ឧ. 5 ដង
+  resetTimeoutMs: number;    // រយៈពេលរង់ចាំមុនសាកល្បងឡើងវិញ ឧ. 30000 ms
+}
+
+export class CircuitBreaker {
+  private state: CircuitState = 'CLOSED';
+  private failureCount = 0;
+  private nextAttempt = Date.now();
+
+  constructor(
+    private readonly name: string,
+    private readonly options: CircuitBreakerOptions = { failureThreshold: 5, resetTimeoutMs: 30000 }
+  ) {}
+
+  async execute<T>(action: () => Promise<T>, fallback?: () => Promise<T>): Promise<T> {
+    if (this.state === 'OPEN') {
+      if (Date.now() > this.nextAttempt) {
+        this.state = 'HALF_OPEN';
+      } else {
+        if (fallback) return fallback();
+        throw new Error(`[CircuitBreaker:${this.name}] Circuit is OPEN - failing fast`);
+      }
+    }
+
+    try {
+      const result = await action();
+      this.onSuccess();
+      return result;
+    } catch (err) {
+      this.onFailure();
+      if (fallback) return fallback();
+      throw err;
+    }
+  }
+
+  private onSuccess() {
+    this.failureCount = 0;
+    this.state = 'CLOSED';
+  }
+
+  private onFailure() {
+    this.failureCount++;
+    if (this.state === 'HALF_OPEN' || this.failureCount >= this.options.failureThreshold) {
+      this.state = 'OPEN';
+      this.nextAttempt = Date.now() + this.options.resetTimeoutMs;
+      console.warn(`[CircuitBreaker:${this.name}] Breaker TRIPPED to OPEN until ${new Date(this.nextAttempt).toISOString()}`);
+    }
+  }
+
+  getState(): CircuitState {
+    return this.state;
+  }
+}
+```
+
+### ឧទាហរណ៍នៃការប្រើប្រាស់ជាមួយ API ខាងក្រៅ និង Fallback៖
+
+```typescript
+const paymentBreaker = new CircuitBreaker('stripe-api', {
+  failureThreshold: 3,
+  resetTimeoutMs: 20000,
+});
+
+export async function processCharge(payload: ChargeRequest) {
+  return await paymentBreaker.execute(
+    async () => {
+      // ត្រូវកំណត់ timeout នៅខាងក្នុង breaker ជានិច្ច
+      const res = await fetch('https://api.stripe.com/v1/charges', {
+        method: 'POST',
+        signal: AbortSignal.timeout(3000), // timeout ៣ វិនាទី
+        body: JSON.stringify(payload),
+      });
+      if (!res.ok) throw new Error(`Stripe error: ${res.status}`);
+      return await res.json();
+    },
+    // Fallback ជម្រើស (ឧ. ដាក់ចូល queue ដើម្បីដំណើរការពេលក្រោយ)
+    async () => {
+      return { status: 'queued', message: 'Payment gateway slow. Queued for asynchronous processing.' };
+    }
+  );
+}
+```
+
+## Verification
+
+1. **Fail-fast latency៖** នៅពេល API ខាងក្រៅដើរយឺតដល់ ២០ វិនាទី Request ៥ ដំបូងនឹង timeout នៅ ៣ វិនាទី ប៉ុន្តែចាប់ពី request ទី ៦ ទៅ វានឹងកាត់ផ្តាច់ ឬបញ្ជូន fallback ភ្លាមៗក្នុងរយៈពេល **< 1 ms**។
+2. **ការការពារធនធាន៖** អំឡុងពេលដែល dependency ខាងក្រៅដាច់ទាំងស្រុង CPU និង active connections នៃ server របស់អ្នកត្រូវតែរក្សាស្ថិរភាពធម្មតា។
+3. **ការស្តារឡើងវិញដោយស្វ័យប្រវត្តិ៖** នៅពេល dependency ខាងក្រៅដំណើរការឡើងវិញ សូមផ្ទៀងផ្ទាត់ថា request សាកល្បងក្នុងស្ថានភាព `HALF_OPEN` នឹងប្តូរ breaker មកកាន់ `CLOSED` វិញដោយស្វ័យប្រវត្តិ ដោយមិនបាច់ restart server ឡើយ។
+
+## Why
+
+នៅក្នុងវិស្វកម្មអគ្គិសនី ប៉ុង (circuit breaker) នឹងកាត់ផ្តាច់ចរន្តអគ្គិសនីភ្លាមៗនៅពេលមានការឆ្លងចរន្តលើសកម្រិតកំណត់ ដើម្បីការពារកុំឱ្យឆេះផ្ទះ។
+
+នៅក្នុងវិស័យ software ធនធានកុំព្យូទ័រ (thread pools, sockets, memory buffers) គឺមានកម្រិតកំណត់។ នៅពេលសេវាកម្មខាងក្រៅខូច threads ដែលត្រូវរង់ចាំ network I/O នឹងមិនអាចទៅបម្រើអ្នកប្រើប្រាស់ថ្មីៗបានឡើយ។ Circuit breaker ការពារធនធានម៉ាស៊ីនក្នុងស្រុករបស់អ្នក ដោយកាត់ផ្តាច់ network call នោះចោល ដែលជួយឱ្យប្រព័ន្ធរបស់អ្នកនៅតែរស់រានមានជីវិត ទោះបីជាប្រព័ន្ធខាងក្រៅត្រូវដួលរលំក៏ដោយ។
+
+## When Not To Use
+
+- **In-memory local operations៖** កុំប្រើ circuit breaker លើ database query ក្នុងស្រុកដែលលឿន ឬការអាន file ធម្មតា; error handling ធម្មតាគឺគ្រប់គ្រាន់ហើយ។
+- **Asynchronous background queues៖** ប្រសិនបើសារត្រូវបានទាញយកពី message queue (ដូចជា SQS ឬ Kafka) ការផ្អាកការទាញយក (pause consumption) ឬដាក់ចូល dead-letter queue គឺមានប្រសិទ្ធភាពជាង។
+
+## Common Mistakes
+
+- **ប្រើ Circuit Breaker ដោយគ្មាន Timeout៖** ប្រសិនបើ network call ជាប់គាំងរហូត breaker នឹងមិនដែលកត់ត្រាការបរាជ័យឡើយ ដែលធ្វើឱ្យ breaker មិនអាចផ្តាច់បាន។
+- **កំណត់ threshold ទាបពេក៖** ការផ្តាច់ភ្លាមៗក្រោយការខកខានតែ ១ ដង អាចធ្វើឱ្យសេវាកម្មរអាក់រអួលដោយសារបញ្ហាបណ្តាញបណ្តោះអាសន្ន។ ត្រូវប្រើ threshold សមរម្យ (ឧ. ៥ ដង ឬអត្រាបរាជ័យ ៥០%)។
+- **មិនបានកត់ត្រា log ពេល breaker ផ្តាច់៖** ត្រូវតែបង្កើត alert ឬ log ជានិច្ចនៅពេល breaker ប្តូរទៅ `OPEN` ដើម្បីឱ្យក្រុមប្រតិបត្តិការបានដឹងថាសេវាកម្មខាងក្រៅកំពុងមានបញ្ហា។

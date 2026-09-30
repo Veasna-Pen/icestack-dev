@@ -1,0 +1,139 @@
+---
+title: "Horizontal vs Vertical Scaling"
+question: "When should I scale up by upgrading instance hardware versus scaling out across multiple nodes?"
+summary: "Vertical scaling (scaling up) upgrades CPU, RAM, and NVMe disk on a single machine, offering zero code changes and simple ACID operations until reaching hardware limits. Horizontal scaling (scaling out) adds more commodity nodes behind load balancers or database shards, offering near-infinite scalability and high availability at the cost of distributed systems complexity."
+tags: [scaling, architecture, devops, database, infrastructure]
+related: [tradeoffs/monolith-vs-microservices, problems/running-out-of-connections, patterns/distributed-lock]
+order: 15
+updated: "2026-09-12"
+contributors: [veasna]
+---
+
+## Context
+
+When an application experiences growth, its computing resources eventually saturate. The database CPU hits 90%, memory usage climbs, and response times slow down.
+
+Engineering teams face two fundamental strategies to scale:
+1. **Vertical Scaling (Scale Up):** Replace the server with a larger, more powerful machine. On AWS, this means upgrading from an `m5.large` (2 vCPU, 8 GB RAM) to an `r6i.32xlarge` (128 vCPU, 1,024 GB RAM, NVMe SSDs).
+2. **Horizontal Scaling (Scale Out):** Add more instances of the service or database behind a load balancer or distributed cluster. The workload is partitioned or distributed across 10, 50, or 500 smaller commodity nodes.
+
+Teams frequently assume that "modern cloud architecture" requires immediate horizontal scaling with distributed databases, microservices, and Kubernetes, paying massive operational and engineering penalties when a single vertically scaled machine could have comfortably handled their workload for a fraction of the cost.
+
+## Symptoms
+
+- **Premature Horizontal Scaling:** A startup with 50,000 users spends 6 months building distributed database sharding, dealing with two-phase commits and distributed deadlocks, when a single $200/month PostgreSQL instance would run their entire company.
+- **Vertical Ceiling Hit:** A monolithic database is running on the largest cloud instance available (`r6i.32xlarge` with 1 TB RAM); CPU utilization remains at 95% during peak hours, and upgrading to a larger single machine is physically impossible.
+- **Downtime During Scale-Up:** Every time traffic grows, resizing the primary database requires taking a 15-minute maintenance outage to change instance types.
+
+<Callout type="warning" title="Vertical scaling has a hard hardware ceiling; horizontal scaling has a software complexity tax">
+You can vertically scale by clicking a button with zero code modifications until you hit hardware limits. Horizontal scaling offers infinite theoretical headroom, but introduces the full distributed systems tax: network latency, partial failures, and consistency trade-offs.
+</Callout>
+
+## Diagnose
+
+1. **Calculate current resource consumption:** Are you currently using more than 64 vCPUs or 256 GB RAM on your primary node? (If no, you are nowhere near the vertical scaling limit).
+2. **Identify the scaling bottleneck:** Is the bottleneck the stateless web tier (trivial to scale horizontally behind a load balancer) or the stateful transactional database (hard to scale horizontally)?
+3. **Measure team operational maturity:** Does your team have the distributed systems expertise required to debug cross-node network partitions, raft consensus, and sharding rebalances?
+4. **Evaluate downtime tolerance:** Can the business tolerate a 2-minute maintenance window at 3:00 AM to resize a database instance, or is continuous zero-downtime mandatory?
+
+## Options
+
+1. **Vertical Scale-Up (Bigger Box):** Upgrade to higher vCPU, RAM, and IOPS. (Fastest time-to-relief, zero architecture changes).
+2. **Stateless Horizontal Scale-Out:** Run 5 to 50 identical stateless API containers behind an Application Load Balancer. (Standard modern practice for web applications).
+3. **Database Read Replicas:** Keep a single vertically scaled primary for writes, but scale read queries out horizontally across multiple read replicas.
+4. **Database Sharding (Distributed Scale-Out):** Partition data rows across independent database clusters using a shard key (e.g. `tenant_id` or `user_id`). (Highest scale, highest complexity).
+
+## Trade-offs
+
+| Dimension | Vertical Scaling (Scale Up) | Horizontal Scaling (Scale Out) | Read Replicas (Hybrid) |
+| :--- | :--- | :--- | :--- |
+| **Code Changes Required** | **Zero** | High (for stateful databases) | Low (split read/write DB URLs) |
+| **Architectural Complexity** | **Lowest (single machine)** | High (distributed state) | Low to Moderate |
+| **Hardware Ceiling** | Hard ceiling (~128–256 vCPU) | **Theoretical Infinite** | Write-bound ceiling |
+| **High Availability (HA)** | None (Single Point of Failure) | **Built-in (node redundancy)** | High (failover to replica) |
+| **Cost at Moderate Scale** | **Very Cost-Effective** | Expensive (idle overhead) | Balanced |
+| **Maintenance Downtime** | Often requires brief restart | **Zero-downtime rolling updates** | Minimal (promoted replica) |
+
+## Decision
+
+- **Scale the Stateless Web Layer Horizontally from Day 1:** Web servers, background workers, and API gateways should always be stateless and autoscaled horizontally behind a load balancer. It provides instant fault tolerance: if one container crashes, the load balancer routes to others.
+- **Scale the Database Vertically First:** Do not shard your database prematurely. A single modern PostgreSQL instance on AWS or bare metal can comfortably handle **50,000+ queries per second** and multiple terabytes of data if properly indexed.
+- **Adopt Read Replicas when Reads Bottleneck the Primary:** When read volume accounts for 90% of database CPU, add 2–3 read replicas before considering horizontal sharding.
+- **Transition to Database Sharding only when:**
+  - Write throughput exceeds the maximum physical IOPS of the largest available NVMe drives.
+  - Data volume exceeds 10–20 terabytes and cannot be archived.
+  - Compliance laws (e.g. GDPR) require geographic data residency in specific countries.
+
+## Implementation
+
+### 1. Stateless Horizontal Autoscaling (Kubernetes HPA):
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: api-service-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: api-service
+  minReplicas: 3
+  maxReplicas: 30
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+```
+
+### 2. Pragmatic Hybrid Read/Write Split in Database Client:
+
+```typescript
+import { Pool } from 'pg';
+
+// Primary DB: Vertically scaled for write consistency
+const primaryPool = new Pool({ connectionString: process.env.PRIMARY_DB_URL, max: 20 });
+
+// Read Replicas: Horizontally scaled for unlimited read concurrency
+const replicaPool = new Pool({ connectionString: process.env.REPLICA_DB_URL, max: 40 });
+
+export async function executeQuery(sql: string, params: any[], isWrite = false) {
+  const pool = isWrite ? primaryPool : replicaPool;
+  const client = await pool.connect();
+  try {
+    return await client.query(sql, params);
+  } finally {
+    client.release();
+  }
+}
+```
+
+## Verification
+
+1. **Load test stateless autoscaler:** Blast the web tier with a 10x traffic spike using `k6`. Confirm that Kubernetes HPA detects CPU > 70% and spins up additional pods within 60 seconds.
+2. **Database vertical headroom check:** Run `SELECT * FROM pg_stat_activity` under peak production load. Verify that CPU utilization is below 60% and buffer cache hit ratio is > 99%.
+3. **Replica read load distribution:** Monitor query metrics across your 3 read replicas during a reporting run. Verify that queries are distributed evenly via round-robin DNS or proxy.
+
+## Why
+
+Every distributed system requires paying the "distributed systems tax":
+- Network serialization and deserialization.
+- Network latency over physical cables.
+- Partial failures, split-brain scenarios, and dropped packets.
+- Distributed consensus algorithms (Raft/Paxos).
+
+Vertical scaling avoids the distributed systems tax completely for as long as possible. By maximizing single-node efficiency first and scaling horizontally only where necessary, engineering teams minimize code complexity, eliminate distributed race conditions, and keep operational overhead manageable.
+
+## When Not To Use
+
+- **Vertical scaling for stateless web servers:** Running a single giant 64-core web server means that any fatal unhandled exception or operating system reboot takes down the entire company.
+- **Horizontal database sharding for an MVP:** Designing a sharded multi-tenant database before knowing if anyone wants your product guarantees slow development velocity and architectural premature optimization.
+
+## Common Mistakes
+
+- **Scaling hardware instead of fixing missing indexes:** Upgrading from an 8-core server to a 32-core server because a query without an index is doing a 10-second sequential disk scan. A single `CREATE INDEX` would have solved the problem for $0.
+- **Assuming cloud instances cannot be resized quickly:** Cloud providers allow resizing instances with only a 1–2 minute reboot window during scheduled off-peak hours.
+- **Stateful web servers that prevent horizontal scaling:** Storing user session data in server memory (`req.session` in local RAM) prevents scaling out behind a load balancer; always store sessions in Redis or secure cookies.

@@ -1,0 +1,94 @@
+---
+title: "Changing the database without downtime"
+summary: "Rename a column, or make any breaking schema change, in small steps that never break the version that is running."
+minutes: 15
+related: [patterns/feature-flags, patterns/strangler-fig]
+updated: "2026-09-30"
+contributors: [Veasna-Pen]
+---
+
+## The problem
+
+You rename `users.name` to `users.full_name`. The migration runs first, then the new code rolls out over five minutes. For those five minutes, the **old** instances, still running, query a column that no longer exists. Every profile page on them fails.
+
+If you deploy the code first instead, the **new** code queries `full_name` before it exists. Either order breaks something.
+
+## The idea
+
+During a deploy, **old and new code run at the same time**, against the **same database**. So every schema change must work with both versions.
+
+The technique is called **expand and contract**. Instead of one breaking change, make several small, compatible ones:
+
+1. **Expand**: add the new thing next to the old one. Nothing is removed, so the old code keeps working.
+2. **Migrate**: write to both, copy existing data across, then switch reads to the new one.
+3. **Contract**: once no running code uses the old thing, remove it.
+
+Each step is its own deploy, and each can be rolled back on its own. It takes longer, but no single step can break the running version.
+
+Also watch for **locks**. On a large table, some changes (adding an index without `CONCURRENTLY`, some column type changes) block reads or writes while they run.
+
+## Example
+
+Renaming `name` to `full_name` in four deploys:
+
+```sql
+-- Deploy 1 (expand): add the new column. The old code ignores it.
+ALTER TABLE users ADD COLUMN full_name text;
+```
+
+```ts
+// Deploy 2 (migrate): write both columns; keep reading the old one.
+await db.user.update({ where: { id }, data: { name: value, fullName: value } });
+```
+
+```sql
+-- Then copy existing rows, in batches, so the table isn't locked for long.
+UPDATE users SET full_name = name WHERE full_name IS NULL AND id BETWEEN 1 AND 10000;
+-- ...repeat for the next ranges
+```
+
+```ts
+// Deploy 3: read from full_name. Keep writing both, so a rollback still works.
+const displayName = user.fullName;
+```
+
+```sql
+-- Deploy 4 (contract): nothing uses name any more.
+ALTER TABLE users DROP COLUMN name;
+```
+
+At every point, the version that is running and the version being deployed both find the columns they expect. Nobody sees an error.
+
+## Try it
+
+1. Pick a schema change you have made, or plan to make, that removes or renames something.
+2. Write it as expand, migrate and contract steps, one deploy each.
+3. For each step, ask: "If the previous version of the app is still running, does it still work?"
+4. For each SQL statement on a big table, check whether it takes a lock that blocks traffic, and how long it runs.
+
+## Check yourself
+
+**1. Why must a migration work with both the old and the new code?**
+
+<Answer>
+Deploys aren't instant. While new instances roll out, old ones are still serving traffic against the same database, and a rollback brings the old code back entirely.
+</Answer>
+
+**2. You want to add a `NOT NULL` column. What is the safe order?**
+
+<Answer>
+Add it as nullable (or with a default), deploy code that writes it, backfill existing rows in batches, and only then add the `NOT NULL` constraint once every row has a value.
+</Answer>
+
+**3. Why keep writing the old column in deploy 3, after reads have moved to the new one?**
+
+<Answer>
+So you can roll back deploy 3. If the previous version is restored, it reads the old column, which must still be up to date.
+</Answer>
+
+## Key takeaways
+
+- During a deploy, **old and new code share one database**.
+- Use **expand, migrate, contract**: add, copy and switch, then remove.
+- One compatible step per deploy, **each one reversible**.
+- Watch for **locks** and backfill large tables in batches.

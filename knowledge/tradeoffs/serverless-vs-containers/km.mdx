@@ -1,0 +1,157 @@
+---
+title: "Serverless vs Containers"
+question: "តើនៅពេលណាដែលខ្ញុំគួរបង្កើតប្រព័ន្ធលើ Serverless (AWS Lambda / Cloudflare Workers) ហើយនៅពេលណាដែលគួរប្រើ Docker Containers លើ Kubernetes / ECS?"
+summary: "Serverless គិតលុយតាមចំនួនសំណើជាក់ស្តែង (Pay-per-request), មានស្វ័យប្រវត្តិនៃការពង្រីកទំហំពី ០ ទៅរាប់ពាន់ភ្លាមៗ, និងមិនបាច់មើលថែ Server ឡើយ ដែលល្អសម្រាប់បន្ទុកការងារបែប Event-driven។ ចំណែក Containers ផ្តល់នូវតម្លៃថេរជាក់លាក់, គ្មានបញ្ហា Cold Start ឡើយ, អាច Cache ទិន្នន័យក្នុង RAM បាន, និងគ្រប់គ្រង Runtime ទាំងមូលបានពេញលេញសម្រាប់ API ស្នូល។"
+tags: [devops, cloud, serverless, containers, architecture, kubernetes]
+related: [tradeoffs/monolith-vs-microservices, problems/slow-first-request, patterns/sidecar]
+order: 11
+updated: "2026-09-12"
+contributors: [veasna]
+translation: draft
+---
+
+## Context
+
+នៅពេលចាប់ផ្តើមបង្កើតប្រព័ន្ធ Backend ថ្មី ឬធ្វើទំនើបកម្មលើប្រព័ន្ធចាស់ ក្រុមវិស្វករត្រូវធ្វើការជ្រើសរើសស្ថាបត្យកម្មហេដ្ឋារចនាសម្ព័ន្ធគ្រឹះចំនួនពីរ៖
+1. **Serverless Functions (Function-as-a-Service / FaaS)៖** កូដត្រូវបានវេចខ្ចប់ជា Functions ឯករាជ្យ (AWS Lambda, Google Cloud Functions, Cloudflare Workers)។ Cloud Provider ជាអ្នកផ្តល់ធនធានដំណើរការតាមតម្រូវការជាក់ស្តែង ពង្រីកពី ០ ទៅ ១០,០០០ Instances ដោយស្វ័យប្រវត្តិ និងគិតថ្លៃជាក់ស្តែងតាមចំនួនមិល្លីវិនាទីនៃកូដដែលដំណើរការ។
+2. **Containerized Services (Docker / Kubernetes / ECS)៖** កម្មវិធីត្រូវបានវេចខ្ចប់ជា Docker Containers ដែលដំណើរការជាប់ជាប្រចាំ ២៤/៧ លើ Virtual Machines ឬ Kubernetes Clusters។ Instances ស្ថិតក្នុងស្ថានភាព Warm ជានិច្ច រក្សាទុក Persistent Connection និងគិតថ្លៃថេរតាមម៉ោងដំណើរការ។
+
+ក្រុមការងារជាច្រើនជ្រើសរើស Serverless ព្រោះសង្ឃឹមថា "មិនបាច់មើលថែ Server" តែចុងក្រោយបែរជាជួបបញ្ហា Cold Start យឺតយ៉ាវ, អស់ Connection Database, និងវិក្កយបត្រ Cloud ឡើងថ្លៃកប់ពពកពេលមាន Traffic ធំ។ ផ្ទុយទៅវិញ ក្រុមដែលចាប់ផ្តើមប្រើ Kubernetes លឿនពេក ត្រូវចំណាយពេលរាប់ខែទៅលើការរៀបចំប្រព័ន្ធស្មុគស្មាញ មុនពេលបានសរសេរកូដមុខងារអាជីវកម្មដំបូង។
+
+## Symptoms
+
+- **រោគសញ្ញាបរាជ័យនៃ Serverless៖** ជួបបញ្ហា Latency យឺតពី ២ ទៅ ៥ វិនាទី (Cold Starts) ម្តងម្កាលនៅពេលមាន Lambda Instance ថ្មីត្រូវបានបង្កើត; Database គាំងព្រោះ Lambda ចំនួន ៥០០ បើក Connection ផ្ទាល់ព្រមគ្នា; វិក្កយបត្រ Cloud ឡើងថ្លៃខ្លាំងខុសពីការរំពឹងទុកពេលដំណើរការងារ Stream ជាប់រហូត។
+- **រោគសញ្ញាបរាជ័យនៃ Container៖** Kubernetes Nodes ចំនួន ៣ ដំណើរការ ២៤ ម៉ោងក្នុងមួយថ្ងៃដោយស៊ី CPU ត្រឹម ៣% សម្រាប់កម្មវិធីផ្ទៃក្នុងដែលប្រើតែ ២ ម៉ោងក្នុងមួយថ្ងៃ ដែលខាតបង់ថវិការាប់ពាន់ដុល្លារ; Developer ត្រូវចំណាយពេល ៤០% នៃ Sprint ដើម្បី Debug ឯកសារ Helm Charts និង Ingress Controllers ជំនួសឱ្យការសរសេរកូដមុខងារថ្មី។
+
+<Callout type="warning" title="Serverless ថោកជាងពេល Traffic តិច ឬមកជាកំហុក; Containers ថោកជាងពេល Traffic ខ្ពស់ថេរ">
+ដោយសារតែ Serverless គិតថ្លៃថ្លៃជាងលើរាល់មិល្លីវិនាទីនៃការគណនា សេវាកម្មដែលមាន Throughput ខ្ពស់ជាប់រហូត (ឧ. 5,000 req/sec ២៤ ម៉ោង) នឹងត្រូវចំណាយលុយលើ AWS Lambda ច្រើនជាងការជួល Container Instances ថេរជាច្រើនដង។
+</Callout>
+
+## Diagnose
+
+1. **វិភាគទម្រង់នៃ Traffic៖** តើ Traffic របស់អ្នកមកជាកំហុកមិនទៀងទាត់ (Webhooks, Batch Cron, ការលក់តាមរដូវកាល) ឬមានសភាពថេរជាប់រហូត (ប្រព័ន្ធ B2B SaaS អំឡុងម៉ោងធ្វើការ)?
+2. **វាស់ស្ទង់កម្រិតអត់ធ្មត់នឹង Cold Start៖** តើអ្នកប្រើប្រាស់របស់អ្នកអាចទ្រាំរង់ចាំ ១.៥ វិនាទីលើសំណើដំបូងគេក្រោយពេលប្រព័ន្ធទំនេរបានដែរឬទេ?
+3. **ពិនិត្យការតភ្ជាប់ Database៖** តើ Database របស់អ្នកគាំទ្រ Serverless Connection Pooling (PgBouncer, AWS RDS Proxy) ដែរឬទេ ឬតើ ១,០០០ Ephemeral Instances នឹងបំផ្លាញ Connection Limit របស់ Database?
+4. **វាយតម្លៃសមត្ថភាពប្រតិបត្តិការរបស់ក្រុម៖** តើក្រុមរបស់អ្នកមាន DevOps/SRE ពេញសិទ្ធិដើម្បីមើលថែ Kubernetes ដែរឬទេ ឬអ្នកជាក្រុមតូចដែលផ្តោតលើផលិតផល?
+
+## Options
+
+1. **Pure Serverless (AWS Lambda + API Gateway)៖** គ្មានការមើលថែ Infrastructure ឡើយ, បង្រួមមកនៅសូន្យពេលគ្មានអ្នកប្រើ (Scale-to-zero), គិតលុយតាមសំណើ។
+2. **Edge Serverless (Cloudflare Workers)៖** ដំណើរការលើ V8 Isolate ដែលមាន Cold Start ក្រោម 5 ms នៅ ៣០០ ទីតាំងជុំវិញពិភពលោក។
+3. **Managed Containers (AWS ECS Fargate / Cloud Run)៖** ភាពបត់បែននៃ Container រួមផ្សំជាមួយភាពងាយស្រួលនៃ Serverless (មិនបាច់គ្រប់គ្រង K8s Cluster, បង្កើត Container ស្វ័យប្រវត្តិ)។
+4. **Self-Managed Containers (Kubernetes / EKS)៖** ការគ្រប់គ្រងពេញលេញលើ Networking, Service Mesh, Sidecars, និង Daemonsets។ (ល្អបំផុតសម្រាប់ប្រព័ន្ធ Enterprise ស្មុគស្មាញ)។
+
+## Trade-offs
+
+| លក្ខណៈវិនិច្ឆ័យ | Serverless (AWS Lambda) | Containers (Docker / K8s) | Edge Serverless (Cloudflare) |
+| :--- | :--- | :--- | :--- |
+| **Cold Starts** | ៥០០ ms ដល់ ៣,០០០ ms | **០ ms (Warm ជានិច្ច)** | **< ៥ ms (V8 Isolate)** |
+| **គំរូតម្លៃ** | គិតតាមមិល្លីវិនាទីដំណើរការ | តម្លៃម៉ាស៊ីនថេរប្រចាំម៉ោង | គិតតាមចំនួនសំណើ |
+| **ល្បឿននៃការ Scale** | **ភ្លាមៗ (ពី ០ ដល់រាប់ពាន់ក្នុងប៉ុន្មានវិ)** | យឺតជាង (Autoscaling ប្រើពេលច្រើននាទី) | **ភ្លាមៗទូទាំងសកលលោក** |
+| **រយៈពេលដំណើរការអតិបរមា** | កំណត់ត្រឹម ១៥ នាទី | **គ្មានដែនកំណត់** | ៣០ ដល់ ៦០ វិនាទី |
+| **Database Connection Pool** | ពិបាក (ត្រូវមាន Proxy) | **មានស្រាប់ (In-process Pool)** | ត្រូវប្រើ HTTP/WebSocket DB |
+| **ការ Cache ក្នុង Memory** | បណ្តោះអាសន្ន (បាត់ពេលបិទ) | **គង់វង្ស (ចែករំលែកក្នុង RAM)** | បណ្តោះអាសន្ន |
+| **បន្ទុកប្រតិបត្តិការ** | ទាបបំផុត (គ្មាន Patching) | ខ្ពស់ (OS, Docker, K8s) | ទាបបំផុត |
+
+## Decision
+
+- **ជ្រើសរើស Serverless (FaaS) សម្រាប់៖**
+  - ការងារបែប Event-driven៖ ការរៀបចំទំហំរូបភាពពេល Upload លើ S3, ការទទួល Webhooks, Consumer របស់ Message Queue។
+  - ការងារ Cron Job តាមកាលវិភាគ (របាយការណ៍ប្រចាំថ្ងៃ, Script សម្អាតទិន្នន័យ)។
+  - គម្រោង MVP ថ្មីៗដែលមិនទាន់មាន Traffic ច្រើន ដែលការជួលម៉ាស៊ីន EC2 ចោលគឺជាការខ្ជះខ្ជាយ។
+  - Edge Computing៖ ការបញ្ជូន Route ឆ្លាតវៃ, ការផ្ទៀងផ្ទាត់ JWT Token នៅលើ CDN (Cloudflare Workers)។
+- **ជ្រើសរើស Containers (ECS / Kubernetes / Cloud Run) សម្រាប់៖**
+  - API ស្នូលរបស់អ្នកប្រើប្រាស់ដែលមាន Traffic ថេរ ដែល p99 Latency ត្រូវតែក្រោម 50 ms ដោយគ្មាន Cold Start ជាដាច់ខាត។
+  - ការងារ Background ដែលដំណើរការលើសពី ១៥ នាទី (ការ Render វីដេអូ, WebSocket Server, Kafka Streaming)។
+  - កម្មវិធីដែលពឹងផ្អែកលើ In-Memory Cache ធំៗ ឬ Connection Pool រួមគ្នា។
+- **យុទ្ធសាស្ត្រ Hybrid៖** ប្រើប្រាស់ Containers សម្រាប់ Web API ចម្បង និងប្រើប្រាស់ Serverless សម្រាប់ Background Events និង Webhooks។
+
+## Implementation
+
+### 1. Serverless AWS Lambda Handler ក្នុង TypeScript៖
+
+```typescript
+import { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
+
+// ប្រើប្រាស់ Connection ឡើងវិញរវាង Warm Invocations
+let cachedDbConnection: any = null;
+
+export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayProxyResult> {
+  // បញ្ហា Cold Start កើតឡើងតែម្តងគត់លើសំណើដំបូង
+  if (!cachedDbConnection) {
+    console.log('[Cold Start] កំពុងបើកដំណើរការ Database Connection...');
+    cachedDbConnection = await initializeDatabaseClient();
+  }
+
+  try {
+    const body = event.body ? JSON.parse(event.body) : {};
+    const result = await processOrder(body, cachedDbConnection);
+
+    return {
+      statusCode: 200,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ success: true, data: result }),
+    };
+  } catch (err) {
+    return {
+      statusCode: 500,
+      body: JSON.stringify({ error: (err as Error).message }),
+    };
+  }
+}
+```
+
+### 2. Containerized Service ជាមួយ Express និង Persistent Connection Pool៖
+
+```typescript
+import express from 'express';
+import { Pool } from 'pg';
+
+const app = express();
+app.use(express.json());
+
+// Persistent Connection Pool រក្សាទុកការតភ្ជាប់រាប់សប្តាហ៍ក្នុង RAM របស់ Container
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  max: 20, // ២០ Connections ដែលបើករួចជាស្រេច
+  idleTimeoutMillis: 30000,
+});
+
+app.post('/orders', async (req, res) => {
+  // គ្មាន Cold Start ឡើយ! Connection កំពុងរង់ចាំជាស្រេច
+  const client = await pool.connect();
+  try {
+    const { rows } = await client.query('INSERT INTO orders (data) VALUES ($1) RETURNING id', [req.body]);
+    return res.status(200).json({ success: true, orderId: rows[0].id });
+  } finally {
+    client.release();
+  }
+});
+
+app.listen(8080, () => console.log('Containerized service កំពុងដំណើរការលើ Port 8080'));
+```
+
+## Verification
+
+1. **ការវាស់ស្ទង់ Cold Start Latency៖** ផ្ញើសំណើទៅកាន់ Lambda ដែលបានសម្រាកទំនេរ ៣០ នាទី។ វាស់វែងរយៈពេលនៃជំហាននីមួយៗ (DNS, TLS, Container Boot, DB Connection, និង Execution)។
+2. **ការគណនាចំណុចប្រសព្វនៃថ្លៃដើម (Cost Crossover)៖** គណនាការចំណាយសម្រាប់ ៥០ លានសំណើក្នុងមួយខែ៖
+   - Lambda៖ ប្រហាក់ប្រហែល $100 ដល់ $250 អាស្រ័យលើ RAM។
+   - 2x `t4g.medium` ECS Containers៖ តម្លៃថេរប្រហាក់ប្រហែល $50 ក្នុងមួយខែ។
+3. **ការពិនិត្យចំនួន Connection Database ពេលមានបន្ទុក៖** បាញ់តេស្ត ២,០០០ សំណើស្របគ្នា។ ផ្ទៀងផ្ទាត់ថា Containers រក្សាចំនួន Connection ថេរ (ឧ. ៤០ Connections) ខណៈដែល Serverless ដែលគ្មាន RDS Proxy នឹងបើករហូតដល់ ១,០០០ Connections ដែលអាចធ្វើឱ្យគាំង PostgreSQL។
+
+## Why
+
+ការសម្រេចចិត្តរវាង Serverless និង Containers គឺជាជម្រើសរវាង **សេដ្ឋកិច្ច** និង **ការគ្រប់គ្រងប្រតិបត្តិការ**៖
+- **Serverless ផ្លាស់ប្តូរថ្លៃដើម Hardware មកជាការគ្រប់គ្រងដោយស្វ័យប្រវត្តិ៖** អ្នកបង់ថ្លៃខ្ពស់ជាងបន្តិចលើរាល់ CPU Cycle ប៉ុន្តែអ្នកមិនបាច់បារម្ភពីរឿង Patching Server, ការគិតគូរទំហំផ្ទុក, ឬបង់ថ្លៃពេលគ្មានអ្នកប្រើឡើយ។
+- **Containers ផ្លាស់ប្តូរការវិនិយោគលើកម្លាំងពលកម្ម មកជាការសន្សំប្រាក់ និងការគ្រប់គ្រងពេញលេញ៖** អ្នកត្រូវទទួលបន្ទុកលើការគ្រប់គ្រង Container និង Scaling Rules ប៉ុន្តែអ្នកទទួលបានល្បឿនលឿនគ្មាន Cold Start និងតម្លៃថេរជាក់លាក់នៅពេលប្រព័ន្ធរីកធំ។
+
+## When Not To Use
+
+- **Serverless សម្រាប់កម្មវិធីដែលទាមទារ Memory State ធំៗ៖** ប្រសិនបើកម្មវិធីរបស់អ្នកត្រូវការ RAM Cache ទំហំ 4 GB ឬត្រូវការភ្ជាប់ WebSocket ជាប់រហូត នោះ Serverless មិនអាចប្រើបានឡើយ។
+- **Kubernetes សម្រាប់គម្រោងតូចដែលមានមនុស្ស ២ នាក់៖** ការរៀបចំ Kubernetes សម្រាប់ Startup ដំបូងៗ បង្កើតតែការងារស្មុគស្មាញមុនពេលរកឃើញ Product-Market Fit។ គួរប្រើ PaaS (Render, Railway) ឬ Serverless ជំនួសវិញ។
+
+## Common Mistakes
+
+- **ភ្ជាប់ទៅកាន់ Relational Database ផ្ទាល់ពី Lambda រាប់ពាន់៖** ការបើក TCP Connection និង TLS Handshake ថ្មីលើរាល់ Function Invocation នឹងធ្វើឱ្យ PostgreSQL ដាច់ខ្យល់។ ត្រូវដាក់ PgBouncer ឬ AWS RDS Proxy នៅចន្លោះកណ្តាលជានិច្ច។
+- **កញ្ចប់ Lambda មានទំហំធំពេក (Heavy Package Size)៖** ការដាក់បញ្ចូល Library ធ្ងន់ៗ (Puppeteer, Chromium, ML Models) ធ្វើឱ្យ Cold Start កើនឡើងពី ៣០០ ms ដល់លើសពី ៥ វិនាទី។
+- **រៀបចំ Kubernetes គ្រាន់តែដើម្បីល្អមើលក្នុង CV៖** ការបង្កើត Kubernetes Cluster ទាំងដែល AWS ECS Fargate ឬ Google Cloud Run អាចផ្តល់ផលប្រយោជន៍បាន ៩៥% ដោយចំណាយកម្លាំងថែទាំត្រឹមតែ ៥%។

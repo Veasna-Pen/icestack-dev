@@ -1,0 +1,158 @@
+---
+title: "Why are file uploads timing out?"
+question: "Why are large file uploads timing out and exhausting server RAM?"
+summary: "Streaming large multipart uploads through your application servers buffers megabytes in RAM, ties up worker threads, and triggers proxy timeouts. Offload uploads directly to cloud storage using Presigned S3/GCS URLs."
+tags: [uploads, s3, storage, performance, nodejs, architecture]
+related: [problems/memory-leak-in-production, problems/slow-first-request]
+order: 18
+updated: "2026-09-12"
+contributors: [veasna]
+---
+
+## Context
+
+A web or mobile application allowing users to upload media: user avatars, PDF invoices, and 500 MB video recordings.
+
+The application initially implements uploads by receiving standard `multipart/form-data` in a Node.js/Express controller using `multer`. The controller buffers the incoming file in memory or saves it to a local temporary disk (`/tmp`), and then uploads it to an AWS S3 bucket:
+
+```text
+Client (Mobile/Web) ──[Upload 200 MB]──> Node.js Server ──[Upload 200 MB]──> AWS S3
+```
+
+Under low traffic, uploads work fine. But when several users upload large video files concurrently on slow mobile cellular networks, the application crashes with Out-Of-Memory errors, and reverse proxies terminate connections with HTTP 504 Gateway Timeouts.
+
+## Symptoms
+
+- Application containers hit memory limits and restart (`OOMKilled`) when multiple users upload files simultaneously.
+- Mobile users on 3G/4G connections experience constant upload failures after waiting 60 seconds (Nginx `client_body_timeout` or Cloudflare 100-second timeout).
+- Web application worker threads remain locked for minutes doing simple socket streaming, starving fast API requests.
+- Node.js local disk `/tmp` fills up, crashing the container.
+
+<Callout type="warning" title="Application servers should never act as media file proxies">
+Proxying large files through application compute instances wastes CPU, saturates container RAM, doubles your network bandwidth costs, and forces application servers to endure slow client network upload speeds.
+</Callout>
+
+## Diagnose
+
+1. **Calculate proxy concurrency cost:** If 20 users upload a 100 MB file over a 1 MB/s mobile connection:
+   - Each upload takes 100 seconds.
+   - Your application servers must maintain 20 open sockets and buffer up to 20 × 100 MB = 2 GB of data in RAM or `/tmp` for 100 seconds!
+2. **Inspect reverse proxy timeouts:** Check your Nginx, Cloudflare, or AWS ALB configuration:
+   - Cloudflare limits request body sizes to 100 MB on free/pro plans and enforces a 100-second HTTP timeout.
+   - Nginx defaults `client_max_body_size` to 1 MB.
+
+## Options
+
+1. **Increase proxy timeouts and server RAM.** Scale up container limits to 4 GB and set timeouts to 10 minutes. (Expensive, brittle, and still fails on bad networks).
+2. **Stream directly from request to S3 without buffering.** Stream chunks directly via `busboy` or PassThrough streams. (Slightly better for memory, but still ties up app server connections for minutes).
+3. **Presigned Direct-to-S3 Uploads.** The frontend requests a short-lived presigned URL from the backend; the browser uploads the file directly to S3/Cloud Storage.
+4. **Resumable Multipart Direct Uploads (TUS Protocol).** Upload files in 5 MB chunks directly to object storage with pause/resume capabilities.
+
+## Trade-offs
+
+| Strategy | App Server RAM | App Server Bandwidth | Client Timeout Limit | Implementation Effort |
+| :--- | :--- | :--- | :--- | :--- |
+| **Server Proxy (Multer)** | **High (Crash risk)** | **Double (In + Out)** | Limited by proxy (60s) | Low |
+| **Streaming Proxy** | Low | Double (In + Out) | Limited by proxy (60s) | Medium |
+| **Presigned URL Direct** | **Zero** | **Zero** | Unlimited (S3 native) | **Low to Medium** |
+| **Multipart / TUS Direct** | **Zero** | **Zero** | Unlimited + Resumable | Medium |
+
+## Decision
+
+Adopt **Direct-to-Storage Presigned URLs**:
+
+1. The client sends a lightweight `POST /api/uploads/presign` request containing the filename and content type.
+2. The backend generates an authenticated, temporary S3 Presigned URL (valid for 15 minutes) and returns it in 15 ms.
+3. The client uploads the file directly from the browser/mobile app to AWS S3 via an HTTP `PUT` request.
+4. Once the upload finishes, the client sends a `POST /api/uploads/complete` request to save the file metadata in the database.
+5. **Result:** Your backend compute instances never touch a single byte of media payload!
+
+## Implementation
+
+### 1. Backend generating an S3 Presigned URL (Node.js):
+
+```typescript
+import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
+import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
+import { randomUUID } from 'crypto';
+
+const s3 = new S3Client({ region: process.env.AWS_REGION });
+
+export async function createPresignedUploadUrl(userId: string, filename: string, mimeType: string) {
+  // Validate allowed file types
+  const ALLOWED_TYPES = ['image/jpeg', 'image/png', 'video/mp4', 'application/pdf'];
+  if (!ALLOWED_TYPES.includes(mimeType)) {
+    throw new Error('Unsupported file type');
+  }
+
+  const fileKey = `uploads/${userId}/${randomUUID()}-${filename}`;
+
+  const command = new PutObjectCommand({
+    Bucket: process.env.AWS_S3_BUCKET,
+    Key: fileKey,
+    ContentType: mimeType,
+  });
+
+  // URL expires in 15 minutes
+  const uploadUrl = await getSignedUrl(s3, command, { expiresIn: 900 });
+
+  return { uploadUrl, fileKey };
+}
+```
+
+### 2. Frontend uploading directly to S3 (Browser JavaScript):
+
+```javascript
+async function uploadFile(file) {
+  // 1. Ask backend for presigned URL (10 ms)
+  const res = await fetch('/api/uploads/presign', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ filename: file.name, mimeType: file.type }),
+  });
+  const { uploadUrl, fileKey } = await res.json();
+
+  // 2. Upload file directly to S3 via HTTP PUT
+  // Zero load on your application backend!
+  const uploadRes = await fetch(uploadUrl, {
+    method: 'PUT',
+    headers: { 'Content-Type': file.type },
+    body: file, // Streams directly from disk/browser memory to S3
+  });
+
+  if (!uploadRes.ok) {
+    throw new Error('Upload to S3 failed');
+  }
+
+  // 3. Notify backend that upload succeeded
+  await fetch('/api/uploads/complete', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ fileKey }),
+  });
+
+  console.log('Upload complete! File key:', fileKey);
+}
+```
+
+## Verification
+
+1. **Zero backend memory movement:** Upload a 2 GB file while monitoring your Node.js container memory. Memory usage should remain completely flat (no spike whatsoever).
+2. **Network bypass confirmation:** Inspect the browser Network tab. The large binary payload must show its destination host as `*.s3.amazonaws.com`, not your application API domain.
+3. **S3 Bucket CORS configuration:** Verify your S3 bucket has CORS enabled for `PUT` requests from your frontend domain.
+
+## Why
+
+Cloud object storage systems (AWS S3, Google Cloud Storage, Cloudflare R2) are hyper-scalable static storage backends engineered specifically to handle millions of concurrent multi-gigabyte streams across global edge networks.
+
+Application servers are designed for fast compute, business rules, and low-latency database queries. Making application servers proxy large files wastes high-cost compute RAM on a task that object stores perform natively for pennies.
+
+## When Not To Use
+
+- **In-memory image transformation before upload:** If you must resize an avatar image before saving, small images (< 2 MB) can be processed on the server. Even then, resizing client-side in the browser or asynchronously using an AWS Lambda triggered by an S3 event is often superior.
+
+## Common Mistakes
+
+- **Forgetting S3 Bucket CORS rules.** Direct uploads will fail in the browser unless your S3 bucket permits `PUT` and `OPTIONS` from your web domain.
+- **Granting long expiration times.** Presigned URLs should expire quickly (e.g. 10–15 minutes) to prevent leaked URLs from being abused.
+- **Allowing arbitrary Content-Types.** Always validate the MIME type on the backend before signing the URL; otherwise, users could upload malicious executables or HTML files.

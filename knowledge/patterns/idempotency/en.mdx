@@ -1,0 +1,147 @@
+---
+title: "Idempotency"
+question: "How do I make an operation safe to repeat?"
+summary: "Give every write that might be repeated a key, record the result under that key in the same transaction as the work, and return the stored result on repeats. It is what makes retries, queues and double-clicks safe."
+tags: [idempotency, reliability, payments, api-design]
+related: [patterns/retry, problems/should-i-use-kafka, tradeoffs/sync-vs-async]
+order: 3
+updated: "2026-09-11"
+---
+
+## Context
+
+An operation is idempotent if doing it twice has the same effect as doing it once. Reads are naturally idempotent, and so is "set the status to shipped". "Charge the card", "send the email" and "add 1 to the balance" are not.
+
+In a distributed system, repeats are normal rather than exceptional. Clients retry after timeouts, queues deliver at least once, users double-click, mobile networks resend, and outbox relays republish after a crash. Every write that *can* be repeated eventually *will* be.
+
+## Symptoms
+
+- A customer is charged twice, or one checkout creates two orders.
+- Duplicate emails, SMS messages or push notifications after a deploy or an incident.
+- Counters, balances or stock levels that drift away from what the logs say.
+- Support tickets that begin with "I only clicked once".
+
+## Diagnose
+
+1. **List the writes that can be repeated:** anything behind a retry, a queue consumer, a webhook handler, or a form a user can submit twice.
+2. **For each one, ask what the second call does.** Walk through the real code, not the intended behavior.
+3. **Find the timeout cases.** Wherever a caller can time out while the work still completes, the caller can't know whether to retry. That is where duplicates come from.
+4. **Check external calls.** Does the payment or email provider accept an idempotency key? Most payment APIs do.
+5. **Look for natural keys.** Many operations already carry a unique business identifier: an order number, a webhook event ID, a message ID.
+
+## Options
+
+1. **Make the operation naturally idempotent:** replace "increment" with "set", use `INSERT … ON CONFLICT DO NOTHING` on a natural unique key, give endpoints `PUT` semantics.
+2. **Idempotency keys:** the client sends a unique key for each logical operation; the server stores the key with the result and returns that stored result for repeats.
+3. **Deduplicate in the consumer:** record processed message IDs and skip any already seen.
+4. **Accept duplicates and reconcile later:** a scheduled job finds and fixes them. Sometimes acceptable for data where a duplicate is harmless.
+
+## Trade-offs
+
+| Option | Guarantee | Cost | Good for |
+| :--- | :--- | :--- | :--- |
+| Natural idempotency | Strong, no extra storage | The operation may need redesigning | Status changes, upserts |
+| Idempotency keys | Strong, if stored in the same transaction as the work | A table, key expiry, client cooperation | Payments, order creation, public APIs |
+| Consumer deduplication | Strong per consumer | A processed-IDs table per consumer | Queue and webhook handlers |
+| Reconcile later | Eventually correct | Duplicates are visible for a while | Analytics, harmless notifications |
+
+The detail that decides correctness: **the key must be recorded in the same transaction as the effect.** Checking for the key, doing the work and then saving the key leaves a window in which two concurrent requests both pass the check.
+
+## Decision
+
+- Make operations **naturally idempotent** wherever the design allows.
+- For anything that moves money, creates orders or is exposed as a public API, **require an idempotency key** and store it under a unique constraint in the same transaction as the work.
+- In queue and webhook consumers, **deduplicate by message or event ID**, again inside the transaction.
+- Pass keys through to providers that support them, such as payment APIs.
+- Keep keys for longer than your longest retry window; 24 hours is common.
+
+## Implementation
+
+An idempotency key on an order-creation endpoint, in Node.js with Postgres. The unique constraint on `key` does the concurrency work:
+
+```sql
+CREATE TABLE idempotency_keys (
+  key          text        PRIMARY KEY,
+  request_hash text        NOT NULL,
+  response     jsonb,
+  created_at   timestamptz NOT NULL DEFAULT now()
+);
+```
+
+```ts
+import { createHash } from 'node:crypto';
+
+app.post('/orders', async (req, res) => {
+  const key = req.header('Idempotency-Key');
+  if (!key) return res.status(400).json({ error: 'Idempotency-Key header is required' });
+
+  const requestHash = createHash('sha256').update(JSON.stringify(req.body)).digest('hex');
+
+  const result = await db.transaction(async tx => {
+    // Claim the key. Only one of several concurrent requests can insert it.
+    const claimed = await tx.query(
+      `INSERT INTO idempotency_keys (key, request_hash) VALUES ($1, $2)
+       ON CONFLICT (key) DO NOTHING RETURNING key`,
+      [key, requestHash]
+    );
+
+    if (claimed.rowCount === 0) {
+      const { rows } = await tx.query(
+        'SELECT request_hash, response FROM idempotency_keys WHERE key = $1',
+        [key]
+      );
+      if (rows[0].request_hash !== requestHash) {
+        return { status: 422, body: { error: 'This key was used for a different request' } };
+      }
+      if (!rows[0].response) {
+        return { status: 409, body: { error: 'The original request is still in progress' } };
+      }
+      return { status: 200, body: rows[0].response };   // a repeat: return what we returned before
+    }
+
+    const order = await createOrder(tx, req.body);       // the real work, in the same transaction
+    await tx.query('UPDATE idempotency_keys SET response = $2 WHERE key = $1', [key, order]);
+    return { status: 201, body: order };
+  });
+
+  res.status(result.status).json(result.body);
+});
+```
+
+The client creates the key once per logical operation (for example, a UUID generated when the checkout form is shown) and sends the same key on every retry.
+
+Queue consumers use the same idea with the message ID:
+
+```sql
+INSERT INTO processed_messages (message_id) VALUES ($1) ON CONFLICT DO NOTHING;
+-- Zero rows inserted means this message was already handled: acknowledge it and skip.
+```
+
+Remove old keys with a scheduled `DELETE FROM idempotency_keys WHERE created_at < now() - interval '24 hours'`.
+
+## Verification
+
+- **Send the same request twice** with the same key, one after the other and concurrently: one order, two identical responses.
+- **Reuse a key with a different body:** the API rejects it.
+- **Kill the process mid-request**, after the work but before the response, then retry: still no duplicate.
+- **Replay a batch of queue messages** in staging: no duplicate effects.
+- **Count repeats.** A sudden rise points to a client that is retrying too aggressively.
+
+## Why
+
+A network can't tell you whether a request that timed out was processed. Exactly-once *delivery* is not something you can buy; exactly-once *effects* are something you build, by accepting at-least-once delivery and making processing idempotent. Idempotency turns "the retry might double-charge" into "the retry is always safe", and that is what makes retries, queues and failover usable in the first place.
+
+## When Not To Use
+
+- **Pure reads**, which are already idempotent.
+- **Operations that are naturally idempotent already**, such as setting a value or deleting by ID. A key table there adds overhead and no safety.
+- **Internal, low-stakes writes** where a rare duplicate is harmless and cheaper to tolerate than to prevent, such as a page-view counter.
+
+## Common Mistakes
+
+- **Check-then-act:** reading whether the key exists, doing the work, then writing the key. Concurrent requests both get through. Use a unique constraint.
+- **Storing the key outside the transaction** that does the work, so a crash leaves the key without the effect, or the effect without the key.
+- **Generating the key on the server**, or a new key for each retry. The client must reuse one key for one logical operation.
+- **Expiring keys before retries stop**, so a late retry becomes a duplicate.
+- **Ignoring the request body**, so a reused key silently returns the response to a different request.
+- **Forgetting side effects outside the database**, such as emails and third-party calls. Pass the key to the provider, or send them from an outbox after the commit.

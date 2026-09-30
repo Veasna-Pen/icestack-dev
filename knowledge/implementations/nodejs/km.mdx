@@ -1,0 +1,185 @@
+---
+title: "Node.js"
+question: "តើត្រូវអនុវត្ត Async Timeouts, pg Connection Pooling, Idempotency, និង Rate Limiting ក្នុង Node.js ដោយរបៀបណា?"
+summary: "Timeouts, retries, idempotency keys, caching, rate limiting និង background jobs នៅក្នុង Node.js និង TypeScript ជាកូដតូចៗដែលអ្នកអាចអានចប់ក្នុងពេលតែមួយ។"
+tags: [nodejs, typescript, express, implementation]
+related: [patterns/retry, patterns/idempotency, patterns/caching, patterns/rate-limiting]
+order: 1
+updated: "2026-09-11"
+translation: draft
+---
+
+ការអនុវត្ត Patterns ប្រកបដោយភាពធន់ក្នុង Node.js 22 និង TypeScript ជាមួយ Express 5។ ផ្តោតលើ Socket និង Fetch Timeouts, ការកំណត់ pg Connection Pool, Transactional Idempotency, និង Rate Limiting ក្នុង Memory។
+
+## Timeouts first
+
+រាល់ការហៅដែលចាកចេញពី process ត្រូវការ deadline មុននឹងត្រូវការ retry។ `AbortSignal.timeout` ដំណើរការជាមួយ `fetch` ដែលមានស្រាប់៖
+
+```ts
+const res = await fetch('https://api.example.com/rates', {
+  signal: AbortSignal.timeout(2000) // give up after 2 s instead of waiting forever
+});
+if (!res.ok) throw Object.assign(new Error(`HTTP ${res.status}`), { status: res.status });
+```
+
+សម្រាប់ Postgres កំណត់ timeouts នៅលើ pool ដើម្បីកុំឱ្យ query ដែលរត់មិនឈប់ កាន់កាប់ connection៖
+
+```ts
+import pg from 'pg';
+
+export const pool = new pg.Pool({
+  connectionString: process.env.DATABASE_URL,
+  max: 10,
+  statement_timeout: 5000,        // ms, enforced by Postgres
+  connectionTimeoutMillis: 2000   // how long to wait for a free connection
+});
+```
+
+## Retry with backoff
+
+Retry តែ failures បណ្តោះអាសន្ន ជាមួយ full jitter និង deadline សរុប។ ទំព័រ [Retry](../../patterns/retry) ពន្យល់ពីពេលណាដែលមិនគួរ retry។
+
+```ts
+const TRANSIENT = new Set([408, 429, 500, 502, 503, 504]);
+
+const isTransient = (err: any) =>
+  err?.name === 'TimeoutError' || err?.code === 'ECONNRESET' || TRANSIENT.has(err?.status);
+
+export async function withRetry<T>(fn: () => Promise<T>, attempts = 3, baseMs = 100, deadlineMs = 5000): Promise<T> {
+  const started = Date.now();
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      const elapsed = Date.now() - started;
+      if (attempt >= attempts || !isTransient(err) || elapsed >= deadlineMs) throw err;
+      const delay = Math.random() * Math.min(2000, baseMs * 2 ** (attempt - 1));
+      await new Promise(resolve => setTimeout(resolve, Math.min(delay, deadlineMs - elapsed)));
+    }
+  }
+}
+```
+
+## Idempotency keys
+
+Key ត្រូវបានកាន់កាប់នៅក្នុង transaction ដដែលជាមួយ order ហើយ primary key លើ `idempotency_keys.key` ធ្វើការងារទាក់ទងនឹង concurrency៖ request ទីពីរដែលមាន key ដដែល រង់ចាំឱ្យ request ទីមួយ commit រួចរកឃើញ response ដែលវាបានរក្សាទុក។ ហេតុផលពេញលេញមាននៅលើទំព័រ [Idempotency](../../patterns/idempotency)។
+
+```ts
+app.post('/orders', async (req, res) => {
+  const key = req.header('Idempotency-Key');
+  if (!key) return res.status(400).json({ error: 'Idempotency-Key header is required' });
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const claimed = await client.query(
+      'INSERT INTO idempotency_keys (key) VALUES ($1) ON CONFLICT DO NOTHING RETURNING key',
+      [key]
+    );
+
+    if (claimed.rowCount === 0) {
+      const { rows } = await client.query('SELECT response FROM idempotency_keys WHERE key = $1', [key]);
+      await client.query('ROLLBACK');
+      return rows[0]?.response
+        ? res.json(rows[0].response)
+        : res.status(409).json({ error: 'The original request is still in progress' });
+    }
+
+    const { rows } = await client.query(
+      'INSERT INTO orders (customer_id, total_cents) VALUES ($1, $2) RETURNING *',
+      [req.body.customerId, req.body.totalCents]
+    );
+    await client.query('UPDATE idempotency_keys SET response = $2 WHERE key = $1', [key, rows[0]]);
+    await client.query('COMMIT');
+    res.status(201).json(rows[0]);
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+});
+```
+
+## Caching
+
+សម្រាប់ server តែមួយ ឬទិន្នន័យដែលអាចខុសគ្នាបន្តិចបន្តួចរវាង servers LRU ក្នុង process ជាមួយ single-flight refill គឺគ្រប់គ្រាន់។ កំណែ Redis ដែលចែករំលែកមាននៅលើទំព័រ [Caching](../../patterns/caching)។
+
+```ts
+import { LRUCache } from 'lru-cache';
+
+type Product = { id: string; name: string; price_cents: number };
+
+const cache = new LRUCache<string, Product>({ max: 5000, ttl: 60_000 });
+const inflight = new Map<string, Promise<Product | null>>();
+
+export function getProduct(id: string): Promise<Product | null> {
+  const key = `product:${id}`;
+  const hit = cache.get(key);
+  if (hit) return Promise.resolve(hit);
+
+  let pending = inflight.get(key);
+  if (!pending) {
+    pending = pool
+      .query<Product>('SELECT id, name, price_cents FROM products WHERE id = $1', [id])
+      .then(result => {
+        const row = result.rows[0] ?? null;
+        if (row) cache.set(key, row);
+        return row;
+      })
+      .finally(() => inflight.delete(key));
+    inflight.set(key, pending);
+  }
+  return pending;
+}
+```
+
+## Rate limiting
+
+`express-rate-limit` ជាមួយ Redis store ផ្តល់ដែនកំណត់តែមួយដែលចែករំលែករវាង instances ទាំងអស់របស់ app៖
+
+```ts
+import { rateLimit } from 'express-rate-limit';
+import { RedisStore } from 'rate-limit-redis';
+import { createClient } from 'redis';
+
+const redisClient = createClient({ url: process.env.REDIS_URL });
+await redisClient.connect();
+
+app.set('trust proxy', 1); // behind one proxy: take the client address from X-Forwarded-For
+
+app.use('/api', rateLimit({
+  windowMs: 60_000,
+  limit: 100,
+  standardHeaders: 'draft-7', // RateLimit headers tell clients where they stand
+  legacyHeaders: false,
+  store: new RedisStore({ sendCommand: (...args: string[]) => redisClient.sendCommand(args) })
+}));
+```
+
+ការកំណត់នេះធ្វើតាម IP address។ ដើម្បីកំណត់តាម API key ឬអ្នកប្រើជំនួសវិញ សូមបញ្ជូន `keyGenerator`; ឯកសាររបស់ library ពន្យល់ពីរបៀបដោះស្រាយ IPv6 addresses ដោយសុវត្ថិភាពនៅពេលអ្នកធ្វើដូច្នោះ។
+
+## Background jobs
+
+BullMQ ផ្លាស់ការងារយឺតចេញពី request។ `jobId` ថេរមួយ ការពារកុំឱ្យ job ដដែលត្រូវបានដាក់ចូល queue ពីរដង ហើយ handler នៅតែត្រូវតែ idempotent ព្រោះ job អាចដំណើរការម្តងទៀតបន្ទាប់ពី worker គាំង៖
+
+```ts
+import { Queue, Worker } from 'bullmq';
+import IORedis from 'ioredis';
+
+const connection = new IORedis(process.env.REDIS_URL!, { maxRetriesPerRequest: null });
+export const emails = new Queue('emails', { connection });
+
+// In the request handler, after the order has committed:
+await emails.add('receipt', { orderId }, {
+  jobId: `receipt:${orderId}`,
+  attempts: 5,
+  backoff: { type: 'exponential', delay: 1000 },
+  removeOnComplete: 1000
+});
+
+// In a separate worker process:
+new Worker('emails', async job => {
+  await sendReceipt(job.data.orderId); // checks receipt_sent_at before sending
+}, { connection });
+```

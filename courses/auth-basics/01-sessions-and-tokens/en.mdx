@@ -1,0 +1,96 @@
+---
+title: "Sessions and tokens: how a server remembers you"
+summary: "Understand the two ways a server recognises a logged-in user, and pick one for your app."
+minutes: 12
+related: [tradeoffs/jwt-vs-session-tokens]
+updated: "2026-09-30"
+contributors: [Veasna-Pen]
+---
+
+## The problem
+
+HTTP forgets. Every request arrives on its own, and the server has no memory of the login a minute ago. Yet after signing in, the user expects every page to know who they are.
+
+Your team is building a web app with a React frontend and a Node API. One developer wants sessions; another says "everyone uses JWTs now". Which should you choose?
+
+## The idea
+
+After a successful login, the server gives the browser something to send back with every request. There are two main kinds:
+
+**A session ID.** The server creates a random ID, stores "session `a8f3…` belongs to user 42" in a database or Redis, and puts the ID in a cookie. On each request, it looks the ID up.
+
+**A token** (usually a **JWT**). The server writes the facts into the token itself, such as "user 42, expires at 15:00", and **signs** it. On each request, it checks the signature; no lookup is needed.
+
+| | Session ID | JWT |
+| --- | --- | --- |
+| Where the facts live | On the server | Inside the token |
+| Check on each request | A lookup in Redis or the database | Verify a signature |
+| Log out, revoke access | Delete the session: immediate | Hard: the token stays valid until it expires |
+| Good for | Websites with one backend | Many services, or APIs used by other systems |
+
+For a typical website with one backend, a **session in an `HttpOnly` cookie** is the simpler, safer default. JWTs make most sense when many independent services must check identity without sharing a session store.
+
+## Example
+
+A session login with `express-session`, stored in Redis:
+
+```ts
+app.use(
+  session({
+    store: new RedisStore({ client: redis }),
+    secret: process.env.SESSION_SECRET!,
+    cookie: { httpOnly: true, secure: true, sameSite: 'lax', maxAge: 7 * 24 * 3600 * 1000 },
+    resave: false,
+    saveUninitialized: false
+  })
+);
+
+app.post('/login', async (req, res) => {
+  const user = await checkPassword(req.body.email, req.body.password);
+  if (!user) return res.status(401).json({ error: 'Wrong email or password' });
+  req.session.regenerate(() => {
+    req.session.userId = user.id; // stored in Redis; the browser only gets a random ID
+    res.json({ ok: true });
+  });
+});
+```
+
+The cookie flags matter:
+
+- `httpOnly`: JavaScript on the page can't read the cookie, so a script injected by an attacker can't steal it.
+- `secure`: it is only sent over HTTPS.
+- `sameSite: 'lax'`: other websites can't make the browser send it with their requests to your forms and API.
+
+## Try it
+
+1. Log in to an app you use and open the browser's developer tools, Application → Cookies.
+2. Find the session cookie. Is it `HttpOnly`, `Secure`, and does it have `SameSite` set?
+3. In your own app, write down where the "who is logged in" information lives: a server session or a token.
+4. Answer: if a user's laptop is stolen, how quickly can you end their login?
+
+## Check yourself
+
+**1. What does the server store with a session, and with a JWT?**
+
+<Answer>
+With a session, the server stores the session data and the browser only holds a random ID. With a JWT, the server stores nothing per user; the data is inside the signed token.
+</Answer>
+
+**2. Why is `HttpOnly` important for a session cookie?**
+
+<Answer>
+It stops JavaScript from reading the cookie. If an attacker manages to run a script on your page, they still can't copy the session ID and use it elsewhere.
+</Answer>
+
+**3. A small team builds one website with one API. Sessions or JWTs?**
+
+<Answer>
+Sessions are usually the simpler choice: easy logout, no token expiry to manage, and a cookie the browser handles for you. JWTs solve problems, such as many independent services, that this app doesn't have.
+</Answer>
+
+## Key takeaways
+
+- HTTP is stateless; after login the browser sends a **session ID** or a **token** with each request.
+- **Sessions** keep the facts on the server: easy to revoke.
+- **JWTs** carry the facts inside a signed token: no lookup, but hard to revoke.
+- For one website and one backend, default to a **session in an `HttpOnly`, `Secure`, `SameSite` cookie**.

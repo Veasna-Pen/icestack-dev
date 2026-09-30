@@ -1,0 +1,174 @@
+---
+title: "Graceful Shutdown"
+question: "How do I deploy new code without dropping active user requests?"
+summary: "Intercept SIGTERM, stop accepting new connections, wait for load balancer deregistration, drain in-flight requests, and close database pools before terminating the process."
+tags: [reliability, deployment, kubernetes, containers, devops]
+related: [problems/running-out-of-connections, patterns/circuit-breaker, tradeoffs/monolith-vs-microservices]
+order: 7
+updated: "2026-09-12"
+contributors: [veasna]
+---
+
+## Context
+
+A production backend service deployed on Kubernetes, Docker Swarm, or AWS ECS with rolling updates. Deployments happen several times a day during normal business hours.
+
+When a new version is pushed, the container orchestrator terminates old container pods and starts new ones. Even though overall system availability is high, monitoring dashboards display brief bursts of HTTP 502 Bad Gateway and connection reset errors (`ECONNRESET`) during every single deployment.
+
+## Symptoms
+
+- Users intermittently see `502 Bad Gateway` or broken network connections while submitting orders during deployment windows.
+- Database logs report `FATAL: terminating connection due to administrator command` as database connections are abruptly severed mid-query.
+- Background jobs or file uploads get cut in half, leaving orphaned, corrupted files in object storage.
+- The team avoids daytime deployments and postpones releases to midnight out of fear of breaking user sessions.
+
+<Callout type="warning" title="Containers do not shut down gracefully by default">
+When Kubernetes terminates a pod, it sends a POSIX `SIGTERM` signal. If your application code does not explicitly catch `SIGTERM`, Node.js, Go, or Python will abort the process immediately, killing all in-flight HTTP requests and database transactions on the spot.
+</Callout>
+
+## Diagnose
+
+1. **Check process signal handlers:** Does your application have a listener for `process.on('SIGTERM')` (Node.js) or `signal.Notify` (Go)? If not, termination is hard and ungraceful.
+2. **Observe deployment error timing:** Trigger a rolling deploy while running a continuous HTTP load generator. If errors correlate precisely with the seconds old pods are deleted, shutdown handling is missing.
+3. **Inspect the ingress deregistration race condition:** When Kubernetes stops a pod, two things happen concurrently in parallel:
+   - The Endpoint controller removes the pod IP from the Service/Ingress endpoints.
+   - The Kubelet sends `SIGTERM` to the container.
+   Because IP removal across network proxies takes 2–5 seconds to propagate, the load balancer continues routing new HTTP requests to a pod that is already dying!
+
+## Options
+
+1. **Hard kill (`kill -9`).** Let the container die immediately. (Worst option: drops requests and corrupts transactions).
+2. **Standard SIGTERM listener with `server.close()`.** Stop accepting new connections and close existing connections. (Better, but still drops requests sent during the ingress propagation race).
+3. **Graceful Shutdown with Kubernetes `preStop` hook.** Combine a `preStop` delay (giving ingress controllers time to remove the pod from routing tables) with application connection draining.
+4. **Connection draining with hard deadline.** Give in-flight requests a budget (e.g. 15–30 seconds) to complete, force-closing any stuck requests before the orchestrator sends `SIGKILL`.
+
+## Trade-offs
+
+| Strategy | Request Dropping | Deploy Speed | Implementation Effort |
+| :--- | :--- | :--- | :--- |
+| **No Shutdown Handler** | Frequent 502s & resets | Fast (~100 ms) | Zero |
+| **`server.close()` only** | Occasional 502s (ingress race) | Fast | Low |
+| **`preStop` + Drain + DB pool closure** | **Zero dropped requests** | Adds 10–15s to deploy | Low (standard template) |
+| **Extended Drain (>60s)** | Zero dropped requests | Very slow deploys | Low |
+
+## Decision
+
+Implement the **4-step graceful shutdown lifecycle**:
+
+1. **Kubernetes `preStop` sleep (5–10 seconds):** Allow ingress controllers, AWS ALBs, and Service meshes to remove the pod IP from their routing tables before the app stops listening.
+2. **Stop accepting new connections:** Call `server.close()` so the operating system rejects new TCP connections while existing ones finish.
+3. **Drain in-flight requests:** Allow ongoing HTTP requests up to 25 seconds to finish their work cleanly.
+4. **Close database connection pools and exit:** Once in-flight requests reach zero, close database pools (`pool.end()`) and exit with code 0.
+
+## Implementation
+
+### 1. Robust Graceful Shutdown in Node.js / Express
+
+```typescript
+import http from 'http';
+import express from 'express';
+import { pool } from './db';
+
+const app = express();
+const server = http.createServer(app);
+
+// Track active connections to enable keep-alive closing
+const activeConnections = new Set<any>();
+
+server.on('connection', (socket) => {
+  activeConnections.add(socket);
+  socket.on('close', () => activeConnections.delete(socket));
+});
+
+let isShuttingDown = false;
+
+// Health check endpoint fails immediately during shutdown
+app.get('/healthz/ready', (req, res) => {
+  if (isShuttingDown) {
+    return res.status(503).send('SHUTTING_DOWN');
+  }
+  res.status(200).send('OK');
+});
+
+function setupGracefulShutdown() {
+  const shutdown = async (signal: string) => {
+    if (isShuttingDown) return;
+    isShuttingDown = true;
+    console.log(`Received ${signal}. Starting graceful shutdown...`);
+
+    // 1. Stop accepting new HTTP requests
+    server.close(async () => {
+      console.log('HTTP server closed. In-flight requests drained.');
+
+      try {
+        // 2. Cleanly close database connection pools
+        console.log('Closing database connection pools...');
+        await pool.end();
+        console.log('Database connections closed cleanly.');
+        process.exit(0);
+      } catch (err) {
+        console.error('Error during teardown:', err);
+        process.exit(1);
+      }
+    });
+
+    // 3. Forcibly terminate hung connections after a hard 25-second deadline
+    setTimeout(() => {
+      console.error('Graceful shutdown timeout expired. Forcing process exit.');
+      for (const socket of activeConnections) {
+        socket.destroy();
+      }
+      process.exit(1);
+    }, 25000).unref();
+  };
+
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
+}
+
+setupGracefulShutdown();
+```
+
+### 2. Kubernetes Pod Lifecycle Configuration
+
+In your Kubernetes Deployment YAML, add a `preStop` hook to fix the ingress race condition:
+
+```yaml
+spec:
+  containers:
+    - name: api
+      image: my-api:v2
+      lifecycle:
+        preStop:
+          exec:
+            # Wait 7 seconds before SIGTERM to let Ingress route traffic away
+            command: ["/bin/sh", "-c", "sleep 7"]
+      # Allow total grace period of 35 seconds (7s preStop + 25s drain + buffer)
+      terminationGracePeriodSeconds: 35
+```
+
+## Verification
+
+1. **Continuous deployment load test:** Run a load test with 200 concurrent users (`autocannon -c 200 -d 60s http://my-service.internal/api/orders`).
+2. **Trigger deployment:** While the load test is running, execute a rolling update:
+   ```bash
+   kubectl rollout restart deployment api
+   ```
+3. **Confirm zero errors:** The load test results must show **100% 2xx responses** and **0 socket errors / 502s**.
+4. **Verify database logs:** Postgres logs should show clean disconnections (`LOG: disconnection: session time...`) without any `terminating connection due to administrator command`.
+
+## Why
+
+Operating systems do not magically know what state an application holds. When an OS process receives `SIGTERM`, its default behavior is immediate death.
+
+Furthermore, distributed orchestrators like Kubernetes run decentralized control planes. The routing proxy (kube-proxy, Envoy, Nginx) updates asynchronously from the node agent (kubelet). Inserting a brief delay (`preStop`) ensures the routing mesh converges before the container stops servicing sockets.
+
+## When Not To Use
+
+- **Stateless worker consumers:** A queue worker (pulling from SQS or RabbitMQ) does not receive inbound HTTP traffic from load balancers. It does not need a `preStop` sleep; it only needs to pause message consumption and finish in-flight jobs.
+
+## Common Mistakes
+
+- **Container entrypoint running as shell without signal forwarding.** Running `CMD npm start` or `CMD ["sh", "-c", "node index.js"]` makes the shell PID 1. Standard shells do not forward `SIGTERM` to child processes! Always execute the binary directly: `CMD ["node", "dist/index.js"]`.
+- **Database pool closed before HTTP server.** If you close the database pool before draining HTTP requests, in-flight requests will immediately throw `Error: pool is closed`.
+- **`terminationGracePeriodSeconds` shorter than application drain timeout.** If Kubernetes defaults to 30 seconds but your app drain timeout is 45 seconds, Kubernetes will abruptly send `SIGKILL` after 30 seconds.

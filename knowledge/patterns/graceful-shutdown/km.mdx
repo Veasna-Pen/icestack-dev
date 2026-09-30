@@ -1,0 +1,175 @@
+---
+title: "Graceful Shutdown"
+question: "តើខ្ញុំអាច deploy កូដថ្មីដោយរបៀបណាដោយមិនឱ្យធ្លាក់ ឬដាច់ request របស់អ្នកប្រើប្រាស់?"
+summary: "ស្ទាក់ចាប់សញ្ញា SIGTERM, បញ្ឈប់ការទទួល connection ថ្មីៗ, រង់ចាំឱ្យ load balancer ដក IP ចេញពី routing, បញ្ចប់ request ដែលកំពុងដំណើរការឱ្យរួចរាល់, និងបិទ database connection pool មុនពេលបិទ process។"
+tags: [reliability, deployment, kubernetes, containers, devops]
+related: [problems/running-out-of-connections, patterns/circuit-breaker, tradeoffs/monolith-vs-microservices]
+order: 7
+updated: "2026-09-12"
+contributors: [veasna]
+translation: draft
+---
+
+## Context
+
+សេវាកម្ម backend មួយដំណើរការលើ Kubernetes, Docker Swarm ឬ AWS ECS ជាមួយ rolling updates។ ការ deploy កូដថ្មីកើតឡើងច្រើនដងក្នុងមួយថ្ងៃអំឡុងពេលម៉ោងធ្វើការធម្មតា។
+
+នៅពេលមានកំណែ (version) ថ្មីត្រូវបាន deploy ប្រព័ន្ធ container orchestrator នឹងបិទ container ចាស់ៗ ហើយចាប់ផ្តើមបើក container ថ្មីៗជំនួសវិញ។ ទោះបីជាប្រព័ន្ធទាំងមូលនៅតែដំណើរការក៏ដោយ ផ្ទាំង monitoring បង្ហាញការកើនឡើងនូវកំហុស HTTP 502 Bad Gateway និង connection reset (`ECONNRESET`) រាល់ពេល deploy ម្តងៗ។
+
+## Symptoms
+
+- អ្នកប្រើប្រាស់ជួបប្រទះបញ្ហា `502 Bad Gateway` ឬដាច់បណ្តាញ អំឡុងពេលកំពុងចុចទិញទំនិញ ឬផ្ញើទិន្នន័យពេល deploy កូដថ្មី។
+- Database logs បង្ហាញសារ `FATAL: terminating connection due to administrator command` ដោយសារតែ database connection ត្រូវបានកាត់ផ្តាច់ភ្លាមៗនៅកណ្តាលទីពេល query កំពុងដើរ។
+- Background jobs ឬការ upload ឯកសារត្រូវកាត់ផ្តាច់ពាក់កណ្តាលទី ដែលបន្សល់ទុកឯកសារខូច (corrupted files) ក្នុង cloud storage។
+- ក្រុមការងារលែងហ៊ាន deploy កូដពេលថ្ងៃ ហើយពន្យារពេលទៅ deploy នៅពាក់កណ្តាលអធ្រាត្រវិញ ដោយសារខ្លាចប៉ះពាល់ដល់អ្នកប្រើប្រាស់។
+
+<Callout type="warning" title="Container មិនចេះបិទដោយរលូន (graceful) តាមលំនាំដើមឡើយ">
+នៅពេល Kubernetes ចង់បិទ pod វានឹងបញ្ជូន POSIX `SIGTERM` signal ទៅកាន់ container។ ប្រសិនបើកូដរបស់អ្នកមិនបានសរសេរដើម្បីស្ទាក់ចាប់ `SIGTERM` ទេនោះ Node.js, Go ឬ Python នឹងបិទ process ភ្លាមៗក្នុងមួយប៉ព្រិចភ្នែក ដែលកាត់ផ្តាច់រាល់ HTTP requests និង database transactions ទាំងអស់ភ្លាមៗ។
+</Callout>
+
+## Diagnose
+
+1. **ពិនិត្យមើល Process Signal Handlers ក្នុងកូដ៖** តើកម្មវិធីរបស់អ្នកមាន `process.on('SIGTERM')` (Node.js) ឬ `signal.Notify` (Go) ដែរឬទេ? បើគ្មានទេ ការបិទ container គឺមានលក្ខណៈបង្ខិតបង្ខំ (hard kill)។
+2. **ពិនិត្យមើលពេលវេលានៃការកើតមាន Error ពេល Deploy៖** ដំណើរការ load test ស្របពេលកំពុងធ្វើ rolling deploy។ ប្រសិនបើកំហុស 502 កើតឡើងចំពេលវិនាទីដែល pod ចាស់ៗត្រូវលុប នោះមានន័យថាកម្មវិធីខ្វះ graceful shutdown handling។
+3. **ពិនិត្យមើល Ingress Deregistration Race Condition៖** នៅពេល Kubernetes បញ្ឈប់ pod មួយ មានរឿងពីរបានកើតឡើងដំណាលគ្នា៖
+   - Endpoint controller ចាប់ផ្តើមដក IP របស់ pod ចេញពី Service/Ingress endpoints។
+   - Kubelet បញ្ជូនសញ្ញា `SIGTERM` ទៅកាន់ container ភ្លាមៗ។
+   ដោយសារការដក IP ចេញពី routing table លើ network proxy ត្រូវស៊ីពេលពី ២ ទៅ ៥ វិនាទី នោះ load balancer នឹងនៅតែបន្តបញ្ជូន request ថ្មីៗទៅកាន់ pod ដែលកំពុងតែស្លាប់នោះដដែល!
+
+## Options
+
+1. **Hard Kill (`kill -9`)។** ទុកឱ្យ container ស្លាប់ភ្លាមៗ។ (ជាជម្រើសអាក្រក់បំផុត៖ កាត់ផ្តាច់ request និងធ្វើឱ្យខូចទិន្នន័យ)។
+2. **ប្រើ SIGTERM Listener ធម្មតាជាមួយ `server.close()`។** ឈប់ទទួល connection ថ្មីៗ និងបិទ connection ដែលមានស្រាប់។ (ល្អជាងមុន ប៉ុន្តែនៅតែដាច់ request ដែល load balancer បញ្ជូនមកអំឡុងពេល race condition)។
+3. **Graceful Shutdown រួមជាមួយ Kubernetes `preStop` hook។** ពន្យារពេលបន្តិចតាម `preStop` (ដើម្បីទុកពេលឱ្យ load balancer ដក IP ចេញពី routing) រួមជាមួយការ drain requests ចាស់ៗឱ្យចប់សព្វគ្រប់។
+4. **Connection Draining ជាមួយ Hard Deadline។** ទុកពេលឱ្យ request ដែលកំពុងដំណើរការ (ឧ. ១៥–៣០ វិនាទី) ដើម្បីបញ្ចប់ការងារ ហើយបង្ខំបិទចោលប្រសិនបើជាប់គាំងយូរជ្រុលមុនពេល orchestrator បញ្ជូន `SIGKILL`។
+
+## Trade-offs
+
+| យុទ្ធសាស្ត្រ | ការបាត់បង់ Request | ល្បឿន Deploy | កម្លាំងអនុវត្ត |
+| :--- | :--- | :--- | :--- |
+| **គ្មាន Shutdown Handler** | ជួប 502s និង resets ញឹកញាប់ | លឿន (~100 ms) | គ្មាន |
+| **ប្រើត្រឹម `server.close()`** | ជួប 502s ម្តងម្កាល (ingress race) | លឿន | ទាប |
+| **`preStop` + Drain + DB pool close** | **គ្មានការបាត់បង់ Request សូម្បីតែមួយ** | បន្ថែម ១០–១៥ វិនាទីលើ deploy | ទាប (ប្រើ template ស្តង់ដារ) |
+| **ពន្យារពេលយូរជ្រុល (>60s)** | គ្មានការបាត់បង់ Request | Deploy យឺតខ្លាំង | ទាប |
+
+## Decision
+
+អនុវត្តតាម **វដ្តជីវិត Graceful Shutdown ៤ ជំហាន (4-Step Lifecycle)**៖
+
+1. **Kubernetes `preStop` sleep (៥ ទៅ ១០ វិនាទី)៖** ទុកពេលឱ្យ Ingress controllers, AWS ALBs និង Service Mesh ដក IP របស់ pod ចេញពី routing tables មុនពេល app ឈប់ស្តាប់ port។
+2. **ឈប់ទទួល Connection ថ្មីៗ៖** ហៅ `server.close()` ដើម្បីឱ្យ OS បដិសេធ TCP connection ថ្មីៗ ខណៈ connection ចាស់ៗនៅតែបន្តដំណើរការ។
+3. **Drain Requests ដែលកំពុងដំណើរការ៖** ទុកពេលឱ្យ HTTP requests ដែលកំពុងដំណើរការរហូតដល់ ២៥ វិនាទីដើម្បីបញ្ចប់កិច្ចការរបស់ពួកគេ។
+4. **បិទ Database Connection Pools និងចាកចេញ៖** នៅពេល request ទាំងអស់បញ្ចប់អស់ហើយ ទើបបិទ database pool (`pool.end()`) រួច exit process ជាមួយ code 0។
+
+## Implementation
+
+### 1. កូដ Graceful Shutdown ក្នុង Node.js / Express
+
+```typescript
+import http from 'http';
+import express from 'express';
+import { pool } from './db';
+
+const app = express();
+const server = http.createServer(app);
+
+// តាមដាន active connections ដើម្បីបិទ keep-alive sockets ពេលចប់
+const activeConnections = new Set<any>();
+
+server.on('connection', (socket) => {
+  activeConnections.add(socket);
+  socket.on('close', () => activeConnections.delete(socket));
+});
+
+let isShuttingDown = false;
+
+// Health check endpoint នឹង fail ភ្លាមៗពេលកំពុង shutdown
+app.get('/healthz/ready', (req, res) => {
+  if (isShuttingDown) {
+    return res.status(503).send('SHUTTING_DOWN');
+  }
+  res.status(200).send('OK');
+});
+
+function setupGracefulShutdown() {
+  const shutdown = async (signal: string) => {
+    if (isShuttingDown) return;
+    isShuttingDown = true;
+    console.log(`ទទួលបានសញ្ញា ${signal}។ កំពុងចាប់ផ្តើម graceful shutdown...`);
+
+    // 1. បញ្ឈប់ការទទួល HTTP requests ថ្មីៗ
+    server.close(async () => {
+      console.log('HTTP server បានបិទ។ រាល់ in-flight requests ត្រូវបាន drain ចប់សព្វគ្រប់។');
+
+      try {
+        // 2. បិទ database connection pool ដោយសុវត្ថិភាព
+        console.log('កំពុងបិទ database connection pool...');
+        await pool.end();
+        console.log('Database connections ត្រូវបានបិទដោយជោគជ័យ។');
+        process.exit(0);
+      } catch (err) {
+        console.error('មានបញ្ហាក្នុងពេល teardown:', err);
+        process.exit(1);
+      }
+    });
+
+    // 3. បង្ខំបិទចោលប្រសិនបើជាប់គាំងលើសពី ២៥ វិនាទី
+    setTimeout(() => {
+      console.error('Graceful shutdown ផុតកំណត់ពេលកំណត់។ បង្ខំបិទ process ភ្លាមៗ។');
+      for (const socket of activeConnections) {
+        socket.destroy();
+      }
+      process.exit(1);
+    }, 25000).unref();
+  };
+
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
+}
+
+setupGracefulShutdown();
+```
+
+### 2. ការកំណត់រចនាសម្ព័ន្ធ Kubernetes Pod Lifecycle
+
+នៅក្នុង Kubernetes Deployment YAML បន្ថែម `preStop` hook ដើម្បីដោះស្រាយបញ្ហា ingress race condition៖
+
+```yaml
+spec:
+  containers:
+    - name: api
+      image: my-api:v2
+      lifecycle:
+        preStop:
+          exec:
+            # រង់ចាំ ៧ វិនាទីមុនពេល SIGTERM ដើម្បីឱ្យ Ingress ដក IP ចេញពី routing
+            command: ["/bin/sh", "-c", "sleep 7"]
+      # អនុញ្ញាតរយៈពេល grace period សរុប ៣៥ វិនាទី (7s preStop + 25s drain + buffer)
+      terminationGracePeriodSeconds: 35
+```
+
+## Verification
+
+1. **Continuous Deployment Load Test៖** ដំណើរការ load test ជាមួយ 200 concurrent users (`autocannon -c 200 -d 60s http://my-service.internal/api/orders`)។
+2. **ដំណើរការ Deployment៖** ខណៈពេល load test កំពុងដើរ ចាប់ផ្តើមធ្វើ rolling update៖
+   ```bash
+   kubectl rollout restart deployment api
+   ```
+3. **ផ្ទៀងផ្ទាត់ថាមិនមាន Error៖** លទ្ធផលនៃ load test ត្រូវតែបង្ហាញ **100% 2xx responses** និង **0 socket errors / 502s**។
+4. **ពិនិត្យ Database Logs៖** Postgres logs គួរតែបង្ហាញការផ្តាច់ connection ធម្មតា (`LOG: disconnection: session time...`) ដោយគ្មានសារ `terminating connection due to administrator command` ឡើយ។
+
+## Why
+
+Operating systems មិនអាចដឹងដោយអព្ភូតហេតុថាតើកម្មវិធីរបស់អ្នកកំពុងកាន់កាប់ទិន្នន័យអ្វីនោះទេ។ នៅពេល process ទទួល `SIGTERM` ប្រតិកម្មលំនាំដើមរបស់វាគឺស្លាប់ភ្លាមៗ។
+
+លើសពីនេះទៅទៀត ប្រព័ន្ធ distributed ដូចជា Kubernetes ដំណើរការ control plane ដាច់ដោយឡែកពីគ្នា។ Routing proxy (kube-proxy, Envoy, Nginx) ធ្វើបច្ចុប្បន្នភាព asynchronously ពី node agent (kubelet)។ ការដាក់ការពន្យារពេលខ្លីមួយ (`preStop`) ជួយធានាថាបណ្តាញ routing បានផ្តាច់ចរាចរណ៍រួចរាល់ មុនពេល container ពិតប្រាកដឈប់ដំណើរការ។
+
+## When Not To Use
+
+- **Stateless Queue Worker Consumers៖** Queue worker (ដែលទាញយកទិន្នន័យពី SQS ឬ RabbitMQ) មិនទទួល HTTP traffic ពី load balancer ឡើយ។ ដូច្នេះវាមិនត្រូវការ `preStop` sleep ទេ; វាគ្រាន់តែត្រូវការផ្អាកការទាញយកសារ និងបញ្ចប់ការងារដែលកំពុងដំណើរការជាការស្រេច។
+
+## Common Mistakes
+
+- **ដំណើរការ Entrypoint តាមរយៈ Shell ដោយមិនបញ្ជូនបន្ត Signal។** ការប្រើ `CMD npm start` ឬ `CMD ["sh", "-c", "node index.js"]` ធ្វើឱ្យ shell ក្លាយជា PID 1។ Shell ធម្មតាមិនបញ្ជូនបន្ត `SIGTERM` ទៅកាន់ child processes ឡើយ! ត្រូវដំណើរការ binary ដោយផ្ទាល់៖ `CMD ["node", "dist/index.js"]`។
+- **បិទ Database Pool មុនពេលបិទ HTTP Server។** ប្រសិនបើអ្នកបិទ database pool មុនពេល drain HTTP request នោះ request ដែលកំពុងដំណើរការនឹងជួប error `Error: pool is closed` ភ្លាមៗ។
+- **កំណត់ `terminationGracePeriodSeconds` ខ្លីជាង Drain Timeout របស់ App។** បើ Kubernetes កំណត់ 30 វិនាទី ប៉ុន្តែ app drain ត្រូវការ 45 វិនាទី នោះ Kubernetes នឹងបញ្ជូន `SIGKILL` បង្ខំកាត់ផ្តាច់នៅវិនាទីទី 30 ជាមិនខាន។

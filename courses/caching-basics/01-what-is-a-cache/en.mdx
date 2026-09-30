@@ -1,0 +1,78 @@
+---
+title: "What a cache is, and when you need one"
+summary: "Tell the difference between data that is worth caching and data that is not, before you write any code."
+minutes: 10
+related: [problems/should-i-use-redis, problems/database-is-slow]
+updated: "2026-09-29"
+contributors: [Veasna-Pen]
+---
+
+## The problem
+
+Your online shop's product page takes **900 ms** to load. The database shows the same query, "get product 42 with its price and stock", running **3,000 times a minute**, and CPU sits at 85%. A teammate says: "Just add Redis."
+
+Before you add anything, you need to answer one question: **is this data worth caching?**
+
+## The idea
+
+A **cache** is a copy of data kept somewhere faster to read than the original. Reading from memory takes about 1 ms; a database query over the network often takes 20 to 200 ms.
+
+A copy is only useful when three things are true:
+
+| Question | Good sign for caching |
+| --- | --- |
+| Is it read often? | The same data is read many times between changes |
+| Is it expensive to get? | The query is slow, or the database is busy |
+| Is a slightly old copy acceptable? | Showing data a few seconds or minutes old is fine |
+
+The key number is the **hit rate**: the share of reads the cache can answer without going to the database. A cache with a 95% hit rate removes 95% of those reads. A cache with a 10% hit rate mostly adds a network hop and a new thing that can break.
+
+<Tip title="The cheapest fix is often not a cache">
+If one query is slow because it is missing an index, fix the query first. A cache hides a slow query; it does not repair it.
+</Tip>
+
+## Example
+
+Look at three kinds of data on the same shop:
+
+1. **Product details** (name, description, images): read on every page view, changed a few times a week. Read-heavy, rarely changes, a minute-old copy is fine. **Cache it.**
+2. **Stock count**: read often, but changes with every order. Showing "5 left" when there are 0 causes failed checkouts. **Cache only very briefly, or not at all.**
+3. **A user's order history**: each user reads only their own, a few times a month. Low reuse means a low hit rate. **Do not cache.**
+
+Now do the arithmetic for product details. 3,000 reads a minute, and the product changes about once a day. If you cache each product for 60 seconds, each product is loaded from the database at most once a minute. For a popular product, that turns 3,000 queries into **1**.
+
+## Try it
+
+Pick one endpoint in a project you know.
+
+1. Count how often it is called (logs, APM, or a quick counter).
+2. Find out how often the underlying data changes.
+3. Ask the product owner, or yourself: "Would a 60-second-old answer be a problem here?"
+4. Write down your decision in one sentence: "Cache for N seconds, because…" or "Don't cache, because…".
+
+## Check yourself
+
+**1. An endpoint returns the current exchange rate, which your provider updates every 10 minutes. It is called 50 times a second. Is it a good candidate?**
+
+<Answer>
+Yes. It is read far more often than it changes, and the source itself only updates every 10 minutes, so a cached copy of up to a few minutes is as correct as the source.
+</Answer>
+
+**2. A report query takes 8 seconds, but each report is opened once, by one person. Will a cache help?**
+
+<Answer>
+Not much. With almost no repeat reads the hit rate is close to zero, so almost every request still pays the 8 seconds. Make the query faster, or generate the report in the background instead.
+</Answer>
+
+**3. What is the first thing to check before caching a slow query?**
+
+<Answer>
+Why it is slow, for example with `EXPLAIN ANALYZE`. A missing index or an N+1 pattern is cheaper and safer to fix than to hide behind a cache.
+</Answer>
+
+## Key takeaways
+
+- A cache is a faster copy. It pays off when data is **read often, costly to fetch, and fine slightly old**.
+- Estimate the **hit rate** before you build: low reuse means the cache adds cost, not speed.
+- Fix a slow query first; cache what is still hot after that.
+- Data that must be exact right now, like stock or balances, needs a very short lifetime or no cache.

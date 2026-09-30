@@ -1,0 +1,163 @@
+---
+title: "Edge Computing vs Centralized Cloud"
+question: "When should application logic execute at CDN edge locations versus a centralized cloud region?"
+summary: "Edge computing (Cloudflare Workers, Fastly Compute, Vercel Edge) executes code in 300+ global points of presence in sub-5ms, ideal for geolocation routing, auth gatekeeping, and personalization. Centralized cloud (AWS us-east-1 VPC) hosts heavy relational databases, long-running batch compute, and complex business logic close to data stores."
+tags: [architecture, cloud, edge, cdn, networking, serverless]
+related: [tradeoffs/serverless-vs-containers, patterns/api-gateway, tradeoffs/client-side-vs-server-side-rendering]
+order: 20
+updated: "2026-09-12"
+contributors: [veasna]
+---
+
+## Context
+
+Traditionally, web architectures were centralized: all application servers, background queues, and databases were deployed in a single cloud region (such as AWS `us-east-1` in Virginia). Users in London or Singapore had to send packets across physical undersea fiber cables, incurring 150 to 250 milliseconds of unavoidable round-trip network latency on every request.
+
+With modern **Edge Computing** platforms (Cloudflare Workers, Fastly Compute, Vercel Edge Functions, AWS Lambda@Edge), lightweight compute runtimes (often V8 isolates or WebAssembly) execute directly inside 300+ CDN data centers worldwide, physically located within 10–50 ms of 95% of the world's population.
+
+However, moving logic to the edge creates a severe architectural paradox: if your edge function in Sydney must query a centralized PostgreSQL database in Virginia, you have not eliminated network latency—you have simply shifted the 200 ms delay from the user-to-server hop to the server-to-database hop.
+
+## Symptoms
+
+- **Centralized Cloud Pitfall:** Global users experience sluggish page transitions and slow API responses (300+ ms) even for static or cached content because every request must travel across the ocean to a single cloud region.
+- **Edge Architecture Pitfall:** Developers deploy an edge function expecting 10 ms responses, but the edge function executes 5 sequential SQL queries back to `us-east-1`, ballooning total response time to over 1,200 ms due to repeated cross-continent round trips.
+
+<Callout type="warning" title="Compute without local data creates the 'Edge Latency Paradox'">
+Running compute close to the user is useless if that compute must immediately reach across the globe to fetch data. Move logic to the edge only if the data is already at the edge (cached/KV) or if the operation requires zero database access.
+</Callout>
+
+## Diagnose
+
+1. **Map user geography:** Where do your users physically reside? Are 90% of your users in North America (where centralized deployment is fine), or are they globally distributed across Europe, Asia, and the Americas?
+2. **Audit database query dependency:** Does the target route require talking to a centralized transactional relational database (PostgreSQL/MySQL)?
+3. **Assess runtime compatibility:** Does your code rely on Node.js native binary C++ modules, TCP socket listeners, or heavy libraries that cannot run on edge V8 isolates?
+4. **Measure payload size and execution time:** Does the operation run in under 30 ms, or is it a heavy 5-second image processing task?
+
+## Options
+
+1. **Centralized Cloud Region (AWS / GCP / Azure):** All compute and data live in a single VPC. (Simple mental model, zero distributed data sync issues, high cross-continent user latency).
+2. **Edge Computing (Cloudflare Workers / Fastly):** Serverless V8 isolates at 300+ points of presence. Sub-5ms startup, edge key-value stores, automatic global routing.
+3. **Multi-Region Centralized Cloud:** Duplicate the application stack across 3 major regions (e.g. US, EU, APAC) with cross-region read replicas.
+4. **Hybrid Edge-Gateway Architecture (Recommended):** Edge handles SSL termination, bot blocking, geolocation routing, A/B testing, and cached reads; the Centralized Cloud handles writes and transactional business logic.
+
+## Trade-offs
+
+| Dimension | Edge Computing | Centralized Cloud Region |
+| :--- | :--- | :--- |
+| **Physical Proximity to User** | **Ultra-close (10–30 ms globally)** | Far (150–250 ms cross-continent) |
+| **Cold Start Latency** | **Sub-5 ms (V8 Isolate)** | 500–3,000 ms (Docker/VM cold start) |
+| **Relational Database Access** | Extremely poor (high network lag to DB) | **Ultra-fast (< 1 ms VPC private link)** |
+| **Runtime Capabilities** | Limited (V8, WASM, strict CPU limits) | **Full (Docker, Linux, any binary)** |
+| **Cost at Scale** | Cheap per request, expensive for heavy CPU | Cost-effective for sustained heavy compute |
+| **Data Synchronization** | Eventual consistency (Edge KV/D1) | **Strong ACID consistency (Single DB)** |
+
+## Decision
+
+- **Deploy to the Edge for:**
+  - Dynamic request routing and A/B testing (inspecting cookies/headers and proxying to origin).
+  - Geolocation detection and language redirection (e.g. routing `/fr` vs `/de` based on IP header).
+  - Authentication token verification (stateless JWT signature checks in 0 ms at the edge before traffic hits origin).
+  - Static HTML rendering with edge-cached personalization (storing user session state in fast Edge KV).
+  - Bot protection, DDoS mitigation, and rate limiting (rejecting malicious requests at the edge).
+- **Keep in Centralized Cloud for:**
+  - High-volume transactional database writes (checkout, inventory decrement, financial ledger).
+  - Complex domain logic requiring multi-table SQL joins and ACID transactions.
+  - Heavy compute jobs: video transcoding, PDF generation, machine learning inference, and report aggregation.
+  - Long-running background workers, WebSockets, and queue consumers.
+
+## Implementation
+
+### 1. Edge Worker: Geolocation Routing & JWT Gatekeeper (Cloudflare Worker):
+
+```typescript
+// Cloudflare Worker running at 300+ edge PoPs in < 5ms
+export default {
+  async fetch(request: Request, env: any): Promise<Response> {
+    const url = new URL(request.url);
+
+    // 1. Edge Geolocation: Determine country in 0 ms from incoming TCP connection
+    const country = request.headers.get('cf-ipcountry') || 'US';
+
+    // 2. Edge Bot / Security Gatekeeper
+    const authHeader = request.headers.get('Authorization');
+    if (url.pathname.startsWith('/api/secure/')) {
+      if (!authHeader?.startsWith('Bearer ')) {
+        return new Response(JSON.stringify({ error: 'Unauthorized at Edge' }), {
+          status: 401,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+    }
+
+    // 3. Edge Personalization: Rewrite language path
+    if (url.pathname === '/') {
+      if (country === 'FR') return Response.redirect(`${url.origin}/fr`, 302);
+      if (country === 'DE') return Response.redirect(`${url.origin}/de`, 302);
+    }
+
+    // 4. Pass clean, authenticated traffic to origin in Centralized Cloud
+    const modifiedRequest = new Request(request, {
+      headers: {
+        ...Object.fromEntries(request.headers),
+        'x-user-country': country,
+      },
+    });
+
+    return await fetch(modifiedRequest);
+  },
+};
+```
+
+### 2. Centralized Cloud API: Transactional Business Logic in AWS us-east-1:
+
+```typescript
+import express from 'express';
+import { Pool } from 'pg';
+
+const app = express();
+// Ultra-low latency (< 0.5 ms) private VPC database connection
+const db = new Pool({ connectionString: process.env.DATABASE_URL });
+
+app.post('/api/secure/checkout', async (req, res) => {
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+    // Multi-table transactional write requiring strict ACID locks
+    await client.query('UPDATE accounts SET balance = balance - $1 WHERE id = $2', [100, req.body.userId]);
+    await client.query('INSERT INTO orders (user_id, amount) VALUES ($1, $2)', [req.body.userId, 100]);
+    await client.query('COMMIT');
+
+    return res.json({ success: true });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    return res.status(500).json({ error: (err as Error).message });
+  } finally {
+    client.release();
+  }
+});
+```
+
+## Verification
+
+1. **Edge latency benchmark:** Ping your edge endpoint from 10 global cities (Tokyo, London, Sydney, New York). Verify that time-to-first-byte (TTFB) for cached routes is **< 30 ms** globally.
+2. **Origin offload audit:** Check your origin server analytics. Verify that bot attacks, static redirects, and unauthenticated requests are stopped at the edge, reducing origin load by 40–60%.
+3. **Cross-continent hop test:** Ensure no edge worker is making sequential database queries across oceans. Total edge execution time should remain under 15 ms.
+
+## Why
+
+Physics dictates that signals cannot travel faster than light. A packet takes roughly 150 ms to travel between Singapore and Virginia and back.
+- If you run everything in a **Centralized Cloud**, you pay a latency penalty to remote users on every click.
+- If you attempt to run your **Entire Database at the Edge**, you run into the nightmare of distributed consensus and replication lag.
+
+The modern consensus is a **Hybrid Architecture**: execute edge compute for inspection, security, routing, and caching right next to the user's thumb, while executing core transactional state inside a centralized, highly optimized cloud region.
+
+## When Not To Use
+
+- **Edge for heavy computational tasks:** Running a 10-second image processing script on Cloudflare Workers will trigger CPU limit timeouts (Workers limit CPU time to 50 ms).
+- **Centralized cloud for static marketing assets:** Serving static CSS, JS, and images directly from a single VM in Virginia instead of a global CDN is a guaranteed way to make your website slow worldwide.
+
+## Common Mistakes
+
+- **The Edge Latency Paradox:** Querying a centralized database sequentially from an edge function, multiplying cross-continent latency.
+- **Using heavy Node.js libraries on edge isolates:** Attempting to import modules that require Node.js `fs` or native C++ addons into a V8 isolate runtime.
+- **Ignoring vendor lock-in:** Coding directly against proprietary edge runtime APIs without an abstraction layer, making it difficult to migrate away later.

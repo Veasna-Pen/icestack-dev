@@ -1,0 +1,133 @@
+---
+title: "Retry"
+question: "តើខ្ញុំគួរបន្ថែម retry ដែរឬទេ?"
+summary: "Retry តែ failures ដែលកើតឡើងបណ្តោះអាសន្ន តែ operations ដែលធ្វើម្តងទៀតបានដោយសុវត្ថិភាព ហើយជានិច្ចជាមួយ exponential backoff, jitter និងដែនកំណត់។ Retry ដែលគ្មានដែនកំណត់ទាំងនេះ ប្រែក្លាយ outage តូចមួយទៅជា outage ធំ។"
+tags: [retry, resilience, backoff, reliability]
+related: [patterns/idempotency, patterns/rate-limiting, tradeoffs/sync-vs-async]
+order: 2
+updated: "2026-09-11"
+translation: draft
+---
+
+## Context
+
+Service មួយហៅអ្វីមួយតាម network៖ service ផ្សេង payment provider, database ឬ email API។ ពេលខ្លះការហៅនោះបរាជ័យ។ ការបន្ថែម retry ជាញឹកញាប់គឺជាដំណោះស្រាយដំបូងដែលមនុស្សនឹកឃើញ ហើយក៏ជាមធ្យោបាយងាយបំផុតមួយដែលធ្វើឱ្យ incident កាន់តែអាក្រក់។
+
+## Symptoms
+
+- Errors ដែលកើតឡើងម្តងម្កាល៖ `ECONNRESET`, `503 Service Unavailable`, timeouts, «deadlock detected», `429 Too Many Requests`។
+- Failures កើតឡើងជាក្រុមជុំវិញពេល deploy, failover ឬ traffic កើនខ្លាំង ហើយការហៅដដែលជោគជ័យវិញប៉ុន្មានវិនាទីក្រោយមក។
+- Job queue បង្ហាញ jobs ដែលបរាជ័យ តែជោគជ័យនៅពេលមាននរណាម្នាក់ដំណើរការវាឡើងវិញដោយដៃ។
+
+## Diagnose
+
+ចាត់ថ្នាក់ failure មុននឹង retry វា៖
+
+1. **តើវាបណ្តោះអាសន្នមែនទេ?** Timeouts, connection resets, 502, 503, 504, 429 និង errors ប្រភេទ serialization ឬ deadlock របស់ database ជាញឹកញាប់គឺបណ្តោះអាសន្ន។ 400, 401, 403, 404, 422 និង validation errors មិនមែនទេ៖ ការ retry request ដែលខុស គ្រាន់តែផ្ញើវាម្តងទៀតប៉ុណ្ណោះ។
+2. **តើ operation នេះធ្វើម្តងទៀតបានដោយសុវត្ថិភាពដែរឬទេ?** Reads គឺបាន។ `PUT` និង `DELETE` ជាធម្មតាបាន។ ការបង្កើត payment ការផ្ញើ email ឬការបង្កើនចំនួន counter មិនបានទេ លុះត្រាតែអ្នកធ្វើឱ្យវា idempotent; សូមមើល [Idempotency](../idempotency)។
+3. **តើការព្យាយាមលើកទីមួយប្រហែលជាបានជោគជ័យដែរឬទេ?** Timeout មានន័យថា *មិនដឹង* មិនមែន *បរាជ័យ* ទេ។ Server អាចបានបញ្ចប់ការងារ បន្ទាប់ពីអ្នកឈប់រង់ចាំ។
+4. **តើមានស្រទាប់ប៉ុន្មានដែល retry?** ប្រសិនបើ client, gateway និង service នីមួយៗ retry បីដង ការហៅដែលបរាជ័យមួយ ក្លាយជាការព្យាយាមរហូតដល់ 27 ដងនៅខាងក្រោមបំផុតនៃ stack។
+5. **តើ dependency និយាយអ្វីខ្លះ?** Header `Retry-After` ឬដែនកំណត់ដែលមានក្នុងឯកសារ ប្រាប់អ្នកថាពេលណាត្រូវព្យាយាមម្តងទៀត។
+
+## Options
+
+1. **មិន retry ទេ; បរាជ័យឱ្យលឿន** ហើយឱ្យអ្នកហៅ ឬអ្នកប្រើជាអ្នកសម្រេច។
+2. **Retry ភ្លាមៗ** តែម្តង។ ល្អសម្រាប់ connection មួយដែលដាច់ តែមានគ្រោះថ្នាក់នៅពេលមាន load ខ្លាំង។
+3. **Exponential backoff ជាមួយ jitter** ដែលមានដែនកំណត់លើចំនួនដង និង deadline សរុប។
+4. **Retry ជា asynchronous៖** ផ្លាស់ការងារទៅ queue ដែលមាន delayed retries និង dead-letter queue។
+5. **Circuit breaker** នៅពីមុខ retries ដែលឈប់ហៅ dependency ដែលច្បាស់ជាគាំង។
+
+## Trade-offs
+
+| ជម្រើស | ជួយបានចំពោះ | ហានិភ័យ | ការចំណាយ latency |
+| :--- | :--- | :--- | :--- |
+| គ្មាន retry | រក្សា load ឱ្យស្មោះត្រង់ | Errors ច្រើនជាងមុនទៅដល់អ្នកប្រើ | គ្មាន |
+| Retry ភ្លាមៗ | Packet មួយដែលបាត់ | ធ្វើឱ្យ load កើនទ្វេដងពេល outage | តិច |
+| Backoff + jitter + ដែនកំណត់ | Failures បណ្តោះអាសន្នភាគច្រើន | Duplicates ប្រសិនបើ operation មិន idempotent | មានដែនកំណត់ដោយ deadline |
+| Queue ជាមួយ delayed retries | Outages យូរ, ការងារនៅពីក្រោយ | លទ្ធផលមកដល់ពេលក្រោយ មិនមែនភ្លាមៗ | ការងារចាកចេញពីផ្លូវរបស់ request |
+| Circuit breaker | Dependencies ដែលគាំង | បដិសេធការហៅមួយចំនួនដែលអាចជោគជ័យ | បរាជ័យលឿន |
+
+Retries ទិញអត្រាជោគជ័យ ដោយបន្ថែម load។ នៅពេល dependency មួយកំពុងបរាជ័យ *ដោយសារ* វាផ្ទុកលើសចំណុះ នោះ retries ដែលកើតឡើងព្រមៗគ្នា គឺជា load បន្ថែមដែលរក្សាវាឱ្យគាំងបន្ត។ នោះហើយជា retry storm។
+
+## Decision
+
+Retry នៅពេល **error បណ្តោះអាសន្ន, operation គឺ idempotent ហើយមានថវិកា (budget)**៖
+
+- យ៉ាងច្រើន **បីដង** ក្នុង request ដែលអ្នកប្រើកំពុងរង់ចាំ ជាមួយ exponential backoff និង full jitter ហើយ deadline សរុបត្រូវខ្លីជាង timeout របស់អ្នកហៅ។
+- Retry នៅ **ស្រទាប់តែមួយប៉ុណ្ណោះ** ជាធម្មតាស្រទាប់ដែលនៅជិត dependency ដែលបរាជ័យបំផុត។
+- សម្រាប់ការងារនៅពីក្រោយ ផ្លាស់ retries ទៅក្នុង **queue**៖ backoff ពីប៉ុន្មាននាទីដល់ប៉ុន្មានម៉ោង បន្ទាប់មក dead-letter queue។
+- គោរព **`Retry-After`** និង responses 429។
+
+ពិនិត្យឡើងវិញ ប្រសិនបើ retries មានច្រើនជាងពីរបីភាគរយនៃការហៅទៅ dependency មួយ។ នោះជាបញ្ហាភាពជឿជាក់ដែលត្រូវជួសជុល មិនមែនជាបញ្ហាដែលត្រូវ retry ជុំវិញវាទេ។
+
+## Implementation
+
+Retry helper តូចមួយក្នុង TypeScript ដែលមិនពឹងលើ library ណាមួយ ជាមួយ full jitter, ដែនកំណត់ចំនួនដង និង deadline។ វា retry តែ errors ដែលវាស្គាល់ថាជាប្រភេទបណ្តោះអាសន្នប៉ុណ្ណោះ៖
+
+```ts
+const TRANSIENT_STATUS = new Set([408, 429, 500, 502, 503, 504]);
+
+export const isTransient = (err: any): boolean =>
+  err?.code === 'ECONNRESET' || err?.code === 'ETIMEDOUT' || TRANSIENT_STATUS.has(err?.status);
+
+type RetryOptions = {
+  attempts?: number;      // total tries, including the first
+  baseMs?: number;
+  maxDelayMs?: number;
+  deadlineMs?: number;    // give up after this much time in total
+  isRetryable?: (err: unknown) => boolean;
+};
+
+const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+export async function retry<T>(fn: () => Promise<T>, options: RetryOptions = {}): Promise<T> {
+  const { attempts = 3, baseMs = 100, maxDelayMs = 2000, deadlineMs = 5000, isRetryable = isTransient } = options;
+  const started = Date.now();
+
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      const elapsed = Date.now() - started;
+      if (attempt >= attempts || !isRetryable(err) || elapsed >= deadlineMs) throw err;
+
+      // Full jitter: a random delay up to the exponential ceiling.
+      const ceiling = Math.min(maxDelayMs, baseMs * 2 ** (attempt - 1));
+      await sleep(Math.min(Math.random() * ceiling, deadlineMs - elapsed));
+    }
+  }
+}
+
+// The idempotency key is what makes a repeated charge safe.
+await retry(() =>
+  payments.charge({ orderId, amount }, { idempotencyKey: `charge:${orderId}` })
+);
+```
+
+## Verification
+
+- **អត្រាជោគជ័យបានប្រសើរឡើង** សម្រាប់ការហៅទៅ dependency ដោយមិនធ្វើឱ្យ error rate ឬ latency របស់វាកើនឡើង។
+- **Retries អាចមើលឃើញ។** Log ឬរាប់ retry នីមួយៗ ជាមួយលេខរៀងនៃការព្យាយាម និង error ហើយដាក់ alert នៅពេលអត្រា retry កើនឡើង។
+- **គ្មាន duplicates។** នៅក្នុង staging សម្លាប់ dependency ពាក់កណ្តាល request ហើយបញ្ជាក់ថាគ្មានការគិតលុយ email ឬ record ស្ទួនគ្នា។
+- **Load នៅតែមានដែនកំណត់ពេល outage។** ធ្វើឱ្យ dependency ឆ្លើយតប 503 រយៈពេលមួយនាទី ហើយបញ្ជាក់ថាការហៅដែលវាទទួលបាន មិនលើសពី `attempts` ដងនៃកម្រិតធម្មតាឡើយ បន្ទាប់មកធ្លាក់ចុះនៅពេល deadline និង circuit breaker ចូលធ្វើការ។
+
+## Why
+
+Retry សន្មតថាការព្យាយាមបន្ទាប់នឹងជួបពិភពលោកខុសពីមុន៖ packet ឆ្លងកាត់បាន lock ទំនេរ ឬ instance បាន restart។ វាពិតសម្រាប់ failures ខ្លីៗដែលកើតឡើងដោយចៃដន្យ ហើយមិនពិតសម្រាប់ការផ្ទុកលើសចំណុះ និង requests ដែលខុស។ Backoff និង jitter ពង្រាយការព្យាយាម ដើម្បីឱ្យ dependency អាចងើបឡើងវិញ; idempotency ធ្វើឱ្យការធ្វើម្តងទៀតគ្មានគ្រោះថ្នាក់; ដែនកំណត់ចំនួនដង និង deadline រក្សាការសន្យាដែលអ្នកហៅបានធ្វើរួចហើយ។ បើគ្មានទាំងបួននេះ retry គឺជាការភ្នាល់ដែលអ្នកមិនអាចទទួលយកការចាញ់បាន។
+
+## When Not To Use
+
+- **Client errors** (4xx ក្រៅពី 408 និង 429) និង validation failures។
+- **Operations ដែលមិន idempotent** ដែលគ្មាន idempotency key។
+- **នៅក្នុង transaction ដែលបានបរាជ័យរួចហើយ។** ចាប់ផ្តើម transaction ទាំងមូលឡើងវិញ ជំនួសឱ្យការ retry statement តែមួយ។
+- **នៅពេលអ្នកប្រើកំពុងរង់ចាំ ហើយ deadline ជិតអស់ហើយ។** បរាជ័យឱ្យលឿន ជាមួយសារច្បាស់លាស់។
+- **នៅគ្រប់ស្រទាប់នៃខ្សែសង្វាក់ការហៅ។**
+
+## Common Mistakes
+
+- **Retry គ្រប់យ៉ាង** រួមទាំង 400s និង 404s។
+- **គ្មាន jitter** ដូច្នេះ clients ទាំងអស់ retry នៅពេលតែមួយ ហើយ dependency ទទួលរលកដែលកើតឡើងព្រមៗគ្នា។
+- **Retries គ្មានដែនកំណត់** ឬពេលវេលា retry សរុបយូរជាង timeout របស់អ្នកហៅ ដូច្នេះការងារនៅតែបន្ត បន្ទាប់ពីគ្មាននរណារង់ចាំវា។
+- **Retry ការហៅដែលមិន idempotent** ដែលបង្កើតការគិតលុយស្ទួន និង emails ស្ទួន។
+- **Retries ជាន់គ្នា** នៅក្នុង client, gateway, service និង database driver។
+- **Retries ដែលលាក់ failures៖** វាជោគជ័យដោយស្ងាត់ៗ ហើយបញ្ហាពិតមិនដែលត្រូវបានជួសជុល។

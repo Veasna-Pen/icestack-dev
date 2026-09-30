@@ -1,0 +1,140 @@
+---
+title: "Horizontal vs Vertical Scaling"
+question: "តើនៅពេលណាដែលខ្ញុំគួរដំឡើងសមត្ថភាព Hardware ម៉ាស៊ីនតែមួយ (Vertical Scaling) ហើយនៅពេលណាដែលគួរបន្ថែមម៉ាស៊ីនច្រើន (Horizontal Scaling)?"
+summary: "Vertical Scaling (Scale Up) ដំឡើង CPU, RAM, និង Disk ល្បឿនលឿនលើម៉ាស៊ីនតែមួយ ដោយមិនបាច់កែប្រែកូដអ្វីទាំងអស់ និងរក្សាភាពងាយស្រួលនៃ ACID រហូតដល់ដល់កម្រិត Hardware អតិបរមា។ ចំណែក Horizontal Scaling (Scale Out) បន្ថែម Nodes តូចៗជាច្រើនពីក្រោយ Load Balancer ឬចែក Shard Database ដែលផ្តល់នូវលទ្ធភាពពង្រីកគ្មានដែនកំណត់ និងភាពធន់ខ្ពស់ តែត្រូវប្តូរមកវិញនូវភាពស្មុគស្មាញនៃប្រព័ន្ធ Distributed Systems។"
+tags: [scaling, architecture, devops, database, infrastructure]
+related: [tradeoffs/monolith-vs-microservices, problems/running-out-of-connections, patterns/distributed-lock]
+order: 15
+updated: "2026-09-12"
+contributors: [veasna]
+translation: draft
+---
+
+## Context
+
+នៅពេលដែលកម្មវិធីមួយមានការរីកចម្រើន ធនធានកុំព្យូទ័ររបស់វានឹងចាប់ផ្តើមពេញទំហឹង។ CPU របស់ Database ឡើងដល់ 90%, ការប្រើប្រាស់ Memory កើនឡើងខ្ពស់, ហើយល្បឿនឆ្លើយតបចាប់ផ្តើមធ្លាក់ចុះយឺត។
+
+ក្រុមវិស្វករត្រូវប្រឈមមុខនឹងយុទ្ធសាស្ត្រពង្រីកសមត្ថភាពគ្រឹះពីរយ៉ាង៖
+1. **Vertical Scaling (Scale Up - ពង្រីកបញ្ឈរ)៖** ប្តូរ Server ទៅប្រើម៉ាស៊ីនធំជាងមុន និងខ្លាំងជាងមុន។ នៅលើ AWS នេះមានន័យថាការ Upgrade ពី `m5.large` (2 vCPU, 8 GB RAM) ទៅកាន់ `r6i.32xlarge` (128 vCPU, 1,024 GB RAM, NVMe SSDs)។
+2. **Horizontal Scaling (Scale Out - ពង្រីកផ្ដេក)៖** បន្ថែមចំនួន Instances នៃសេវាកម្ម ឬ Database ឱ្យកាន់តែច្រើនពីក្រោយ Load Balancer ឬ Distributed Cluster។ បន្ទុកការងារត្រូវបានបែងចែកឆ្លងកាត់ម៉ាស៊ីនតូចៗចំនួន ១០, ៥០, ឬ ៥០០ Nodes។
+
+ក្រុមការងារជាច្រើនតែងតែគិតថា "ស្ថាបត្យកម្ម Cloud ទំនើប" ទាមទារការធ្វើ Horizontal Scaling ភ្លាមៗជាមួយ Distributed Databases, Microservices, និង Kubernetes ដោយសុខចិត្តបង់ថ្លៃដើមប្រតិបត្តិការយ៉ាងធំធេង ទាំងដែលការពិតម៉ាស៊ីនធំតែមួយ (Vertical Scaling) អាចទ្រទ្រង់ការងាររបស់ពួកគេបានយ៉ាងស្រួលដោយចំណាយតិចជាងឆ្ងាយ។
+
+## Symptoms
+
+- **ការធ្វើ Horizontal Scaling មុនពេលកំណត់៖** Startup ដែលមាន User ត្រឹម ៥០,០០០ នាក់ ចំណាយពេល ៦ ខែដើម្បីបង្កើតប្រព័ន្ធ Database Sharding ដោយត្រូវដោះស្រាយ Two-Phase Commits និង Deadlocks ទាំងដែល Database PostgreSQL មួយតម្លៃ $200/ខែ អាចដំណើរការក្រុមហ៊ុនទាំងមូលបានយ៉ាងរលូន។
+- **ការបុកទង្គិចនឹងពិដាន Hardware របស់ Vertical៖** Database Monolith កំពុងដំណើរការលើម៉ាស៊ីន Cloud ធំបំផុតដែលមាន (`r6i.32xlarge` ដែលមាន RAM 1 TB); CPU នៅតែស៊ី 95% នៅម៉ោង Peak Hour ហើយការ Upgrade ម៉ាស៊ីនទោលឱ្យធំជាងនេះទៀតគឺមិនអាចទៅរួចឡើយ។
+- **មាន Downtime រាល់ពេល Scale Up៖** រាល់ពេលដែល Traffic កើនឡើង ការប្តូរទំហំ Primary Database តម្រូវឱ្យមានការបិទប្រព័ន្ធ (Maintenance Window) រយៈពេល ១៥ នាទីដើម្បីប្តូរប្រភេទ Instance។
+
+<Callout type="warning" title="Vertical Scaling មានពិដានកម្រិត Hardware; Horizontal Scaling មានបំណុលស្មុគស្មាញលើ Software">
+អ្នកអាចធ្វើ Vertical Scaling បានយ៉ាងងាយដោយគ្រាន់តែចុចប៊ូតុងមួយដោយមិនបាច់កែកូដសូម្បីតែមួយជួរ រហូតទាល់តែដល់កម្រិត Hardware។ Horizontal Scaling ផ្តល់នូវលទ្ធភាពពង្រីកគ្មានដែនកំណត់ តែទាមទារការបង់ "ពន្ធ Distributed Systems"៖ Network Latency, បញ្ហា Network ដាច់ពាក់កណ្តាលផ្លូវ, និងភាពស៊ីសង្វាក់នៃទិន្នន័យ។
+</Callout>
+
+## Diagnose
+
+1. **គណនាការប្រើប្រាស់ធនធានបច្ចុប្បន្ន៖** តើអ្នកកំពុងប្រើលើសពី 64 vCPU ឬ 256 GB RAM លើ Primary Node របស់អ្នកហើយឬនៅ? (បើមិនទាន់ទេ អ្នកនៅឆ្ងាយពីពិដានរបស់ Vertical Scaling ណាស់)។
+2. **កំណត់ចំណុចកកស្ទះ (Bottleneck)៖** តើកន្លែងដែលស្ទះគឺជា Stateless Web Tier (ដែលងាយស្រួល Scale ផ្ដេកពីក្រោយ Load Balancer) ឬជា Stateful Transactional Database (ដែលពិបាក Scale ផ្ដេក)?
+3. **វាយតម្លៃសមត្ថភាពប្រតិបត្តិការរបស់ក្រុម៖** តើក្រុមរបស់អ្នកមានជំនាញគ្រប់គ្រាន់ក្នុងការដោះស្រាយបញ្ហា Distributed Systems, Network Partitions, Raft Consensus, និង Sharding Rebalancing ដែរឬទេ?
+4. **វាយតម្លៃកម្រិតអត់ធ្មត់នឹង Downtime៖** តើអាជីវកម្មអាចទទួលយកការបិទប្រព័ន្ធ ២ នាទីនៅម៉ោង ៣ ទៀបភ្លឺដើម្បី Resize Database បានទេ ឬតម្រូវការគឺត្រូវតែដំណើរការជាប់ ២៤/៧ ដោយគ្មានការផ្អាកសូម្បីមួយវិនាទី?
+
+## Options
+
+1. **Vertical Scale-Up (ប្រើម៉ាស៊ីនធំជាងមុន)៖** ដំឡើង vCPU, RAM, និង Disk IOPS។ (ដោះស្រាយបញ្ហាបានលឿនបំផុត មិនបាច់កែស្ថាបត្យកម្មកូដ)។
+2. **Stateless Horizontal Scale-Out៖** បើកដំណើរការ ៥ ទៅ ៥០ API Containers ដូចៗគ្នាពីក្រោយ Application Load Balancer។ (ជាស្តង់ដារទូទៅសម្រាប់ Web Applications)។
+3. **Database Read Replicas៖** រក្សាទុកម៉ាស៊ីន Primary ធំមួយសម្រាប់តែការសរសេរ (Write) ប៉ុន្តែពង្រីកការអាន (Read) ផ្ដេកឆ្លងកាត់ Read Replicas ជាច្រើន។
+4. **Database Sharding (Distributed Scale-Out)៖** បែងចែកជួរទិន្នន័យឆ្លងកាត់ Database Clusters ឯករាជ្យជាច្រើនដោយផ្អែកលើ Shard Key (ដូចជា `tenant_id` ឬ `user_id`)។ (កម្រិត Scale ខ្ពស់បំផុត ស្មុគស្មាញបំផុត)។
+
+## Trade-offs
+
+| លក្ខណៈវិនិច្ឆ័យ | Vertical Scaling (Scale Up) | Horizontal Scaling (Scale Out) | Read Replicas (Hybrid) |
+| :--- | :--- | :--- | :--- |
+| **ការកែប្រែកូដ** | **គ្មានទាល់តែសោះ (សូន្យ)** | ខ្ពស់ (សម្រាប់ Stateful Database) | ទាប (បំបែក URL អាន និងសរសេរ) |
+| **ភាពស្មុគស្មាញស្ថាបត្យកម្ម** | **ទាបបំផុត (ម៉ាស៊ីនតែមួយ)** | ខ្ពស់ (Distributed State) | ទាបទៅមធ្យម |
+| **ពិដានកម្រិត Hardware** | មានពិដានកំណត់ (~128–256 vCPU) | **គ្មានដែនកំណត់ (Infinite)** | ជាប់ពិដានត្រង់ការសរសេរ (Write) |
+| **ភាពធន់ខ្ពស់ (High Availability)** | គ្មាន (Single Point of Failure) | **មានស្រាប់ (ម៉ាស៊ីនបម្រុងច្រើន)** | ខ្ពស់ (អាច Promote Replica ជំនួស) |
+| **ថ្លៃដើមនៅទំហំមធ្យម** | **សន្សំសំចៃបំផុត** | ថ្លៃ (ការខាតបង់ម៉ាស៊ីនទំនេរ) | សមរម្យ |
+| **Downtime ពេលថែទាំ** | ត្រូវការ Restart មួយភ្លែត | **Zero-downtime Rolling Updates** | តិចតួចបំផុត (Promote Replica) |
+
+## Decision
+
+- **ធ្វើ Horizontal Scaling លើ Stateless Web Layer តាំងពីថ្ងៃដំបូង៖** Web Servers, Background Workers, និង API Gateways គួរតែជា Stateless ជានិច្ច និងពង្រីកផ្ដេកដោយស្វ័យប្រវត្តិតាមរយៈ Load Balancer។ វិធីនេះផ្តល់នូវភាពធន់ខ្ពស់ភ្លាមៗ៖ បើ Container មួយគាំង Load Balancer នឹងបង្វែរទៅ Container ផ្សេងទៀត។
+- **ធ្វើ Vertical Scaling លើ Database ជាមុនសិន៖** កុំប្រញាប់ធ្វើ Sharding លើ Database មុនពេលកំណត់។ ម៉ាស៊ីន PostgreSQL ទំនើបតែមួយគត់អាចទ្រទ្រង់សំណើបានយ៉ាងស្រួលដល់ទៅ **៥០,០០០+ Queries ក្នុងមួយវិនាទី** និងទិន្នន័យរាប់ Terabytes ប្រសិនបើមាន Index ត្រឹមត្រូវ។
+- **ប្រើ Read Replicas នៅពេលការអានចាប់ផ្តើមស្ទះ Primary៖** នៅពេលដែលការអានស្រូបយក ៩០% នៃ CPU របស់ Database ត្រូវបន្ថែម Read Replicas ចំនួន ២ ឬ ៣ សិន មុននឹងគិតដល់រឿង Sharding។
+- **ប្តូរទៅកាន់ Database Sharding លុះត្រាតែ៖**
+  - បរិមាណនៃការសរសេរ (Write Throughput) លើសពីសមត្ថភាព IOPS រូបវន្តនៃ NVMe SSDs ដែលធំបំផុត។
+  - ទំហំទិន្នន័យកើនលើសពី ១០ ទៅ ២០ Terabytes ហើយមិនអាច Archive ចោលបាន។
+  - ច្បាប់ការពារទិន្នន័យ (ដូចជា GDPR) តម្រូវឱ្យរក្សាទុកទិន្នន័យក្នុងប្រទេសជាក់លាក់ដាច់ដោយឡែកពីគ្នា។
+
+## Implementation
+
+### 1. ការកំណត់ Stateless Horizontal Autoscaling (Kubernetes HPA)៖
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: api-service-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: api-service
+  minReplicas: 3
+  maxReplicas: 30
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+```
+
+### 2. ការបំបែក Connection Pool រវាង Primary និង Replica ក្នុង Node.js៖
+
+```typescript
+import { Pool } from 'pg';
+
+// Primary DB: ម៉ាស៊ីនធំ (Vertically scaled) សម្រាប់តែការសរសេរ
+const primaryPool = new Pool({ connectionString: process.env.PRIMARY_DB_URL, max: 20 });
+
+// Read Replicas: ពង្រីកផ្ដេក (Horizontally scaled) សម្រាប់ទទួលការអានគ្មានដែនកំណត់
+const replicaPool = new Pool({ connectionString: process.env.REPLICA_DB_URL, max: 40 });
+
+export async function executeQuery(sql: string, params: any[], isWrite = false) {
+  const pool = isWrite ? primaryPool : replicaPool;
+  const client = await pool.connect();
+  try {
+    return await client.query(sql, params);
+  } finally {
+    client.release();
+  }
+}
+```
+
+## Verification
+
+1. **ការធ្វើតេស្តបន្ទុកលើ Autoscaler៖** បញ្ជូន Traffic កើនឡើង ១០ ដងដោយប្រើ `k6`។ ផ្ទៀងផ្ទាត់ថា Kubernetes HPA រកឃើញ CPU លើសពី 70% ហើយបង្កើត Pods បន្ថែមក្នុងរយៈពេល ៦០ វិនាទី។
+2. **ពិនិត្យមើល Headroom របស់ Vertical Database៖** ដំណើរការ `SELECT * FROM pg_stat_activity` នៅម៉ោង Peak Load។ ផ្ទៀងផ្ទាត់ថា CPU នៅក្រោម 60% ហើយ Buffer Cache Hit Ratio លើសពី 99%។
+3. **ផ្ទៀងផ្ទាត់ការបែងចែកបន្ទុកលើ Replicas៖** តាមដាន Query Metrics លើ Read Replicas ទាំង ៣ អំឡុងពេលទាញរបាយការណ៍។ ធានាថាសំណើត្រូវបានបែងចែកស្មើគ្នាឆ្លងកាត់ Replicas ទាំងអស់។
+
+## Why
+
+រាល់ប្រព័ន្ធ Distributed Systems ទាំងអស់សុទ្ធតែត្រូវបង់ "ពន្ធ Distributed Systems"៖
+- ការបំប្លែងទិន្នន័យ (Serialization/Deserialization) ឆ្លងកាត់ Network។
+- ការពន្យារពេល Latency តាមខ្សែកាប។
+- បញ្ហា Network ដាច់, Split-Brain, និងការជ្រុះបាត់កញ្ចប់ទិន្នន័យ (Dropped Packets)។
+- ភាពស្មុគស្មាញនៃ Consensus Algorithms (Raft/Paxos)។
+
+Vertical Scaling ជួយជៀសវាងការបង់ពន្ធនេះឱ្យនៅបានយូរបំផុតតាមដែលអាចធ្វើទៅបាន។ តាមរយៈការបង្កើនប្រសិទ្ធភាពម៉ាស៊ីនទោលជាមុន និងធ្វើ Horizontal Scaling តែនៅកន្លែងដែលចាំបាច់ ក្រុមការងារអាចកាត់បន្ថយភាពស្មុគស្មាញនៃកូដ លុបបំបាត់ Race Conditions និងគ្រប់គ្រងប្រព័ន្ធបានយ៉ាងងាយស្រួល។
+
+## When Not To Use
+
+- **Vertical Scaling សម្រាប់ Stateless Web Servers៖** ការប្រើ Server Web ធំតែមួយដែលមាន 64 Cores មានន័យថាបើសិនជាមាន Unhandled Exception ឬម៉ាស៊ីនត្រូវ Reboot នោះក្រុមហ៊ុនទាំងមូលនឹងត្រូវដាច់ប្រព័ន្ធភ្លាមៗ។
+- **Database Sharding សម្រាប់គម្រោង MVP ដំបូង៖** ការចំណាយពេលរៀបចំ Sharding មុនពេលដឹងថាមានអ្នកប្រើផលិតផលឬអត់ គឺជាការខ្ជះខ្ជាយពេលវេលា និងជាការធ្វើ Premature Optimization ដ៏ធំធេង។
+
+## Common Mistakes
+
+- **ដំឡើង Hardware ជំនួសឱ្យការបង្កើត Index៖** Upgrade ពី 8 Cores ទៅ 32 Cores ព្រោះតែ Query មួយខ្វះ Index កំពុងធ្វើការ Scan តារាងអស់ពេល ១០ វិនាទី។ ការសរសេរ `CREATE INDEX` តែមួយជួរចំណាយត្រឹម $0 អាចដោះស្រាយបញ្ហាបានភ្លាមៗ។
+- **គិតស្មានថា Cloud មិនអាចប្តូរទំហំម៉ាស៊ីនបានលឿន៖** Cloud Providers សម័យនេះអនុញ្ញាតឱ្យប្តូរទំហំ Instance បានក្នុងរយៈពេលត្រឹមតែ ១ ទៅ ២ នាទីនៃការ Reboot ប៉ុណ្ណោះ។
+- **បង្កើត Stateful Web Servers ដែលរារាំងមិនឱ្យ Scale ផ្ដេកបាន៖** ការរក្សាទុក User Session ក្នុង Memory ម៉ាស៊ីន (`req.session` ក្នុង RAM ផ្ទាល់) ធ្វើឱ្យមិនអាចដាក់ពីក្រោយ Load Balancer បានឡើយ; ត្រូវរក្សាទុកក្នុង Redis ឬ Secure Cookie ជានិច្ច។

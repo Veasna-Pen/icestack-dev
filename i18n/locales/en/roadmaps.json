@@ -1,0 +1,978 @@
+{
+  "eyebrow": "Roadmaps",
+  "heading": "Where do I start?",
+  "lead": "Pick the role you want to grow into. Each roadmap is six stages in order: what to learn, the first decision you'll face there, and a project that proves you're ready to move on.",
+  "principle": "A roadmap is a starting order, not a checklist to finish. Build something at every stage — you'll learn more from one shipped project than from ten tutorials.",
+  "stageCount_one": "{{count}} stage",
+  "stageCount_other": "{{count}} stages",
+  "open": "View roadmap",
+  "allRoadmaps": "All roadmaps",
+  "outcome": "Where you'll be",
+  "start": "Start here",
+  "stageLabel": "Stage {{number}}",
+  "learn": "Skills to learn",
+  "decide": "Your first decision",
+  "build": "Build to prove it",
+  "related": "Think it through",
+  "showDetails": "Decision and project",
+  "hideDetails": "Hide details",
+  "markDone": "Mark stage as done",
+  "markNotDone": "Mark stage as not done",
+  "otherRoadmaps": "Other roadmaps",
+  "home": {
+    "eyebrow": "New to engineering?",
+    "title": "Start with a roadmap",
+    "body": "Six career paths for beginners, each in six stages, linked to the decisions you'll meet on the way.",
+    "cta": "See all roadmaps"
+  },
+  "roles": {
+    "web-developer": {
+      "label": "Web Developer",
+      "summary": "Build and ship complete websites, from the page in the browser to the server behind it.",
+      "outcome": "A full-stack app of your own, live on a real domain, that you can explain end to end.",
+      "pace": "9–12 months at about 10 hours a week",
+      "stages": {
+        "how-the-web-works": {
+          "title": "How the web works",
+          "goal": "Understand what happens between typing a URL and seeing a page, so later tools don't feel like magic.",
+          "skills": [
+            {
+              "name": "DNS, TCP and HTTP",
+              "note": "How a request finds a server and gets an answer"
+            },
+            {
+              "name": "Status codes and headers",
+              "note": "What 200, 301, 404 and 500 tell you"
+            },
+            {
+              "name": "Browser DevTools",
+              "note": "The Network tab shows every request a page makes"
+            },
+            {
+              "name": "Command line and Git",
+              "note": "Move around files and save your work's history"
+            }
+          ],
+          "decision": "Do I need a framework yet?",
+          "advice": "No. Frameworks hide the parts you're learning here. Pick one only once you can say what it saves you from.",
+          "project": "Open the Network tab on a site you use daily and explain every request it makes on load."
+        },
+        "html-css": {
+          "title": "HTML and CSS",
+          "goal": "Structure content with meaning and lay it out so it works on every screen.",
+          "skills": [
+            {
+              "name": "Semantic HTML",
+              "note": "Headings, lists and forms that mean something"
+            },
+            {
+              "name": "Flexbox and Grid",
+              "note": "Lay out rows, columns and whole pages"
+            },
+            {
+              "name": "Responsive design",
+              "note": "One layout that works from phone to desktop"
+            },
+            {
+              "name": "Accessibility basics",
+              "note": "Labels, contrast and keyboard use"
+            }
+          ],
+          "decision": "Tailwind, or plain CSS first?",
+          "advice": "Plain CSS first, until you can read what a utility class does. Then use whichever your team uses.",
+          "project": "Rebuild a real landing page from a screenshot, responsive down to phone width."
+        },
+        "javascript": {
+          "title": "JavaScript",
+          "goal": "Make pages interactive and talk to other services.",
+          "skills": [
+            {
+              "name": "Language basics",
+              "note": "Variables, functions, arrays and objects"
+            },
+            {
+              "name": "DOM and events",
+              "note": "Change the page when the user does something"
+            },
+            {
+              "name": "Async code",
+              "note": "fetch, Promises and async/await"
+            },
+            {
+              "name": "Modules and npm",
+              "note": "Split code into files and use packages"
+            }
+          ],
+          "decision": "JavaScript or TypeScript first?",
+          "advice": "JavaScript first. Move to TypeScript once a type bug has cost you an afternoon — you'll know exactly what it's for.",
+          "project": "A search page that calls a public API and handles loading, empty and error states."
+        },
+        "frontend-framework": {
+          "title": "A frontend framework",
+          "goal": "Build larger interfaces out of components, with state and routing.",
+          "skills": [
+            {
+              "name": "Components and props",
+              "note": "Reusable pieces of interface"
+            },
+            {
+              "name": "State and effects",
+              "note": "Data that changes, and what reacts to it"
+            },
+            {
+              "name": "Routing",
+              "note": "Several pages in one app, with real URLs"
+            },
+            {
+              "name": "Forms and validation",
+              "note": "Collect input and explain what's wrong"
+            }
+          ],
+          "decision": "React, Vue or Svelte?",
+          "advice": "Pick the one with the most job posts where you want to work. Components, state and routing transfer between all three.",
+          "project": "A multi-page app with routing, a form, and data from an API."
+        },
+        "backend-and-data": {
+          "title": "Backend and database",
+          "goal": "Store data, expose it through an API and know who is asking.",
+          "skills": [
+            {
+              "name": "A server language",
+              "note": "Node.js is the shortest step from JavaScript"
+            },
+            {
+              "name": "REST APIs and JSON",
+              "note": "Endpoints other programs can call"
+            },
+            {
+              "name": "SQL and relations",
+              "note": "Tables, joins and keeping data consistent"
+            },
+            {
+              "name": "Authentication and CORS",
+              "note": "Know who's calling and from where"
+            }
+          ],
+          "decision": "Session cookies or JWT?",
+          "advice": "For a single web app, session cookies are simpler and safer. Reach for JWT when several services must verify the same user.",
+          "project": "An API with sign-up, login and create/read/update/delete, backed by PostgreSQL."
+        },
+        "ship-it": {
+          "title": "Deploy and maintain",
+          "goal": "Put your app on the internet and keep it running.",
+          "skills": [
+            {
+              "name": "Hosting and HTTPS",
+              "note": "Domains, certificates and where the app runs"
+            },
+            {
+              "name": "Environment variables",
+              "note": "Keep secrets and settings out of the code"
+            },
+            {
+              "name": "Logs and health checks",
+              "note": "Know when something breaks, and why"
+            },
+            {
+              "name": "Continuous integration",
+              "note": "Tests run automatically on every push"
+            }
+          ],
+          "decision": "A platform (PaaS) or my own server?",
+          "advice": "A platform first. Running your own server teaches a lot, but it's a second project — ship the first one.",
+          "project": "Deploy your full-stack app to a custom domain, with CI that runs on every push."
+        }
+      }
+    },
+    "frontend-developer": {
+      "label": "Frontend Developer",
+      "summary": "Build fast, accessible interfaces that people enjoy using.",
+      "outcome": "A portfolio of interfaces that are fast, accessible and tested, built with a modern framework.",
+      "pace": "6–9 months at about 10 hours a week",
+      "stages": {
+        "foundations": {
+          "title": "HTML, CSS and accessibility",
+          "goal": "Master the platform every framework compiles down to.",
+          "skills": [
+            {
+              "name": "Semantic HTML",
+              "note": "Structure that browsers and screen readers understand"
+            },
+            {
+              "name": "Flexbox and Grid",
+              "note": "Responsive layouts without hacks"
+            },
+            {
+              "name": "CSS custom properties",
+              "note": "Themes, dark mode and design tokens"
+            },
+            {
+              "name": "Keyboard and screen readers",
+              "note": "Test that everyone can use the page"
+            }
+          ],
+          "decision": "Which CSS approach?",
+          "advice": "Learn plain CSS well, then adopt the team's choice. CSS Modules, Tailwind and CSS-in-JS are all fine once the basics are solid.",
+          "project": "Three responsive pages that pass a keyboard-only and screen-reader walkthrough."
+        },
+        "javascript-deep": {
+          "title": "JavaScript in depth",
+          "goal": "Understand the language well enough to debug what a framework does.",
+          "skills": [
+            {
+              "name": "Scope and closures",
+              "note": "Why a function remembers its variables"
+            },
+            {
+              "name": "The event loop",
+              "note": "How Promises and async/await really run"
+            },
+            {
+              "name": "Modules and bundlers",
+              "note": "How Vite turns files into a fast app"
+            },
+            {
+              "name": "TypeScript basics",
+              "note": "Catch mistakes before the browser does"
+            }
+          ],
+          "decision": "When should I add TypeScript?",
+          "advice": "As soon as a project has more than a few files. The editor help alone pays for itself.",
+          "project": "A small vanilla TypeScript app, such as a to-do list with filters and local storage."
+        },
+        "framework": {
+          "title": "A framework: React",
+          "goal": "Build interfaces from components and manage state predictably.",
+          "skills": [
+            {
+              "name": "Components and JSX",
+              "note": "Describe the interface as a function of data"
+            },
+            {
+              "name": "Hooks",
+              "note": "State, effects and refs inside components"
+            },
+            {
+              "name": "Routing",
+              "note": "Pages, links and state kept in the URL"
+            },
+            {
+              "name": "Forms",
+              "note": "Controlled inputs and validation"
+            }
+          ],
+          "decision": "Where should state live?",
+          "advice": "In the component that uses it. Lift it up when two siblings need it; add a global store only when distant parts of the app do.",
+          "project": "A dashboard with routes, filters kept in the URL, and a form that validates."
+        },
+        "data-fetching": {
+          "title": "Talking to APIs",
+          "goal": "Load, cache and update server data without breaking the interface.",
+          "skills": [
+            {
+              "name": "Loading and error states",
+              "note": "Never leave the user looking at a blank screen"
+            },
+            {
+              "name": "Caching and refetching",
+              "note": "TanStack Query or similar data libraries"
+            },
+            {
+              "name": "Pagination",
+              "note": "Pages, cursors and infinite scroll"
+            },
+            {
+              "name": "CORS and auth headers",
+              "note": "Why the browser blocks some requests"
+            }
+          ],
+          "decision": "Fetch in effects, or use a data library?",
+          "advice": "Write it by hand once to feel the pain, then use a data library. It solves caching, retries and races you'd otherwise rebuild.",
+          "project": "A paginated list with search that caches results and recovers from a failed request."
+        },
+        "rendering-performance": {
+          "title": "Rendering and performance",
+          "goal": "Make pages load fast and stay smooth on slow phones.",
+          "skills": [
+            {
+              "name": "CSR vs SSR",
+              "note": "Where the HTML is built, and why it matters"
+            },
+            {
+              "name": "Core Web Vitals",
+              "note": "Measure load, interactivity and layout shift"
+            },
+            {
+              "name": "Code splitting",
+              "note": "Ship only the code the page needs"
+            },
+            {
+              "name": "Images and fonts",
+              "note": "Usually the heaviest part of a page"
+            }
+          ],
+          "decision": "Do I need server-side rendering?",
+          "advice": "Only if the first load or search ranking matters for this page. A dashboard behind a login usually doesn't need it.",
+          "project": "Take an existing app, measure it, and cut its largest contentful paint in half."
+        },
+        "testing-shipping": {
+          "title": "Testing and shipping",
+          "goal": "Change code with confidence and release it safely.",
+          "skills": [
+            {
+              "name": "Unit tests",
+              "note": "Vitest or Jest for logic and helpers"
+            },
+            {
+              "name": "Component tests",
+              "note": "Testing Library, the way users see it"
+            },
+            {
+              "name": "End-to-end tests",
+              "note": "Playwright drives a real browser"
+            },
+            {
+              "name": "CI and feature flags",
+              "note": "Merge often, release when ready"
+            }
+          ],
+          "decision": "What should I test first?",
+          "advice": "The flows that make money or lose data: sign-in, checkout, saving. One end-to-end test there beats a hundred snapshot tests.",
+          "project": "Add CI with tests to your dashboard and ship one feature behind a flag."
+        }
+      }
+    },
+    "backend-developer": {
+      "label": "Backend Developer",
+      "summary": "Design the APIs, data and services that applications run on.",
+      "outcome": "A production-ready API with a database, authentication, caching and monitoring.",
+      "pace": "9–12 months at about 10 hours a week",
+      "stages": {
+        "language": {
+          "title": "One language, deeply",
+          "goal": "Get fluent in one server language and the tools around it.",
+          "skills": [
+            {
+              "name": "One language",
+              "note": "Node.js, Python, Go or Java"
+            },
+            {
+              "name": "Packages and testing",
+              "note": "The tools every project in it uses"
+            },
+            {
+              "name": "Git and the command line",
+              "note": "Daily tools on every team"
+            },
+            {
+              "name": "Linux basics",
+              "note": "Files, processes and permissions on servers"
+            }
+          ],
+          "decision": "Which language should I learn?",
+          "advice": "The one most used by companies you'd like to work for. The concepts carry over; switching later takes weeks, not years.",
+          "project": "A command-line tool that reads a file, transforms it and has tests."
+        },
+        "http-apis": {
+          "title": "HTTP and APIs",
+          "goal": "Design APIs that are predictable for the people who call them.",
+          "skills": [
+            {
+              "name": "REST design",
+              "note": "Resources, status codes and consistent errors"
+            },
+            {
+              "name": "Input validation",
+              "note": "Never trust what the client sends"
+            },
+            {
+              "name": "Idempotency",
+              "note": "Make retries safe for callers"
+            },
+            {
+              "name": "Rate limiting and docs",
+              "note": "Protect the API and describe it with OpenAPI"
+            }
+          ],
+          "decision": "REST or GraphQL?",
+          "advice": "REST, unless many different clients need very different shapes of the same data. It is simpler to cache, secure and debug.",
+          "project": "A documented REST API for a small domain (a library, a shop) with validation and consistent errors."
+        },
+        "databases": {
+          "title": "Databases",
+          "goal": "Model data correctly and query it without surprises.",
+          "skills": [
+            {
+              "name": "SQL",
+              "note": "Joins, aggregates and transactions"
+            },
+            {
+              "name": "Schema and migrations",
+              "note": "Change the database safely over time"
+            },
+            {
+              "name": "Indexes and query plans",
+              "note": "Find out why a query is slow"
+            },
+            {
+              "name": "ORMs",
+              "note": "Use them without hiding the SQL they run"
+            }
+          ],
+          "decision": "SQL or NoSQL?",
+          "advice": "PostgreSQL by default. Choose something else when you can name the access pattern it serves better.",
+          "project": "Back your API with PostgreSQL, with migrations and an index you justified with EXPLAIN."
+        },
+        "auth-security": {
+          "title": "Authentication and security",
+          "goal": "Know who is calling and keep their data safe.",
+          "skills": [
+            {
+              "name": "Password hashing",
+              "note": "bcrypt or Argon2, never plain text"
+            },
+            {
+              "name": "Sessions, JWT and OAuth",
+              "note": "Ways to remember who signed in"
+            },
+            {
+              "name": "OWASP Top 10",
+              "note": "The most common ways apps get attacked"
+            },
+            {
+              "name": "Secrets management",
+              "note": "Keys and passwords out of the repository"
+            }
+          ],
+          "decision": "Build auth myself, or use a provider?",
+          "advice": "Build it once to learn it, then use a proven library or provider in production. Auth bugs are expensive and quiet.",
+          "project": "Add sign-up, login, roles and password reset to your API."
+        },
+        "caching-async": {
+          "title": "Caching and background work",
+          "goal": "Keep responses fast and move slow work out of the request.",
+          "skills": [
+            {
+              "name": "Caching with Redis",
+              "note": "Serve repeated reads without the database"
+            },
+            {
+              "name": "Job queues",
+              "note": "Workers handle slow tasks like email"
+            },
+            {
+              "name": "Retries with backoff",
+              "note": "Recover from failures without piling on"
+            },
+            {
+              "name": "Message brokers",
+              "note": "When Kafka or RabbitMQ is worth it"
+            }
+          ],
+          "decision": "Do I need Redis or Kafka yet?",
+          "advice": "Probably not. Measure first; add a cache when a query is proven slow, and a broker when a database-backed queue can't keep up.",
+          "project": "Send emails from a background worker and cache one slow endpoint — with numbers before and after."
+        },
+        "production": {
+          "title": "Running in production",
+          "goal": "Deploy, observe and scale a service you're responsible for.",
+          "skills": [
+            {
+              "name": "Docker and deployment",
+              "note": "Run the same build everywhere"
+            },
+            {
+              "name": "Logs, metrics and alerts",
+              "note": "See what the service is doing"
+            },
+            {
+              "name": "Pools and graceful shutdown",
+              "note": "Don't drop requests during a deploy"
+            },
+            {
+              "name": "Scaling out",
+              "note": "More instances when one isn't enough"
+            }
+          ],
+          "decision": "Monolith or microservices?",
+          "advice": "A monolith. Split a service out when a team or a scaling need forces it, not before.",
+          "project": "Deploy your API with a health check, a dashboard and one alert that would wake you up for the right reason."
+        }
+      }
+    },
+    "mobile-developer": {
+      "label": "Mobile Developer",
+      "summary": "Build apps for Android and iOS that feel at home on a phone.",
+      "outcome": "An app published on a store, with offline support and push notifications.",
+      "pace": "8–12 months at about 10 hours a week",
+      "stages": {
+        "programming-basics": {
+          "title": "Programming fundamentals",
+          "goal": "Learn to write code before learning to write apps.",
+          "skills": [
+            {
+              "name": "One language",
+              "note": "Dart, Kotlin, Swift or JavaScript"
+            },
+            {
+              "name": "Types and classes",
+              "note": "Model the data your app works with"
+            },
+            {
+              "name": "Asynchronous code",
+              "note": "Wait for the network without freezing"
+            },
+            {
+              "name": "Git basics",
+              "note": "Save and share your work"
+            }
+          ],
+          "decision": "Which language first?",
+          "advice": "Choose after the next stage's decision if you can: Dart for Flutter, Kotlin for Android, Swift for iOS, JavaScript for React Native.",
+          "project": "A small console program, such as a quiz or budget tracker, with tests."
+        },
+        "choose-approach": {
+          "title": "Native or cross-platform",
+          "goal": "Pick the approach that fits the apps you want to build.",
+          "skills": [
+            {
+              "name": "Native",
+              "note": "Kotlin with Jetpack Compose, Swift with SwiftUI"
+            },
+            {
+              "name": "Cross-platform",
+              "note": "Flutter or React Native, one codebase"
+            },
+            {
+              "name": "Emulators and devices",
+              "note": "Run your app where users will"
+            },
+            {
+              "name": "Building and signing",
+              "note": "How an app becomes an installable file"
+            }
+          ],
+          "decision": "Native or cross-platform?",
+          "advice": "Cross-platform if you want both stores with one codebase. Native if you target one platform or need deep device features.",
+          "project": "Run a hello-world app on a real phone, not only the emulator."
+        },
+        "screens": {
+          "title": "Building screens",
+          "goal": "Lay out screens that follow each platform's conventions.",
+          "skills": [
+            {
+              "name": "Layouts and lists",
+              "note": "Scrolling content that stays smooth"
+            },
+            {
+              "name": "Navigation",
+              "note": "Moving between screens and back"
+            },
+            {
+              "name": "Platform guidelines",
+              "note": "Material Design and Apple's HIG"
+            },
+            {
+              "name": "Screen sizes",
+              "note": "Small phones, large phones and tablets"
+            }
+          ],
+          "decision": "One design for both platforms, or native looks?",
+          "advice": "Shared brand, native behaviour: keep your colours and type, but let back navigation and gestures feel like the platform.",
+          "project": "A three-screen app (list, detail, settings) with navigation."
+        },
+        "state-data": {
+          "title": "State and data",
+          "goal": "Load data from the network and keep the app usable offline.",
+          "skills": [
+            {
+              "name": "State management",
+              "note": "Keep screens in sync with the data"
+            },
+            {
+              "name": "HTTP and JSON",
+              "note": "Talk to your backend API"
+            },
+            {
+              "name": "Local storage",
+              "note": "SQLite and key-value stores on the device"
+            },
+            {
+              "name": "Offline sync",
+              "note": "Queue changes and retry when back online"
+            }
+          ],
+          "decision": "How much should work offline?",
+          "advice": "At least reading what the user has already seen. Decide early — offline support is hard to add later.",
+          "project": "Connect your app to an API, cache the data locally and handle a lost connection."
+        },
+        "device-features": {
+          "title": "Device features",
+          "goal": "Use what makes phones special, with the user's permission.",
+          "skills": [
+            {
+              "name": "Permissions",
+              "note": "Ask at the right moment, handle a “no”"
+            },
+            {
+              "name": "Camera and uploads",
+              "note": "Photos and files over slow networks"
+            },
+            {
+              "name": "Location and maps",
+              "note": "Where the user is, used carefully"
+            },
+            {
+              "name": "Push notifications",
+              "note": "Bring users back without annoying them"
+            }
+          ],
+          "decision": "When should I ask for permission?",
+          "advice": "At the moment the feature is used, with a reason on screen. Asking on first launch gets a “no”.",
+          "project": "Add a photo upload with progress and a push notification to your app."
+        },
+        "publish": {
+          "title": "Testing and publishing",
+          "goal": "Ship to real users and keep the app stable.",
+          "skills": [
+            {
+              "name": "Unit and UI tests",
+              "note": "Catch regressions before users do"
+            },
+            {
+              "name": "Crash reporting",
+              "note": "Know about crashes the moment they happen"
+            },
+            {
+              "name": "Store submission",
+              "note": "Play Store and App Store reviews"
+            },
+            {
+              "name": "Staged rollouts",
+              "note": "Release to a few users first, with flags"
+            }
+          ],
+          "decision": "When is it ready to publish?",
+          "advice": "When the core flow works and crashes are reported to you. Publish small and early; real users find what testers don't.",
+          "project": "Publish your app to at least one store with crash reporting turned on."
+        }
+      }
+    },
+    "ux-ui-designer": {
+      "label": "UX/UI Designer",
+      "summary": "Understand people's problems and design interfaces that solve them.",
+      "outcome": "A portfolio of case studies that show your process, from research to a tested design.",
+      "pace": "6–9 months at about 10 hours a week",
+      "stages": {
+        "ux-foundations": {
+          "title": "UX foundations",
+          "goal": "Start from the user's problem, not from the screen.",
+          "skills": [
+            {
+              "name": "User research",
+              "note": "Interviews that uncover real needs"
+            },
+            {
+              "name": "Personas and jobs to be done",
+              "note": "Who you design for, and what they need done"
+            },
+            {
+              "name": "Problem statements",
+              "note": "Name the problem before any solution"
+            },
+            {
+              "name": "Design thinking",
+              "note": "Understand, explore, test, repeat"
+            }
+          ],
+          "decision": "Research first, or sketch first?",
+          "advice": "Talk to five users first. It takes a few days and stops you polishing a solution to the wrong problem.",
+          "project": "Interview five people about a daily task and write the problem you'd solve."
+        },
+        "flows-wireframes": {
+          "title": "Flows and wireframes",
+          "goal": "Organise content and steps before deciding how anything looks.",
+          "skills": [
+            {
+              "name": "Information architecture",
+              "note": "Group and name content so people find it"
+            },
+            {
+              "name": "User flows",
+              "note": "The steps from a goal to done"
+            },
+            {
+              "name": "Wireframes",
+              "note": "Low-fidelity layouts, quick to change"
+            },
+            {
+              "name": "Card sorting",
+              "note": "Let users show how they group things"
+            }
+          ],
+          "decision": "Paper or digital wireframes?",
+          "advice": "Paper for the first ideas — they're cheap to throw away. Move to digital once the flow is settled.",
+          "project": "Wireframe the full flow for the problem from stage one."
+        },
+        "visual-design": {
+          "title": "Visual design",
+          "goal": "Make interfaces clear, consistent and pleasant to use.",
+          "skills": [
+            {
+              "name": "Typography",
+              "note": "Type sizes and weights that create hierarchy"
+            },
+            {
+              "name": "Colour and contrast",
+              "note": "Meaningful, readable and on-brand"
+            },
+            {
+              "name": "Spacing and grids",
+              "note": "Consistent rhythm and alignment"
+            },
+            {
+              "name": "Icons and imagery",
+              "note": "Support the content, don't decorate it"
+            }
+          ],
+          "decision": "How many fonts and colours?",
+          "advice": "Fewer than you think: one or two typefaces, one accent colour, and a strict spacing scale.",
+          "project": "Turn your wireframes into high-fidelity screens with a simple style guide."
+        },
+        "prototyping": {
+          "title": "Figma and prototyping",
+          "goal": "Build designs that behave like the real product.",
+          "skills": [
+            {
+              "name": "Auto Layout",
+              "note": "Frames that resize like real interfaces"
+            },
+            {
+              "name": "Components and variants",
+              "note": "Design once, reuse everywhere"
+            },
+            {
+              "name": "Interactive prototypes",
+              "note": "Clickable flows to test with users"
+            },
+            {
+              "name": "Mobile and desktop",
+              "note": "Adapt one design to both sizes"
+            }
+          ],
+          "decision": "How realistic should a prototype be?",
+          "advice": "Only as realistic as the question you're testing needs. Test the flow in grey boxes before the colours.",
+          "project": "A clickable prototype of your core flow, on mobile and desktop."
+        },
+        "accessibility-systems": {
+          "title": "Accessibility and design systems",
+          "goal": "Design for everyone and at scale.",
+          "skills": [
+            {
+              "name": "WCAG basics",
+              "note": "Contrast ratios and readable text sizes"
+            },
+            {
+              "name": "Focus and keyboard paths",
+              "note": "Usable without a mouse"
+            },
+            {
+              "name": "Design tokens",
+              "note": "Colours and spacing as named values"
+            },
+            {
+              "name": "Component libraries",
+              "note": "Shared parts for designers and developers"
+            }
+          ],
+          "decision": "Use an existing design system, or build one?",
+          "advice": "Start from an existing one (Material, a Figma UI kit) and adapt it. Build your own when a product outgrows it.",
+          "project": "Turn your screens into a small design system with tokens and accessible components."
+        },
+        "testing-handoff": {
+          "title": "Usability testing and handoff",
+          "goal": "Prove the design works and help developers build it.",
+          "skills": [
+            {
+              "name": "Usability testing",
+              "note": "Watch real people try your design"
+            },
+            {
+              "name": "Success metrics",
+              "note": "Task completion and time on task"
+            },
+            {
+              "name": "Developer handoff",
+              "note": "Specs, states and edge cases"
+            },
+            {
+              "name": "Case studies",
+              "note": "Show your process in your portfolio"
+            }
+          ],
+          "decision": "How do I know the design is good?",
+          "advice": "Watch five users try the core task without help. Where they hesitate is where the design needs work, not where they say it does.",
+          "project": "Test your prototype with five users, fix what they struggled with, and publish it as a case study."
+        }
+      }
+    },
+    "devops": {
+      "label": "DevOps Engineer",
+      "summary": "Automate how software is built, deployed and kept running.",
+      "outcome": "An automated pipeline that tests, deploys and monitors an app on cloud infrastructure you defined in code.",
+      "pace": "9–12 months at about 10 hours a week",
+      "stages": {
+        "linux-networking": {
+          "title": "Linux and networking",
+          "goal": "Be at home on a server and understand how machines talk.",
+          "skills": [
+            {
+              "name": "The shell",
+              "note": "Files, processes and permissions"
+            },
+            {
+              "name": "SSH and packages",
+              "note": "Reach servers and install software safely"
+            },
+            {
+              "name": "IP, ports and DNS",
+              "note": "How machines find and reach each other"
+            },
+            {
+              "name": "HTTP, TLS and Nginx",
+              "note": "Serve sites securely behind a reverse proxy"
+            }
+          ],
+          "decision": "Which Linux distribution?",
+          "advice": "Ubuntu or Debian. What matters is the skills, and they transfer to every distribution.",
+          "project": "Set up a Linux server, secure SSH, and serve a site over HTTPS with Nginx."
+        },
+        "scripting-git": {
+          "title": "Scripting and version control",
+          "goal": "Automate the task you'd otherwise do by hand twice.",
+          "skills": [
+            {
+              "name": "Bash scripting",
+              "note": "Glue commands into repeatable scripts"
+            },
+            {
+              "name": "Python for automation",
+              "note": "When a script needs real logic"
+            },
+            {
+              "name": "Git workflows",
+              "note": "Branches, pull requests and reviews"
+            },
+            {
+              "name": "YAML and JSON",
+              "note": "The formats every tool is configured in"
+            }
+          ],
+          "decision": "Bash or Python?",
+          "advice": "Bash for gluing commands together, Python once a script needs logic, error handling or tests.",
+          "project": "A script that backs up a directory, rotates old backups and reports failures."
+        },
+        "containers": {
+          "title": "Containers",
+          "goal": "Package apps so they run the same everywhere.",
+          "skills": [
+            {
+              "name": "Dockerfiles",
+              "note": "Build an image for your app"
+            },
+            {
+              "name": "Docker Compose",
+              "note": "Run an app with its database and network"
+            },
+            {
+              "name": "Small, secure images",
+              "note": "Fewer layers, fewer vulnerabilities"
+            },
+            {
+              "name": "Health checks",
+              "note": "Let the platform know the app is alive"
+            }
+          ],
+          "decision": "Do I need Kubernetes yet?",
+          "advice": "Not until one server with Docker Compose isn't enough. Kubernetes solves problems a beginner doesn't have yet.",
+          "project": "Containerise an app with its database using Docker Compose."
+        },
+        "ci-cd": {
+          "title": "CI/CD",
+          "goal": "Make every change tested and deployable automatically.",
+          "skills": [
+            {
+              "name": "Pipelines",
+              "note": "GitHub Actions or GitLab CI"
+            },
+            {
+              "name": "Tests and image builds",
+              "note": "Every merge produces a tested artifact"
+            },
+            {
+              "name": "Deployment strategies",
+              "note": "Rolling, blue-green and canary releases"
+            },
+            {
+              "name": "Rollbacks and flags",
+              "note": "Undo a bad release in minutes"
+            }
+          ],
+          "decision": "Deploy on every merge?",
+          "advice": "Yes, once tests and a quick rollback exist. Small, frequent deploys are safer than big rare ones.",
+          "project": "A pipeline that tests, builds and deploys your containerised app on every merge."
+        },
+        "cloud-iac": {
+          "title": "Cloud and infrastructure as code",
+          "goal": "Create cloud infrastructure you can review, repeat and destroy.",
+          "skills": [
+            {
+              "name": "One cloud",
+              "note": "AWS, Google Cloud or Azure"
+            },
+            {
+              "name": "Networking and IAM",
+              "note": "Least privilege from day one"
+            },
+            {
+              "name": "Terraform",
+              "note": "Infrastructure you can review in a pull request"
+            },
+            {
+              "name": "Managed services and cost",
+              "note": "Know what you run and what it costs"
+            }
+          ],
+          "decision": "Scale up or scale out?",
+          "advice": "Scale up first — a bigger machine is one change. Scale out when you need redundancy or have hit the biggest machine.",
+          "project": "Define your app's infrastructure in Terraform and recreate it from scratch."
+        },
+        "observability": {
+          "title": "Observability and reliability",
+          "goal": "Know something is wrong before users tell you, and recover fast.",
+          "skills": [
+            {
+              "name": "Logs, metrics and traces",
+              "note": "Three views of what a system is doing"
+            },
+            {
+              "name": "Prometheus and Grafana",
+              "note": "Collect metrics and build dashboards"
+            },
+            {
+              "name": "Alerting",
+              "note": "Page people only for what users feel"
+            },
+            {
+              "name": "Backups and incidents",
+              "note": "Restore data and learn from outages"
+            }
+          ],
+          "decision": "What should I alert on?",
+          "advice": "Symptoms users feel — errors, latency, a full disk — not every CPU spike. An alert nobody acts on trains people to ignore alerts.",
+          "project": "A dashboard and alerts for your app, and a tested restore from backup."
+        }
+      }
+    }
+  }
+}

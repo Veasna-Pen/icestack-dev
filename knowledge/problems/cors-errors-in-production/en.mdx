@@ -1,0 +1,151 @@
+---
+title: "How do I fix CORS errors?"
+question: "Why are my API requests failing with CORS errors in production?"
+summary: "CORS is a browser security mechanism, not a backend firewall. Production CORS failures usually stem from failing preflight OPTIONS requests, reverse proxies stripping headers on 5xx errors, or mismatched credentials modes."
+tags: [cors, security, api, browsers, http, production]
+related: [problems/slow-first-request, tradeoffs/rest-vs-grpc]
+order: 17
+updated: "2026-09-12"
+contributors: [veasna]
+---
+
+## Context
+
+A modern web application with a single-page frontend (React / Next.js) hosted on `https://app.example.com` and a backend REST API on `https://api.example.com`.
+
+During local development on `localhost:3000` and `localhost:8000`, the developer configured `Access-Control-Allow-Origin: *`. Everything worked smoothly. 
+
+Immediately upon deploying to production, the frontend console floods with red error messages:
+```text
+Access to fetch at 'https://api.example.com/orders' from origin 'https://app.example.com' 
+has been blocked by CORS policy: Response to preflight request doesn't pass access control check: 
+No 'Access-Control-Allow-Origin' header is present on the requested resource.
+```
+
+The team attempts quick fixes: adding wildcard `*` headers, enabling CORS plugins in Express, but the errors persist or mutate into `The value of the 'Access-Control-Allow-Origin' header in the response must not be the wildcard '*' when the request's credentials mode is 'include'`.
+
+## Symptoms
+
+- Web browser requests fail before reaching backend application business logic.
+- The Network tab shows two requests for a single action: an `OPTIONS` request failing with HTTP 404, 401, or 502, followed by a canceled `POST` request.
+- Testing the endpoint with `curl` or Postman **succeeds perfectly** with HTTP 200, baffling the developers.
+- When an internal server error (HTTP 500) occurs, the browser hides the actual error and displays a misleading CORS failure message instead.
+
+<Callout type="warning" title="CORS is enforced by the browser, not the server">
+CORS does not stop your backend from processing requests; it stops the user's browser from reading the response. If your backend crashes with an unhandled exception before CORS middleware attaches the headers, the browser interprets the 500 crash as a CORS violation.
+</Callout>
+
+## Diagnose
+
+1. **Test with `curl -I` mimicking the browser preflight:**
+   ```bash
+   curl -I -X OPTIONS https://api.example.com/orders \
+     -H "Origin: https://app.example.com" \
+     -H "Access-Control-Request-Method: POST" \
+     -H "Access-Control-Request-Headers: Content-Type, Authorization"
+   ```
+   Check the response:
+   - Does it return **HTTP 204** or **HTTP 200**? (If it returns 404 or 401, your authentication middleware is rejecting the preflight OPTIONS request before CORS handles it!).
+   - Does `Access-Control-Allow-Origin` match `https://app.example.com` exactly?
+2. **Inspect reverse proxy / API gateway:** Nginx, Cloudflare, or AWS CloudFront often strip headers from upstream 5xx responses unless explicitly told to preserve them.
+
+## Options
+
+1. **Same-Origin Proxy.** Host both frontend and backend under the exact same origin (`https://example.com/api`) using reverse proxy path routing. (Eliminates CORS entirely!).
+2. **Proper Preflight OPTIONS Handling.** Configure CORS middleware at the very top of your middleware chain before any authentication guards.
+3. **Dynamic Origin Whitelisting with Credentials.** Return the requesting origin explicitly instead of wildcard `*` when cookies/credentials are transmitted.
+4. **Cache Preflight Requests (`Access-Control-Max-Age`).** Tell browsers to cache OPTIONS preflight decisions for 24 hours so every single API call does not require a double round-trip.
+
+## Trade-offs
+
+| Strategy | Security | Latency Impact | Operational Complexity |
+| :--- | :--- | :--- | :--- |
+| **Same-Origin (`/api`)** | **Highest** | **0 ms (No Preflight)** | Requires unified reverse proxy |
+| **Wildcard `*`** | Insecure (cannot send cookies) | High (Preflight on every call) | Low (Breaks authenticated APIs) |
+| **Proper CORS + Max-Age** | High | **Low (Preflight cached 24h)** | Medium (15 lines of config) |
+
+## Decision
+
+1. **If possible, use Same-Domain Routing:** Route `/api` to the backend and `/` to the frontend via your CDN/reverse proxy (Cloudflare/Nginx). This eliminates the cross-origin boundary entirely.
+2. **If domains must be separate (`app.` and `api.`):**
+   - Place CORS middleware **before authentication**. `OPTIONS` requests never carry auth tokens and must never return HTTP 401.
+   - Whitelist explicit origins dynamically; never use `*` when `credentials: 'include'` is used.
+   - Cache preflights for 24 hours (`Access-Control-Max-Age: 86400`) to cut network round-trips in half.
+   - Attach CORS headers inside global error handlers so 500 errors display real error payloads instead of generic CORS blocks.
+
+## Implementation
+
+### Production-Grade CORS Configuration (Node.js / Express):
+
+```typescript
+import express from 'express';
+import cors from 'cors';
+
+const app = express();
+
+const ALLOWED_ORIGINS = new Set([
+  'https://app.example.com',
+  'https://admin.example.com',
+]);
+
+// 1. Configure CORS as the FIRST middleware before any route or auth handler
+app.use(
+  cors({
+    origin: (origin, callback) => {
+      // Allow requests with no origin (mobile apps, curl, server-to-server)
+      if (!origin || ALLOWED_ORIGINS.has(origin)) {
+        return callback(null, true);
+      }
+      callback(new Error('Blocked by CORS'));
+    },
+    credentials: true, // Allow cookies and Authorization headers
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
+    maxAge: 86400, // Cache preflight for 24 hours (86,400 seconds)
+  })
+);
+
+// 2. Explicitly handle preflight OPTIONS for all routes
+app.options('*', cors());
+
+// 3. Global Error Handler MUST preserve CORS headers
+app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+  const origin = req.headers.origin;
+  if (origin && ALLOWED_ORIGINS.has(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+  }
+  
+  res.status(err.status || 500).json({
+    error: err.message || 'Internal Server Error',
+  });
+});
+```
+
+## Verification
+
+1. **Verify preflight with curl:**
+   ```bash
+   curl -I -X OPTIONS https://api.example.com/orders \
+     -H "Origin: https://app.example.com" \
+     -H "Access-Control-Request-Method: POST"
+   ```
+   Must return **HTTP 204 No Content**, with `Access-Control-Max-Age: 86400` and `Access-Control-Allow-Origin: https://app.example.com`.
+2. **Browser Network inspection:** Ensure consecutive API calls to the same endpoint do **not** fire redundant `OPTIONS` requests within the 24-hour cache window.
+3. **Error visibility test:** Trigger a deliberate 500 exception. The browser console must display the actual JSON error payload rather than a CORS blockage.
+
+## Why
+
+The Same-Origin Policy (SOP) is enforced by browsers to protect users from Cross-Site Request Forgery (CSRF) and credential theft. Without CORS, a malicious website (`https://evil.com`) could execute a background fetch to `https://bank.com/transfer` using your ambient login cookies.
+
+Cross-Origin Resource Sharing (CORS) is the handshake mechanism by which `api.example.com` grants permission to `app.example.com` to read its responses.
+
+## When Not To Use
+
+- **Server-to-server or Mobile App APIs:** CORS is entirely ignored by iOS apps, Android apps, and backend services. Do not debug CORS issues if callers are not web browsers.
+
+## Common Mistakes
+
+- **Putting authentication middleware before CORS.** The preflight `OPTIONS` request never contains an `Authorization` header or cookie. If your auth middleware runs first, it returns 401, breaking the preflight check.
+- **Using wildcard `*` with credentials.** The CORS specification strictly forbids `Access-Control-Allow-Origin: *` when `Access-Control-Allow-Credentials: true`.
+- **Applying CORS headers twice.** Setting headers in both Nginx and Express produces `Access-Control-Allow-Origin: https://app.com, https://app.com`, which the browser rejects.

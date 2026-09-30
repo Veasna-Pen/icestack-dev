@@ -1,0 +1,137 @@
+---
+title: "Should I use Redis?"
+question: "When should I use Redis?"
+summary: "When you have a measured problem that a shared, in-memory, expiring store solves better than your database: hot reads, rate limits, sessions, short-lived locks. Not as a second source of truth, and not as a way around a slow query."
+tags: [redis, caching, architecture]
+related: [patterns/caching, patterns/rate-limiting, problems/database-is-slow, problems/should-i-use-kafka]
+order: 1
+updated: "2026-09-11"
+---
+
+## Context
+
+Redis comes up in almost every architecture conversation, often before anyone has named a problem. It is an in-memory key-value store with rich data types (strings, hashes, sorted sets, streams), atomic operations and per-key expiry. It is fast, well under a millisecond on a local network, because it keeps everything in RAM. That same property is where most of its trade-offs come from.
+
+The usual setting: a web app on one relational database, a few app servers, and a team of two to ten developers wondering whether "adding Redis" is the next step.
+
+## Symptoms
+
+The reasons people reach for Redis, strongest first:
+
+- The same expensive read is served thousands of times a minute and the answer rarely changes.
+- You need state **shared across app servers**: sessions, rate-limit counters, a lock.
+- You need **expiry** built in: one-time codes, "recently viewed" lists, temporary tokens.
+- A background job library needs a broker (Sidekiq, BullMQ, Laravel queues).
+- "The database is slow." This is the weakest reason. Read [Why is my database slow?](../database-is-slow) first.
+
+## Diagnose
+
+Before adding a new piece of infrastructure, answer these with data:
+
+1. **What exactly is slow or missing?** Name the endpoint and the number: p95, CPU, error rate.
+2. **Is the database really the bottleneck?** Check `pg_stat_statements` or the slow query log. A missing index is fixed in an hour; a cache in front of it is a permanent cost.
+3. **How often does the data change, and how stale may it be?** A product price that can be 30 seconds out of date is a good cache candidate. An account balance usually isn't.
+4. **Does the state need to be shared?** One process can use an in-memory `Map`. Two or more servers need something outside the process.
+5. **What happens when Redis is down?** If the answer is "the site is down", Redis has become a critical dependency and must be run like one.
+
+## Options
+
+1. **Nothing new.** Fix the query, add an index, or use HTTP caching (`Cache-Control`, a CDN).
+2. **An in-process cache.** An LRU map inside each app server: no network hop, no new service, but every server holds its own copy.
+3. **Your existing database.** Postgres handles sessions, rate-limit counters (`UPDATE … RETURNING`) and job queues (`FOR UPDATE SKIP LOCKED`) well at moderate scale.
+4. **Redis**, managed or self-hosted. Shared, fast, expiring state with atomic operations.
+5. **Memcached.** Simpler and multi-threaded, but plain strings only and no persistence.
+
+## Trade-offs
+
+| | In-process cache | Postgres | Redis |
+| :--- | :--- | :--- | :--- |
+| Read latency | ~0.01 ms | 1–5 ms | ~0.3 ms |
+| Shared across servers | No | Yes | Yes |
+| Built-in expiry | Depends on the library | Manual cleanup | Yes, per key |
+| Size limit | App memory | Disk | RAM, which is expensive |
+| Durability | None | Full | Optional (RDB/AOF); a failover can lose recent writes |
+| New thing to operate | No | No | Yes: memory, eviction, failover, upgrades |
+
+Redis earns its place when you need **shared + fast + expiring** together. Its costs are a second place where data lives (and can disagree with the database), memory that has to be sized and watched, and a new way for the site to fail.
+
+## Decision
+
+- **Use Redis** for state that is shared, short-lived and cheap to lose or rebuild: cache entries, sessions, rate limits, locks, and queues you already run through a Redis-based library.
+- **Don't use it** to avoid fixing slow queries, or as the only home of data you can't reconstruct.
+- **Start small:** a managed instance, `maxmemory` set, an eviction policy chosen on purpose, and application code that keeps working (more slowly) when Redis is unavailable.
+
+Revisit the decision if Redis memory grows faster than your data, or if you find yourself writing to Redis and to the database in the same request and hoping they agree.
+
+## Implementation
+
+A cache-aside read with a short TTL, in Node.js with `ioredis`. The database stays the source of truth; Redis only remembers recent answers.
+
+```ts
+import Redis from 'ioredis';
+
+const redis = new Redis(process.env.REDIS_URL!, {
+  maxRetriesPerRequest: 1,   // fail fast: the database is the fallback
+  enableOfflineQueue: false  // don't queue commands while disconnected
+});
+
+const TTL_SECONDS = 60;
+
+export async function getProduct(id: string) {
+  const key = `product:v1:${id}`;
+
+  try {
+    const cached = await redis.get(key);
+    if (cached) return JSON.parse(cached);
+  } catch {
+    // Redis is down or slow: serve from the database instead of failing the request.
+  }
+
+  const product = await db.product.findUnique({ where: { id } });
+
+  if (product) {
+    // Fire and forget; a failed cache write must not fail the read.
+    redis.set(key, JSON.stringify(product), 'EX', TTL_SECONDS).catch(() => {});
+  }
+  return product;
+}
+```
+
+The two server settings that matter most for a cache:
+
+```text
+maxmemory 512mb
+maxmemory-policy allkeys-lru   # when full, evict the least recently used key
+```
+
+For a queue or session store, where eviction silently loses work, use `maxmemory-policy noeviction` and alert on memory instead.
+
+## Verification
+
+- **The original number moved.** The endpoint's p95 and the database time for that query both dropped.
+- **The hit ratio is healthy.** From `INFO stats`: `keyspace_hits / (keyspace_hits + keyspace_misses)`. Below about 80% on a cache usually means the TTL is too short or the keys are too specific.
+- **Memory is bounded.** `INFO memory` shows `used_memory` stable below `maxmemory`, and `evicted_keys` isn't climbing unexpectedly.
+- **Failure is survivable.** Stop Redis in staging. Requests should get slower, not fail.
+
+## Why
+
+Redis is fast because it trades durability and capacity for speed: data lives in RAM on a single primary. That is ideal for data whose loss costs a recomputation, and dangerous for data whose loss costs money.
+
+Most "should I use Redis?" questions are really "is this data more like a cache or more like a ledger?" Answer that first and the rest of the decision follows.
+
+## When Not To Use
+
+- **To paper over a slow query.** Fix the query; see [Why is my database slow?](../database-is-slow).
+- **As the primary store for important data**, unless you've configured persistence and replication on purpose and know what a failover can lose.
+- **For data larger than the RAM you can afford**, or data you need to query by anything other than its key.
+- **With one app server and modest traffic**, where an in-process cache does the job with no new service.
+- **For durable, replayable event streams shared between teams.** That is closer to Kafka's job; see [Should I use Kafka?](../should-i-use-kafka).
+
+## Common Mistakes
+
+- **No `maxmemory`.** Redis grows until the operating system kills it.
+- **No TTL on cache keys**, so stale data lives forever and memory only goes up.
+- **Treating Redis as always available**, so a Redis blip becomes a full outage.
+- **Cache stampedes:** a popular key expires and hundreds of requests hit the database at once. Add jitter to TTLs or let one request refill the key; see [Caching](../../patterns/caching).
+- **`KEYS *` in production.** It blocks the server while it runs. Use `SCAN`.
+- **Unversioned keys.** When the cached shape changes, old entries break new code. Put a version in the key (`product:v2:…`).

@@ -1,0 +1,178 @@
+---
+title: "How do I revoke a JWT?"
+question: "How do I revoke a JWT before it expires?"
+summary: "Stateless JWTs cannot be invalidated by design without maintaining state. Implement a hybrid architecture: short-lived access tokens (5–15 minutes) paired with a server-side token version or Redis revocation blocklist for logout and password resets."
+tags: [auth, jwt, security, redis, architecture]
+related: [problems/should-i-use-redis, patterns/caching]
+order: 19
+updated: "2026-09-12"
+contributors: [veasna]
+---
+
+## Context
+
+A web and mobile application uses stateless JSON Web Tokens (JWT) for authentication. When a user logs in, the server signs a cryptographic JWT with a 30-day expiration and returns it to the client. On every request, API microservices verify the token signature using the public key—requiring zero database queries or central session lookups.
+
+One day, a user reports their phone was stolen, or an employee is abruptly terminated. An administrator resets their password and clicks "Log out of all devices."
+
+However, because the JWT is cryptographically valid and signed, the stolen token **continues to work on all API endpoints** for the next 29 days.
+
+## Symptoms
+
+- Users click "Log out", but their token remains completely functional if replayed via curl or Postman.
+- Password resets do not invalidate active sessions on other devices.
+- Banned or deactivated users can still read and write private data until their token naturally expires.
+- Security audits flag a critical compliance violation: "Inability to immediately revoke active bearer tokens."
+
+<Callout type="warning" title="Statelessness and immediate revocation are fundamentally mutually exclusive">
+If an authorization token is truly stateless (meaning services verify it without checking a central database), it is physically impossible for the server to invalidate it before its `exp` timestamp. The moment you introduce a revocation check, you are maintaining state.
+</Callout>
+
+## Diagnose
+
+1. **Inspect token lifetime:** Decode your access token payload:
+   ```json
+   {
+     "sub": "usr_9481",
+     "iat": 1718000000,
+     "exp": 1720592000 // 30 days in the future!
+   }
+   ```
+   If your stateless access token has an expiration longer than 15 minutes, your vulnerability window is dangerously wide.
+2. **Review logout implementation:** Does your `/logout` endpoint merely instruct the client to delete the token from `localStorage`? If so, the server did not revoke the token; any attacker who copied it retains full access.
+
+## Options
+
+1. **Traditional Server-Side Sessions (Redis / DB).** Drop JWTs entirely and use session IDs (`session:xyz`) checked against Redis on every request. (Restores instant revocation, but requires a Redis lookup on every API call).
+2. **Short-Lived Access Token + Refresh Token Rotation.** Issue access tokens valid for only **5–15 minutes**. Issue long-lived refresh tokens stored in the database. When access tokens expire, the client uses the refresh token to get a new one. Revoking the refresh token cuts off access within minutes.
+3. **Redis Token Blocklist.** Store revoked JWT IDs (`jti`) in Redis with a TTL matching the token's remaining lifetime.
+4. **User Token Versioning (`token_version`).** Store an integer `token_version` on the `users` table. Embed `ver: 3` in the JWT. Incrementing the user's `token_version` instantly invalidates all previously issued tokens on subsequent refresh.
+
+## Trade-offs
+
+| Strategy | Revocation Speed | DB / Cache Overhead | Architecture Complexity |
+| :--- | :--- | :--- | :--- |
+| **Traditional Session (Redis)** | **Instant (0 ms)** | 1 Redis lookup per request | Low |
+| **Short JWT (10m) + Refresh** | Within 10 minutes | 1 DB lookup every 10 min | Medium |
+| **Redis Blocklist** | **Instant (0 ms)** | 1 Redis lookup per request | Medium (Requires Redis) |
+| **User Token Version** | Within 10 minutes | 1 DB lookup during refresh | **Low (No Redis required)** |
+
+## Decision
+
+Adopt the **Hybrid Industry Standard: Short-Lived Access Tokens with Token Versioning**:
+
+1. **Access Tokens live for 10 minutes:** Cryptographically signed, contains user ID, role, and `token_version`. Verified statelessly by all microservices without touching a database.
+2. **Refresh Tokens live for 30 days:** Opaque strings stored in PostgreSQL or Redis.
+3. **Immediate Revocation (Logout / Password Reset):**
+   - When a user changes passwords or an admin revokes access, increment the user's `token_version = token_version + 1` in the database and delete all refresh tokens.
+   - The user's active access token will continue for at most 10 minutes.
+   - When the client attempts to refresh, the version mismatch rejects the request, terminating the session across all devices.
+4. **For high-security zero-delay requirements:** Check a Redis blocklist (`EXISTS blacklist:jti`) on critical endpoints (like financial wire transfers).
+
+## Implementation
+
+### 1. Token Generation with `token_version` (Node.js):
+
+```typescript
+import jwt from 'jsonwebtoken';
+
+interface User {
+  id: string;
+  role: string;
+  token_version: number;
+}
+
+export function generateTokens(user: User) {
+  // Short-lived stateless access token (10 minutes)
+  const accessToken = jwt.sign(
+    {
+      sub: user.id,
+      role: user.role,
+      version: user.token_version,
+    },
+    process.env.JWT_SECRET!,
+    { expiresIn: '10m' }
+  );
+
+  // Long-lived refresh token
+  const refreshToken = jwt.sign(
+    { sub: user.id, version: user.token_version },
+    process.env.REFRESH_SECRET!,
+    { expiresIn: '30d' }
+  );
+
+  return { accessToken, refreshToken };
+}
+```
+
+### 2. Instant Revocation on Password Reset / Logout All:
+
+```typescript
+export async function revokeAllUserSessions(userId: string) {
+  // Incrementing token_version instantly invalidates all future token refreshes!
+  await db.query(
+    `UPDATE users 
+     SET token_version = token_version + 1 
+     WHERE id = $1`,
+    [userId]
+  );
+
+  // Delete all persisted refresh tokens
+  await db.query(`DELETE FROM refresh_tokens WHERE user_id = $1`, [userId]);
+}
+```
+
+### 3. Refresh Endpoint checking Token Version:
+
+```typescript
+app.post('/auth/refresh', async (req, res) => {
+  const { refreshToken } = req.body;
+  
+  let payload: any;
+  try {
+    payload = jwt.verify(refreshToken, process.env.REFRESH_SECRET!);
+  } catch {
+    return res.status(401).send('Invalid refresh token');
+  }
+
+  // Fetch current user version from database
+  const userRes = await db.query(
+    `SELECT id, role, token_version FROM users WHERE id = $1`,
+    [payload.sub]
+  );
+  const user = userRes.rows[0];
+
+  // If token version doesn't match, the session was revoked!
+  if (!user || user.token_version !== payload.version) {
+    return res.status(401).send('Session has been revoked. Please log in again.');
+  }
+
+  // Issue brand new access token
+  const tokens = generateTokens(user);
+  res.json(tokens);
+});
+```
+
+## Verification
+
+1. **Session revocation test:**
+   - Log in and obtain an access token and refresh token.
+   - Execute a password reset (`token_version++`).
+   - Attempt to call `/auth/refresh` with the previous refresh token.
+   - The endpoint must reject with **HTTP 401 Unauthorized**.
+2. **Access token expiration:** Verify that 10 minutes after revocation, all API requests using the old access token fail with `jwt expired`.
+
+## Why
+
+Pure statelessness is a myth for security-critical applications. Complete statelessness means you have surrendered the ability to revoke authorization.
+
+By shrinking the access token's lifespan to 10 minutes, we strike an optimal balance: 99% of requests remain fast, local, and stateless, while the maximum vulnerability window for any compromised credential is capped at 10 minutes.
+
+## When Not To Use
+
+- **B2B API Keys:** Long-lived machine-to-machine API keys (e.g. `sk_live_...`) should not use JWTs. Use opaque random hashes stored in a database or Redis with instant revocation.
+
+## Common Mistakes
+
+- **Storing JWTs in `localStorage`.** `localStorage` is accessible to any malicious script (XSS). Store refresh tokens in `HttpOnly, Secure, SameSite=Strict` cookies.
+- **Putting sensitive, mutable data in the JWT payload.** Storing user emails, names, or permissions in the JWT means if the user's role changes from "admin" to "viewer", the user remains an admin until the JWT expires. Keep payloads minimal: `sub`, `role`, and `version`.

@@ -1,0 +1,172 @@
+---
+title: "Bulkhead"
+question: "How do I isolate critical workloads so one slow dependency doesn't consume all threads?"
+summary: "Partition thread pools, connection pools, and memory limits per downstream dependency or tenant. If one service stalls, only its dedicated pool exhausts, leaving other features intact."
+tags: [resilience, reliability, concurrency, bulkhead, microservices]
+related: [patterns/circuit-breaker, patterns/rate-limiting, problems/running-out-of-connections]
+order: 8
+updated: "2026-09-12"
+contributors: [veasna]
+---
+
+## Context
+
+In naval engineering, a ship's hull is divided into watertight compartments called **bulkheads**. If water breaches one compartment, the bulkheads isolate the flood so the entire ship does not sink.
+
+In software architecture, an application frequently talks to multiple external systems: payment processors, recommendation engines, fraud detectors, and databases. When all requests share a single global thread pool or HTTP client connection pool, a slowdown in one minor feature (e.g., product recommendations taking 10 seconds) will consume 100% of available worker threads. Critical features like user checkout or authentication then fail immediately with thread starvation errors.
+
+## Symptoms
+
+- A partial outage in a non-essential service (e.g., search suggestions or review ratings) brings down core revenue-generating endpoints like checkout or login.
+- Web server worker threads or event loop connection slots hit 100% saturation, blocking all incoming HTTP connections.
+- Latency across *all* API routes degrades simultaneously, even though the database and CPU utilization appear low.
+- A single "noisy neighbor" tenant consumes all database query connections, starving all other tenants sharing the multi-tenant cluster.
+
+<Callout type="warning" title="Global thread pools create hidden single points of failure">
+If checkout and recommendations share the same pool of 100 worker threads, 100 stalled recommendation requests will completely halt checkout.
+</Callout>
+
+## Diagnose
+
+1. **Audit thread and connection pools:** Does your backend share a single HTTP client or database pool across all features and routes?
+2. **Review incident post-mortems:** Identify if past outages began in an auxiliary service before taking down the primary application.
+3. **Inspect timeout behavior:** When downstream calls stall, do in-flight requests queue indefinitely or fail fast once a threshold is reached?
+4. **Analyze per-dependency concurrency:** Measure current concurrent in-flight requests per external service under peak load.
+
+## Options
+
+1. **Dedicated thread pools / worker queues:** Assign a fixed max concurrency (e.g., 20 threads) to non-critical external calls and a separate pool (e.g., 80 threads) to critical operations.
+2. **Semaphore / concurrency limiters:** Wrap outbound HTTP clients with a semaphore (e.g., maximum 15 simultaneous in-flight calls to the recommendation API). Subsequent calls are rejected immediately or queued with a bounded waiting buffer.
+3. **Process / container isolation:** Split high-risk background processing into dedicated microservice containers with hard Kubernetes CPU and memory limits.
+4. **Database connection pool partitioning:** Use separate PgBouncer pools or separate connection strings for reporting/analytics queries versus transactional user requests.
+
+## Trade-offs
+
+| Strategy | Failure Containment | Resource Efficiency | Implementation Effort | Complexity |
+| :--- | :--- | :--- | :--- | :--- |
+| **Shared Global Pool (Default)** | None (cascading failure) | Maximum (100% sharing) | Zero | Lowest |
+| **Semaphore Limiter** | High (in-process limit) | Very High | Low (TypeScript semaphore) | Low |
+| **Dedicated Thread Pools** | Very High | Medium (idle pool waste) | Medium | Medium |
+| **Separate Containers (Microservices)** | Maximum (hardware isolation) | Lower (container overhead) | High (deployments, K8s) | High |
+
+## Decision
+
+- **Implement Semaphore Bulkheads for outbound network calls:** Wrap calls to slow or third-party APIs with a strict concurrency limiter (e.g. max 10 concurrent requests). Reject excess requests immediately with a fallback.
+- **Isolate database pools by workload:** Never allow long-running admin reports or batch analytics to share connection pools with low-latency user checkout flows.
+- **Pair bulkheads with short timeouts:** Concurrency limits prevent pool exhaustion, while timeouts prevent long queues inside the bulkhead.
+- **Fail fast or fallback:** When the bulkhead is full, return cached data, an empty list, or a fast 503 rather than waiting indefinitely.
+
+## Implementation
+
+A lightweight Bulkhead Concurrency Limiter in TypeScript:
+
+```typescript
+export interface BulkheadOptions {
+  maxConcurrent: number;
+  maxQueue: number;
+}
+
+export class Bulkhead {
+  private activeCount = 0;
+  private queue: Array<() => void> = [];
+
+  constructor(
+    private readonly name: string,
+    private readonly options: BulkheadOptions
+  ) {}
+
+  async execute<T>(task: () => Promise<T>): Promise<T> {
+    // If capacity available, execute immediately
+    if (this.activeCount < this.options.maxConcurrent) {
+      this.activeCount++;
+      try {
+        return await task();
+      } finally {
+        this.release();
+      }
+    }
+
+    // If active pool full, check queue capacity
+    if (this.queue.length >= this.options.maxQueue) {
+      throw new Error(`[Bulkhead:${this.name}] Rejected: Bulkhead capacity full (${this.options.maxConcurrent} active, ${this.options.maxQueue} queued)`);
+    }
+
+    // Wait in queue for available slot
+    return new Promise<T>((resolve, reject) => {
+      this.queue.push(async () => {
+        try {
+          const result = await task();
+          resolve(result);
+        } catch (err) {
+          reject(err);
+        } finally {
+          this.release();
+        }
+      });
+    });
+  }
+
+  private release() {
+    if (this.queue.length > 0) {
+      const nextTask = this.queue.shift();
+      if (nextTask) nextTask();
+    } else {
+      this.activeCount--;
+    }
+  }
+
+  getMetrics() {
+    return { active: this.activeCount, queued: this.queue.length };
+  }
+}
+```
+
+### Isolating a recommendation service with a Bulkhead:
+
+```typescript
+// Allow at most 10 concurrent calls to recommendations, with a queue limit of 5
+const recommendationBulkhead = new Bulkhead('recommendations', {
+  maxConcurrent: 10,
+  maxQueue: 5,
+});
+
+export async function getProductRecommendations(userId: string): Promise<string[]> {
+  try {
+    return await recommendationBulkhead.execute(async () => {
+      const res = await fetch(`https://api.recommendations.internal/users/${userId}`, {
+        signal: AbortSignal.timeout(1500),
+      });
+      if (!res.ok) throw new Error('Recommendation API failed');
+      return await res.json();
+    });
+  } catch (err) {
+    // Graceful fallback: when recommendations stall or overload, return default popular items
+    console.warn(`[Recommendations] Bulkhead tripped or call failed: ${(err as Error).message}. Returning fallback.`);
+    return ['item-popular-1', 'item-popular-2'];
+  }
+}
+```
+
+## Verification
+
+1. **Fault injection test:** Simulate a 30-second delay on the recommendation endpoint using a mock server.
+2. **Sustained load test:** Blast the application with 1,000 req/sec across both checkout and product pages (`k6 run loadtest.js`).
+3. **Verify isolation:** Ensure checkout latency remains under 50 ms and error rate is 0%, while recommendation calls fail fast with fallback data in < 2 ms once the 15-slot bulkhead saturates.
+4. **Metrics monitoring:** Confirm `activeCount` never exceeds 10.
+
+## Why
+
+In complex architectures, failures are inevitable. A service cannot control the reliability of external dependencies, cloud APIs, or partner networks.
+
+Without isolation, every service is as fragile as its weakest dependency. The Bulkhead pattern sets hard boundaries on resource consumption. By ensuring that failure remains localized inside a single compartment, the core business engine continues sailing smoothly.
+
+## When Not To Use
+
+- **Monolithic single-purpose scripts:** In CLI tools or offline batch scripts where tasks are sequential, concurrency partitions add unnecessary complexity.
+- **Super fast, locally cached operations:** Operations with sub-millisecond execution times (e.g. Redis GET) do not hold threads long enough to cause pool exhaustion.
+
+## Common Mistakes
+
+- **Unlimited queue size:** Setting `maxQueue: Infinity` defeats the bulkhead; requests will pile up in memory until the process runs out of RAM.
+- **Bulkhead without timeouts:** If tasks inside the bulkhead do not have timeouts, blocked tasks will occupy slots permanently until the server is restarted.
+- **Omitting fallbacks:** Rejecting requests without a fallback turns a localized slowdown into visible user errors when a default value would have sufficed.

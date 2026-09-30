@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1563 1563" width="100%" height="100%">
+  <rect width="1563" height="1563" fill="#031637" />
+  <g>
+    <circle cx="538.4" cy="785.3" r="72.5" fill="#73B7FE" />
+    <line x1="607.4" y1="529.8" x2="745.0" y2="788.4" stroke="#0175E4" stroke-width="145" stroke-linecap="round" />
+    <line x1="817.8" y1="530.0" x2="955.4" y2="788.6" stroke="#023BA6" stroke-width="145" stroke-linecap="round" />
+    <circle cx="1024.7" cy="532.9" r="72.5" fill="#73B7FE" />
+  </g>
+  <text x="781" y="995" font-family="'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="110" font-weight="900" letter-spacing="4" fill="#FFFFFF" text-anchor="middle">ICE STACK</text>
+</svg>

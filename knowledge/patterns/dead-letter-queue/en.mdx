@@ -1,0 +1,159 @@
+---
+title: "Dead Letter Queue"
+question: "How do I handle malformed or poison-pill messages without blocking the queue or losing data?"
+summary: "Isolate messages that repeatedly fail processing into a dedicated dead letter queue after exceeding max retry attempts. This prevents poison pills from blocking the entire pipeline while preserving unprocessable payloads for debugging."
+tags: [messaging, reliability, dlq, rabbitmq, kafka, sqs]
+related: [patterns/retry, patterns/idempotency, problems/unbounded-queue-backpressure]
+order: 9
+updated: "2026-09-12"
+contributors: [veasna]
+---
+
+## Context
+
+In asynchronous message-driven architectures (RabbitMQ, AWS SQS, Apache Kafka, Redis Streams), consumer workers pull messages from queues to process background jobs: generating PDFs, charging credit cards, or syncing third-party webhooks.
+
+Inevitably, some messages cannot be processed. A payload might have invalid JSON syntax, reference a deleted user ID, or trigger an unhandled runtime exception. Without a Dead Letter Queue strategy, consumers reject the message back to the queue, immediately re-read it, crash again, and enter an infinite retry loop. This "poison pill" message starves valid messages, exhausts CPU, fills disk logs, and can bring down all queue workers.
+
+## Symptoms
+
+- Queue consumers crash repeatedly with the exact same stack trace every few milliseconds.
+- Queue backlog increases rapidly despite normal producer traffic because workers are stuck repeatedly failing on a single unprocessable message.
+- Worker CPU spikes to 100% processing the same corrupted message thousands of times per minute.
+- Disk fills up with millions of duplicate error logs.
+- Downstream systems receive repeated identical calls if the failure occurs late in the processing transaction.
+
+<Callout type="warning" title="Poison pill messages halt the entire pipeline">
+A single malformed message rejected back to the head of a queue will cause all 10 worker instances to crash in an infinite loop, halting all legitimate user processing.
+</Callout>
+
+## Diagnose
+
+1. **Check message redelivery count:** Does the failing message show a `delivery_count` or `redelivery_count` greater than 10?
+2. **Inspect queue head:** Read the top message in the queue without acknowledging it. Is the payload malformed or missing required schema fields?
+3. **Review consumer error handling:** Does your consumer code `catch` unexpected errors and send a blind `nack(requeue=true)`?
+4. **Audit log explosion:** Are log aggregators (Datadog, Grafana Loki) overwhelmed with identical error messages repeated continuously?
+
+## Options
+
+1. **Drop on failure (Discard / Ack):** Acknowledge and discard failing messages immediately. (Fast, but leads to silent data loss).
+2. **Infinite retry with delay:** Re-queue the message with an exponential backoff. (Keeps retrying forever, clogging retry queues for unfixable schema bugs).
+3. **Dead Letter Queue (DLQ):** After $N$ failed delivery attempts (e.g. 3 or 5), automatically route the message into a separate `orders.dlq` queue with original headers, error stack traces, and timestamps intact.
+4. **Parking lot table (Database DLQ):** Insert corrupted payloads into a `failed_messages` database table with an administrative retry status.
+
+## Trade-offs
+
+| Strategy | Data Durability | Pipeline Throughput | Operational Burden | Root-Cause Debugging |
+| :--- | :--- | :--- | :--- | :--- |
+| **Drop on Error** | Zero (silent loss) | High (never blocks) | Low | Impossible |
+| **Infinite Retry** | High | Near Zero (queue blocked) | High (constant alerts) | Frustrating |
+| **Dead Letter Queue** | Maximum (100% saved) | Maximum (pipeline flows) | Moderate (need to drain DLQ) | Excellent (full payload preserved) |
+| **Database DLQ** | Maximum | High | Low (standard SQL queries) | Excellent |
+
+## Decision
+
+- **Always configure a DLQ with a maximum retry threshold:** Set `maxReceiveCount: 3` (or 5). If a message fails 3 times, divert it to the DLQ.
+- **Attach diagnostics to message metadata:** When forwarding to DLQ, append the failure reason, stack trace, timestamp, and original queue name to message headers.
+- **Alert on DLQ depth:** Any message entering the DLQ indicates a software bug, unhandled edge case, or upstream schema drift. Fire a notification to PagerDuty or Slack when `DLQ.depth > 0`.
+- **Provide replay tooling:** Build a command-line script or admin endpoint to replay fixed messages from the DLQ back to the main processing queue once the underlying bug is patched.
+
+## Implementation
+
+### 1. Declaring a Dead Letter Exchange in RabbitMQ (amqplib):
+
+```typescript
+import amqp from 'amqplib';
+
+export async function setupQueues(channel: amqp.Channel) {
+  // 1. Declare the Dead Letter Exchange and DLQ
+  await channel.assertExchange('dlx', 'direct', { durable: true });
+  await channel.assertQueue('orders.dlq', { durable: true });
+  await channel.bindQueue('orders.dlq', 'dlx', 'orders');
+
+  // 2. Declare the primary queue with dead-letter forwarding
+  await channel.assertQueue('orders.main', {
+    durable: true,
+    arguments: {
+      'x-dead-letter-exchange': 'dlx',
+      'x-dead-letter-routing-key': 'orders',
+      'x-message-ttl': 86400000, // 24 hours
+    },
+  });
+}
+```
+
+### 2. Consumer with Redelivery Counting and Safe DLQ Routing:
+
+```typescript
+export async function consumeOrders(channel: amqp.Channel) {
+  await channel.prefetch(10);
+
+  channel.consume('orders.main', async (msg) => {
+    if (!msg) return;
+
+    try {
+      const order = JSON.parse(msg.content.toString());
+      await processOrder(order);
+      channel.ack(msg);
+    } catch (err) {
+      const deathCount = msg.properties.headers?.['x-death']?.[0]?.count || 0;
+      console.error(`[Consumer] Processing failed for message (attempts: ${deathCount + 1}):`, (err as Error).message);
+
+      if (deathCount >= 3) {
+        // Exceeded retries: reject without requeue, triggering RabbitMQ's DLX
+        console.error(`[Consumer] Diverting poison-pill message to DLQ`);
+        channel.nack(msg, false, false); // requeue = false -> moves to DLQ
+      } else {
+        // Temporary retry: reject with requeue for another attempt
+        channel.nack(msg, false, true); // requeue = true
+      }
+    }
+  });
+}
+```
+
+### 3. DLQ Replay Utility Script:
+
+```typescript
+// Script to redrive messages from DLQ back to main queue after deploying a bug fix
+export async function redriveDlq(channel: amqp.Channel, count = 100) {
+  let redriven = 0;
+  for (let i = 0; i < count; i++) {
+    const msg = await channel.get('orders.dlq', { noAck: false });
+    if (!msg) break;
+
+    // Republish to main queue
+    channel.sendToQueue('orders.main', msg.content, {
+      persistent: true,
+      headers: { ...msg.properties.headers, redrivenFromDlq: true },
+    });
+    channel.ack(msg);
+    redriven++;
+  }
+  console.log(`Successfully redrove ${redriven} messages from orders.dlq to orders.main`);
+}
+```
+
+## Verification
+
+1. **Poison pill injection:** Publish a deliberately corrupted JSON message (`"{invalid-json"`) to `orders.main`.
+2. **Confirm pipeline unblocked:** Publish 50 valid order messages immediately behind the corrupted message.
+3. **Verify DLQ isolation:** Confirm that after 3 failed attempts, the corrupted message lands in `orders.dlq` while all 50 valid orders process successfully without delay.
+4. **Alert triggering:** Confirm that CloudWatch/Datadog emits an alert when `orders.dlq` count increases from 0 to 1.
+
+## Why
+
+In distributed systems, the assumption that every input is valid and every downstream operation will succeed is flawed. Schema drift, malformed user inputs, and unexpected race conditions will inevitably create unprocessable payloads.
+
+Without a DLQ, a system is forced to make a terrible choice: either lose data forever by dropping failed messages, or halt processing for all users by looping indefinitely. A DLQ provides the best of both worlds: zero data loss with zero pipeline interruption.
+
+## When Not To Use
+
+- **High-throughput metrics & ephemeral telemetry:** For fire-and-forget UDP logs, IoT sensor pings, or analytics counters where dropped messages have no business impact, DLQ infrastructure adds unnecessary disk and maintenance overhead.
+- **Strict FIFO ordering where skipping is unacceptable:** In financial ledgers where message #2 depends strictly on message #1, skipping to a DLQ would cause ledger inconsistency; the entire partition must halt until resolved.
+
+## Common Mistakes
+
+- **Unmonitored DLQ ("Write-Only Storage"):** Sending messages to a DLQ without monitoring or alerting means errors fester unnoticed until messages expire or disk runs out.
+- **DLQs without retention limits:** Forgetting to configure a TTL or maximum size on the DLQ, causing broker disk exhaustion during major outages.
+- **Replaying without root-cause fixes:** Automatically redriving messages from DLQ back to the main queue before deploying the bug fix just results in messages immediately failing and cycling back to the DLQ.

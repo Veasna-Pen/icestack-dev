@@ -1,0 +1,48 @@
+name: New topic
+description: Propose a problem, pattern, trade-off or implementation for the knowledge base, or a course lesson.
+title: '[Topic] '
+labels: ['content']
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for proposing a topic. Please search the existing issues first so nobody writes the same page twice.
+  - type: dropdown
+    id: collection
+    attributes:
+      label: Collection
+      options:
+        - Problem (a question developers ask)
+        - Pattern (a reusable solution)
+        - Trade-off (a head-to-head comparison)
+        - Implementation (a pattern in a specific stack)
+        - Course or lesson (one skill, taught step by step)
+    validations:
+      required: true
+  - type: input
+    id: question
+    attributes:
+      label: The question
+      description: How a developer would ask it.
+      placeholder: 'Should I add a retry?'
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Context
+      description: Where does this come up? Scale, stack, team, constraints.
+    validations:
+      required: true
+  - type: textarea
+    id: experience
+    attributes:
+      label: What you have seen in practice
+      description: Production lessons, options you tried, mistakes you made. Leave out company names, customer data and secrets.
+  - type: checkboxes
+    id: help
+    attributes:
+      label: Writing it
+      options:
+        - label: I'd like to write this page
+        - label: I can review it or translate it into Khmer

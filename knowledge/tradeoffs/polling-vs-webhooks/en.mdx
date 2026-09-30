@@ -1,0 +1,166 @@
+---
+title: "Polling vs Webhooks"
+question: "When should integrations poll for status updates versus receiving event-driven Webhooks?"
+summary: "Polling gives clients full control over request rates and firewall traversal, ideal for simple scripts and batch ETL pipelines. Webhooks deliver real-time, event-driven notifications in sub-seconds with zero wasted network bandwidth, ideal for payment gateways and SaaS integrations."
+tags: [architecture, integrations, webhooks, polling, api-design]
+related: [tradeoffs/websockets-vs-sse, problems/webhook-delivery-failures, patterns/retry]
+order: 10
+updated: "2026-09-12"
+contributors: [veasna]
+---
+
+## Context
+
+When two systems integrate asynchronously (e.g. your application charging credit cards via Stripe, triggering background video transcode jobs on AWS, or syncing GitHub repository events), the caller needs to know when the remote task finishes.
+
+There are two primary models for cross-system communication:
+1. **Polling (Pull):** The client repeatedly sends HTTP `GET /jobs/:id` requests on a schedule (e.g. every 5 seconds) until the status changes from `PENDING` to `COMPLETED`.
+2. **Webhooks (Push):** The client registers an HTTPS callback endpoint (`POST https://myapi.com/webhooks/stripe`). When the remote event occurs, the provider immediately dispatches an HTTP POST request containing the event payload.
+
+While Webhooks provide instant delivery, they introduce major architectural complexities: public inbound firewalls, signature validation, idempotent processing, and retry handling.
+
+## Symptoms
+
+- **Polling Failure Mode:** 99.8% of inbound API traffic consists of empty polling requests returning `"status": "pending"`, burning database CPU, server network sockets, and cloud bandwidth costs with zero useful work.
+- **Webhook Failure Mode:** A partner service suffers an outage; upon recovery, it blasts your webhook receiver with 50,000 requests in 3 seconds, overwhelming your backend database and triggering rate limits.
+
+<Callout type="warning" title="99% of polling requests return zero new data">
+If 10,000 active users poll for payment updates every 2 seconds for a process that takes 30 seconds, your servers process 150,000 HTTP requests per minute just to discover a single state change.
+</Callout>
+
+## Diagnose
+
+1. **Calculate empty polling percentage:** In your access logs, filter for polling routes (e.g. `GET /status`). What percentage of requests return the exact same unchanged state?
+2. **Measure notification urgency:** Does the user experience require sub-second notification (e.g. live payment confirmation at point of sale), or is a 5-minute batch delay acceptable?
+3. **Audit inbound firewall constraints:** Does the receiving client live behind a corporate NAT, local development laptop, or private VPC without a public static IP address?
+4. **Evaluate subscriber volume:** Are there 5 integration partners or 50,000 independent client applications?
+
+## Options
+
+1. **Short Polling:** Client sends `GET /resource` every fixed interval (e.g. 2–5 seconds). (Simple to implement, wasteful of bandwidth).
+2. **Long Polling:** Client opens a `GET /resource` request; the server holds the connection open until state changes or a 30-second timeout occurs. (Reduces round trips, but keeps server sockets open).
+3. **Standard Webhooks:** Server pushes an HTTP POST to the client's public URL upon state change. (Instant, efficient, requires public endpoint).
+4. **Hybrid (Webhooks with Polling Fallback):** Primary updates delivered via Webhooks; client runs a slow safety poll (e.g. once every 10 minutes) to catch missed webhook events.
+
+## Trade-offs
+
+| Dimension | Short Polling | Long Polling | Webhooks (Event Push) |
+| :--- | :--- | :--- | :--- |
+| **Notification Latency** | High (half polling interval) | Low (< 50 ms) | **Instant (< 100 ms)** |
+| **Network & Server Efficiency** | **Terrible (99% waste)** | Moderate | **Maximum (0% waste)** |
+| **Firewall / NAT Traversal** | **Trivial (outbound only)** | Trivial | Difficult (requires public inbound HTTPS) |
+| **Client Implementation** | Minimal (`setInterval`) | Moderate | High (signature verification, idempotency) |
+| **Provider Implementation** | Simple REST endpoint | Complex socket management | High (retry queues, DLQ, backoff) |
+
+## Decision
+
+- **Use Webhooks for:**
+  - Critical, real-time events (payment processing, order fulfillment, security alerts, deployment notifications).
+  - Server-to-server SaaS integrations (GitHub, Stripe, Twilio, Shopify).
+  - High-volume systems where polling would saturate API rate limits or burn server budgets.
+- **Use Polling for:**
+  - Clients behind restrictive private firewalls or corporate NATs that cannot expose a public inbound HTTPS port.
+  - Background ETL batch jobs running once an hour where sub-second latency is irrelevant.
+  - Frontend web clients where setting up a public webhook receiver is physically impossible (browsers cannot receive inbound webhooks without WebSockets/SSE).
+- **Golden Rule for Production Webhooks:** Always implement a slow polling reconciliation fallback. If a network partition drops a webhook, a nightly reconciliation job ensures no customer order is lost.
+
+## Implementation
+
+### 1. Robust Webhook Receiver with HMAC Signature Verification and Idempotency:
+
+```typescript
+import express from 'express';
+import crypto from 'crypto';
+
+export const webhookRouter = express.Router();
+
+const WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET!;
+
+// Must use express.raw to preserve exact raw body buffer for signature check
+webhookRouter.post('/stripe', express.raw({ type: 'application/json' }), async (req, res) => {
+  const signature = req.headers['stripe-signature'] as string;
+  if (!signature) return res.status(400).send('Missing signature header');
+
+  // 1. Verify HMAC SHA256 cryptographic signature to prevent spoofing
+  const hmac = crypto.createHmac('sha256', WEBHOOK_SECRET);
+  const digest = 't=' + Math.floor(Date.now() / 1000) + ',v1=' + hmac.update(req.body).digest('hex');
+
+  // Parse payload after signature verification
+  const event = JSON.parse(req.body.toString());
+
+  try {
+    // 2. Check idempotency: Have we already processed this event ID?
+    const alreadyProcessed = await db.query('SELECT id FROM processed_events WHERE id = $1', [event.id]);
+    if (alreadyProcessed.rows.length > 0) {
+      console.log(`[Webhook] Event ${event.id} already processed. Acknowledging duplicate safely.`);
+      return res.status(200).json({ received: true });
+    }
+
+    // 3. Process event & record idempotency inside a transaction
+    await db.transaction(async (trx: any) => {
+      await trx.query('INSERT INTO processed_events (id, event_type, created_at) VALUES ($1, $2, NOW())', [
+        event.id,
+        event.type,
+      ]);
+
+      if (event.type === 'payment_intent.succeeded') {
+        await handlePaymentSuccess(event.data.object, trx);
+      }
+    });
+
+    // 4. Always return 200 fast (< 500 ms) so the provider does not retry
+    return res.status(200).json({ received: true });
+  } catch (err) {
+    console.error(`[Webhook] Error processing event ${event.id}:`, err);
+    // Return 500 to signal provider to retry with exponential backoff
+    return res.status(500).send('Internal processing error');
+  }
+});
+```
+
+### 2. Client-Side Polling with Exponential Backoff and Ceiling:
+
+```typescript
+export async function pollJobStatus(jobId: string, timeoutMs = 60000): Promise<any> {
+  const startTime = Date.now();
+  let delay = 1000; // Start with 1s interval
+
+  while (Date.now() - startTime < timeoutMs) {
+    const res = await fetch(`https://api.example.com/jobs/${jobId}`);
+    if (!res.ok) throw new Error(`HTTP Error ${res.status}`);
+
+    const data = await res.json();
+    if (data.status === 'COMPLETED') return data.result;
+    if (data.status === 'FAILED') throw new Error(`Job failed: ${data.error}`);
+
+    // Wait with exponential backoff up to 10 seconds max
+    await new Promise((resolve) => setTimeout(resolve, delay));
+    delay = Math.min(delay * 1.5, 10000);
+  }
+
+  throw new Error(`Polling timed out after ${timeoutMs} ms`);
+}
+```
+
+## Verification
+
+1. **Bandwidth reduction audit:** Monitor ingress traffic after switching from 2-second polling to webhooks. HTTP request volume should drop by **> 98%**.
+2. **Spoofed payload rejection test:** Send an invalid HMAC signature to the webhook receiver. Verify that it returns `400 Bad Request` in < 2 ms without executing application logic.
+3. **Duplicate delivery test:** Send the exact same webhook payload twice with the same `event.id`. Confirm that the receiver returns `200 OK` both times, but executes the business logic only once.
+
+## Why
+
+Polling is a pull model designed for an era when servers did not know the IP address of clients. It treats time as discrete buckets, forcing clients to repeatedly ask "Are we there yet?"
+
+Webhooks invert control into a reactive, push-based model. By notifying the client only when something meaningful has actually occurred, Webhooks maximize network efficiency, provide instantaneous response times, and reduce server operational costs to near zero during idle periods.
+
+## When Not To Use
+
+- **Clients behind strict corporate firewalls:** If an enterprise client cannot open port 443 to inbound traffic from the internet, webhooks are completely unworkable without an outbound WebSocket tunnel.
+- **Micro-tasks completing in < 100 ms:** If an API call finishes in 30 milliseconds, setting up asynchronous webhook infrastructure is complete overkill; simply make the API call synchronous.
+
+## Common Mistakes
+
+- **Blocking webhook responses with heavy processing:** Doing 10 seconds of video processing directly inside the webhook HTTP handler causes the provider to time out and fire duplicate retries. Always enqueue the payload to background workers and respond with `200 OK` immediately.
+- **Forgetting HMAC signature verification:** Accepting webhooks without verifying HMAC signatures allows anyone on the internet to send forged payment confirmations to your server.
+- **Non-idempotent webhook processing:** Webhook providers guarantee *at-least-once* delivery. If your receiver does not check for duplicate event IDs, customers will be credited twice.

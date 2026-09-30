@@ -1,0 +1,171 @@
+---
+title: "ហេតុអ្វីបានជា OFFSET pagination យឺត?"
+question: "ហេតុអ្វីបានជា OFFSET Pagination ធ្វើឱ្យ Database របស់ខ្ញុំដើរយឺតខ្លាំង?"
+summary: "OFFSET pagination បង្ខំឱ្យ database engine ត្រូវ scan, រាប់ចំនួន និងបោះចោលទិន្នន័យរាប់ម៉ឺនជួរចោល មុនពេលអាចប្រគល់ទំព័រដែលបានស្នើសុំ។ ជំនួស OFFSET ដោយប្រើ Keyset / Cursor-based pagination។"
+tags: [database, sql, postgres, pagination, performance]
+related: [problems/database-is-slow, problems/n-plus-one-queries]
+order: 16
+updated: "2026-09-12"
+contributors: [veasna]
+translation: draft
+---
+
+## Context
+
+កម្មវិធីមួយបង្ហាញបញ្ជីទំព័រនៃទិន្នន័យប្រតិបត្តិការ (transactions) ឬ audit logs ចំនួន 10 លាន rows។ API អនុវត្តការបែងចែកទំព័រតាមបែបស្តង់ដារ៖ `GET /api/transactions?page=1&limit=20` ដែលបម្លែងទៅជា SQL៖ `SELECT * FROM transactions ORDER BY created_at DESC LIMIT 20 OFFSET 0`។
+
+ទំព័រទី 1 ដំណើរការលឿនត្រឹមតែ 2 ms។ ទំព័រទី 10 ស៊ីពេលត្រឹម 8 ms។
+
+ប៉ុន្តែ នៅពេលដែល web crawler, ស្គ្រីប export របាយការណ៍, ឬអ្នកប្រើប្រាស់បើកទៅកាន់ទំព័រទី 5,000 (`OFFSET 100000`) query នោះស្រាប់តែស៊ីពេលដល់ទៅ **3,800 ms**។ នៅពេល bot រុករកទៅដល់ទំព័រទី 25,000 (`OFFSET 500000`) query នោះស៊ីពេលដល់ទៅ **18 វិនាទី** ដែលធ្វើឱ្យ CPU ឡើងពេញ និងអស់ connection slots របស់ database ទាំងស្រុង។
+
+## Symptoms
+
+- Latency នៃ Query កើនឡើងយឺតទៅតាមជម្រៅនៃទំព័រ៖
+  - ទំព័រទី 1 (`OFFSET 0`)៖ 2 ms
+  - ទំព័រទី 100 (`OFFSET 2,000`)៖ 45 ms
+  - ទំព័រទី 5,000 (`OFFSET 100,000`)៖ 3,800 ms
+  - ទំព័រទី 50,000 (`OFFSET 1,000,000`)៖ 35,000 ms (Timeout)
+- Database disk read buffers ស្ទុះឡើងខ្ពស់ខុសប្រក្រតី ដោយសារ database engine ត្រូវរុករក index range ដ៏ធំសម្បើម។
+- អ្នកប្រើប្រាស់ដែលបើកមើលទំព័រជ្រៅៗ ជួបប្រទះបញ្ហាទិន្នន័យរំកិលស្ទួន (ទិន្នន័យដែលឃើញលើទំព័រទី ១ លេចឡើងម្តងទៀតលើទំព័រទី ២ ដោយសារមានទិន្នន័យថ្មីទើបតែ insert ចូលពេលគេកំពុងចុច)។
+
+<Callout type="warning" title="OFFSET មិនបានលោតរំលង Rows លើ Disk ទេ; វាអាន រាប់ រួចបោះចោល">
+នៅពេលអ្នកដំណើរការ `LIMIT 20 OFFSET 100000` PostgreSQL មិនបានលោតផ្លោះទៅកាន់ជួរទី 100,001 ភ្លាមៗនោះឡើយ។ វាត្រូវអាន, parse, និងឆ្លងកាត់ជួរទិន្នន័យមុនៗទាំង 100,000 ជួរ, រាប់ចំនួនពួកវា, បោះចោលទាំងអស់ រួចទើបបញ្ជូន ២០ ជួរបន្ទាប់មកឱ្យអ្នក។
+</Callout>
+
+## Diagnose
+
+ដំណើរការ `EXPLAIN (ANALYZE, BUFFERS)` លើ query pagination ជ្រៅមួយ៖
+
+```sql
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT * FROM transactions
+ORDER BY created_at DESC
+LIMIT 20 OFFSET 200000;
+```
+
+សង្កេតមើលលទ្ធផលនៃការដំណើរការ៖
+
+```text
+Limit (actual time=2410.12..2410.15 rows=20 loops=1)
+  Buffers: shared hit=42100 read=18400
+  ->  Index Scan using idx_trans_created_at on transactions
+        (actual time=0.08..2395.10 rows=200020 loops=1)
+```
+
+កត់សម្គាល់ត្រង់ `rows=200020`៖ Database ត្រូវចំណាយកម្លាំង scan និងរាប់ទិន្នន័យជាង **២០០,០០០ rows** និងប៉ះពាល់ disk pages ចំនួន ៦០,០០០ ទំព័រ គ្រាន់តែដើម្បីផ្តល់ទិន្នន័យ ២០ ជួរមកឱ្យអ្នក!
+
+## Options
+
+1. **Optimize OFFSET ជាមួយ Deferred Join។** ទាញយកតែ primary keys ជាមួយ `OFFSET` រួចទើប `JOIN` ត្រឡប់មក table ធំវិញ។ (ជួយកាត់បន្ថយ I/O លើ columns ប៉ុន្តែនៅតែត្រូវ scan $N$ index rows ដដែល)។
+2. **កំណត់ពិដានទំព័រអតិបរមា (Hard Cap)។** មិនអនុញ្ញាតឱ្យបើកមើលលើសពីទំព័រទី 50 (`if (page > 50) throw BadRequest`)។ (ជាទម្លាប់ទូទៅលើ Google/Amazon Search ប៉ុន្តែមិនអាចប្រើលើការ export ទិន្នន័យ ឬ infinite scroll បានទេ)។
+3. **Keyset / Cursor-based Pagination។** ប្រើប្រាស់តម្លៃនៃ item ចុងក្រោយគេនៃទំព័រមុន ធ្វើជាចំណុចយោងក្នុងការ filter (`WHERE created_at < $last_seen_created_at LIMIT 20`)។
+
+## Trade-offs
+
+| យុទ្ធសាស្ត្រ | ល្បឿននៅទំព័រទី 1 | ល្បឿននៅទំព័រទី 10,000 | អាចលោតទៅទំព័រណាក៏បាន? | ភាពធន់នឹងការ Insert ព្រមគ្នា |
+| :--- | :--- | :--- | :--- | :--- |
+| **OFFSET Pagination** | **2 ms** | **18,000 ms (គាំង)** | **អាចបាន** | មិនធន់ (ទិន្នន័យរំកិលស្ទួន) |
+| **Deferred Join** | 2 ms | 1,200 ms | អាចបាន | មិនធន់ |
+| **កំណត់ត្រឹមទំព័រ 50** | 2 ms | មិនអនុញ្ញាត | ត្រឹមទំព័រ 50 | មិនធន់ |
+| **Keyset (Cursor)** | **2 ms** | **2 ms (លឿនរហ័ស!)** | **មិនបាន (តែ Next/Prev)** | **ធន់ ១០០% (ស្ថិរភាពល្អ)** |
+
+## Decision
+
+1. **សម្រាប់ Mobile Feeds, Activity Logs និង Infinite Scroll៖** ត្រូវប្រើប្រាស់ **Keyset (Cursor) Pagination** តែមួយគត់។ Latency នឹងនៅថេរក្រោម 5 ms ជានិច្ច មិនថាអ្នកស្ថិតនៅលើទំព័រទី ១ ឬទំព័រទី ១,០០០,០០០ ឡើយ។
+2. **សម្រាប់ Web Catalog Search ធំៗ៖** ប្រើ Keyset រួមផ្សំជាមួយ **ការកំណត់កម្រិតទំព័រអតិបរមាលើ UI** (អនុញ្ញាតឱ្យចុចលេខទំព័រត្រឹមទំព័រទី ២០ ហើយជំរុញឱ្យអ្នកប្រើប្រាស់ប្រើ filter ដើម្បីបង្រួមទិន្នន័យ ជំនួសឱ្យការចុចរហូតដល់ទំព័រទី ១០០,០០០)។
+
+## Implementation
+
+### 1. Keyset (Cursor) Pagination Query
+
+បង្កើត Index លើទាំង sorting column (`created_at`) និង unique tie-breaker (`id`)៖
+
+```sql
+CREATE INDEX idx_transactions_cursor 
+ON transactions (created_at DESC, id DESC);
+```
+
+ជំនួសឱ្យការប្រើ `OFFSET` សូមបញ្ជូនតម្លៃ `created_at` និង `id` នៃ item ចុងក្រោយគេដែលបង្ហាញលើអេក្រង់របស់ client៖
+
+```sql
+-- ទំព័រដំបូង៖
+SELECT id, amount, created_at
+FROM transactions
+ORDER BY created_at DESC, id DESC
+LIMIT 20;
+
+-- ទំព័របន្ទាប់ (ទាញយកទិន្នន័យដែលចាស់ជាង item ចុងក្រោយគេ)៖
+SELECT id, amount, created_at
+FROM transactions
+WHERE (created_at, id) < ($last_seen_created_at, $last_seen_id)
+ORDER BY created_at DESC, id DESC
+LIMIT 20;
+```
+
+### 2. Node.js API Implementation ជាមួយ Base64 Cursor៖
+
+```typescript
+import { pool } from './db';
+
+interface CursorData {
+  createdAt: string;
+  id: string;
+}
+
+export async function getTransactions(cursor?: string, limit = 20) {
+  let query = `
+    SELECT id, amount_cents, created_at 
+    FROM transactions
+  `;
+  const params: any[] = [];
+
+  if (cursor) {
+    // Decode base64 cursor
+    const decoded: CursorData = JSON.parse(Buffer.from(cursor, 'base64').toString('utf8'));
+    query += ` WHERE (created_at, id) < ($1, $2)`;
+    params.push(decoded.createdAt, decoded.id);
+  }
+
+  query += ` ORDER BY created_at DESC, id DESC LIMIT $${params.length + 1}`;
+  params.push(limit + 1); // ទាញយក limit + 1 ដើម្បីដឹងថាមានទំព័របន្ទាប់ឬអត់
+
+  const res = await pool.query(query, params);
+  const hasNextPage = res.rows.length > limit;
+  const items = res.rows.slice(0, limit);
+
+  // បង្កើត next cursor ពី item ចុងក្រោយគេ
+  let nextCursor: string | null = null;
+  if (hasNextPage) {
+    const lastItem = items[items.length - 1];
+    nextCursor = Buffer.from(
+      JSON.stringify({ createdAt: lastItem.created_at, id: lastItem.id })
+    ).toString('base64');
+  }
+
+  return { items, nextCursor, hasNextPage };
+}
+```
+
+## Verification
+
+1. **ការធ្វើតេស្តល្បឿនតាមជម្រៅទំព័រ៖** ដំណើរការ query ពីរ៖ ទំព័រទី 1 និងទំព័រទី 50,000។
+   - Query ទំព័រទី 1៖ 3 ms។
+   - Query Keyset ទំព័រទី 50,000៖ **3 ms**។
+   ពេលវេលាដំណើរការនៅថេរកម្រិត **Constant $O(1)$** ជានិច្ច មិនថាទំព័រជ្រៅប៉ុណ្ណាឡើយ។
+2. **គ្មានការរំកិលទិន្នន័យស្ទួនពេលមានការ Insert ព្រមគ្នា៖** បញ្ចូលទិន្នន័យថ្មីៗជាបន្តបន្ទាប់ខណៈពេលកំពុងចុចទំព័របន្ទាប់ ៥ ទំព័រ។ ផ្ទៀងផ្ទាត់ថាគ្មានទិន្នន័យណាត្រូវស្ទួន ឬបាត់បង់ឡើយ។
+
+## Why
+
+B-Tree indexes របស់ PostgreSQL រក្សាទុកទិន្នន័យតាមលំដាប់លំដោយ។ នៅពេលប្រើ `WHERE (created_at, id) < (...)` database ប្រើប្រាស់ **Direct Binary B-Tree Lookup ($O(\log N)$)** ដើម្បីស្វែងរកទីតាំង leaf node ត្រឹមត្រូវភ្លាមៗ រួចអាន ២០ ជួរបន្ទាប់តែប៉ុណ្ណោះ។
+
+ផ្ទុយទៅវិញ ជាមួយ `OFFSET 100000` database មិនអាចដឹងថាជួរទី 100,000 នៅត្រង់ណាឡើយ បើមិនបានដើររាប់ index pointers ទាំង 100,000 មុននោះម្តងមួយៗ ($O(N)$)។
+
+## When Not To Use
+
+- **Tables តូចៗ (< 500 rows)៖** សម្រាប់ admin lookup tables ដែលមានទិន្នន័យតែប៉ុន្មានសិបជួរ `OFFSET` គឺសាមញ្ញ ហើយមិនបង្កផលប៉ះពាល់ឡើយ។
+- **តម្រូវការលោតរំលងទំព័រតាមចិត្ត៖** ប្រសិនបើតម្រូវការអាជីវកម្មបង្ខំឱ្យអ្នកប្រើប្រាស់ត្រូវតែលោតទៅទំព័រទី 437 ភ្លាមៗ Keyset pagination មិនអាចធ្វើបានទេបើគ្មាន deferred join ជួយ។
+
+## Common Mistakes
+
+- **ភ្លេចដាក់ Unique Tie-breaker Column។** បើទិន្នន័យច្រើនមាន `created_at` ដូចគ្នាបេះបិទ ការ query `WHERE created_at < $1` នឹងរំលងចោលទិន្នន័យដទៃទៀតទាំងអស់ដែលមានម៉ោងស្មើគ្នានោះ! ត្រូវប្រើគូជាមួយ primary key ជានិច្ច៖ `(created_at, id) < ($1, $2)`។
+- **ដំណើរការ `SELECT count(*)` រាល់ពេលមាន Request ទំព័រ។** ការដំណើរការ `count(*)` ដែលគ្មាន index លើ table ១០ លាន rows គ្រាន់តែដើម្បីបង្ហាញ "ទំព័រទី ១ នៃ ៥០០,០០០" ស៊ីពេល ៥ វិនាទី។ ចៀសវាងការរាប់ចំនួនសរុបពិតប្រាកដលើ table ធំៗ; គ្រាន់តែបង្ហាញប៊ូតុង "ទំព័របន្ទាប់" ឬប៉ាន់ប្រមាណតាម `pg_class.reltuples`។

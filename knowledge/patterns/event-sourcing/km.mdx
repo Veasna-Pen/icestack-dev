@@ -1,0 +1,199 @@
+---
+title: "Event Sourcing"
+question: "តើខ្ញុំអាចរក្សាទុកប្រវត្តិនៃការផ្លាស់ប្តូរទិន្នន័យទាំងអស់ (Audit Trail) ដោយមិនបាត់បង់ និងមិនអាចកែប្រែបាន (Immutable) យ៉ាងដូចម្តេច?"
+summary: "ជំនួសឱ្យការកត់ត្រាជាន់ពីលើ (Overwrite) នូវទិន្នន័យចាស់ រាល់ការផ្លាស់ប្តូរទាំងអស់ត្រូវបានរក្សាទុកជាព្រឹត្តិការណ៍ (Events) បែប Append-only ដែលមិនអាចលុបឬកែបាន។ ស្ថានភាពបច្ចុប្បន្នត្រូវបានបង្កើតឡើងវិញដោយការរត់ Event ឡើងវិញ (Replay) តាំងពីដើមដំបូង ឬពី Snapshot។"
+tags: [architecture, event-sourcing, ddd, audit, append-only]
+related: [patterns/cqrs, patterns/transactional-outbox, tradeoffs/saga-orchestration-vs-choreography]
+order: 13
+updated: "2026-09-12"
+contributors: [veasna]
+translation: draft
+---
+
+## Context
+
+Database បែបប្រពៃណីរក្សាទុកតែ *ស្ថានភាពបច្ចុប្បន្ន (Current State)* នៃ Entity ប៉ុណ្ណោះ។ នៅពេលដែលអ្នកប្រើប្រាស់ផ្លាស់ប្តូរអាសយដ្ឋានដឹកជញ្ជូន ពាក្យបញ្ជា `UPDATE users SET address = '...' WHERE id = 1` នឹងសរសេរជាន់កម្ទេចអាសយដ្ឋានចាស់ចោលភ្លាម។
+
+ទោះបីជាវាសាមញ្ញ ប៉ុន្តែវាបំផ្លាញប្រវត្តិទិន្នន័យចោលទាំងអស់។ អ្នកនឹងមិនអាចឆ្លើយសំណួរសំខាន់ៗរបស់អាជីវកម្ម ឬច្បាប់បានឡើយ៖ "តើអាសយដ្ឋានរបស់អតិថិជននៅពេលកុម្ម៉ង់ Order #452 គឺជាអ្វី?", "តើនរណាជាអ្នកប្តូរលេខគណនីធនាគារនៅម៉ោង ២ ទៀបភ្លឺ?", ឬ "ហេតុអ្វីបានជាសមតុល្យលុយក្នុងកុងនេះធ្លាក់ចុះអវិជ្ជមាន?"
+
+**Event Sourcing** ផ្លាស់ប្តូរផ្នត់គំនិតនេះទាំងស្រុង។ ទិន្នន័យមិនដែលត្រូវបានកែប្រែ (Update) ឬលុបចោល (Delete) ឡើយ។ ផ្ទុយទៅវិញ រាល់ការផ្លាស់ប្តូរទាំងអស់ត្រូវបានកត់ត្រាទុកជា Domain Event ដែលមិនអាចកែប្រែបាន (Immutable Append-only Log) ដូចជា `AccountOpened`, `MoneyDeposited`, `AddressChanged`។ ស្ថានភាពបច្ចុប្បន្ន គឺជាលទ្ធផលនៃការបូកសរុប (Replay) ព្រឹត្តិការណ៍ទាំងអស់តាំងពីបង្កើតដំបូងមក។
+
+## Symptoms
+
+- ស្ថាប័នត្រួតពិនិត្យច្បាប់ ឬសវនករទាមទារចង់បាន Audit Log ជាក់លាក់នៃគ្រប់ការផ្លាស់ប្តូរទាំងអស់ ប៉ុន្តែ Database រក្សាទុកតែទិន្នន័យបច្ចុប្បន្ន។
+- Developer ត្រូវសរសេរ Database Triggers ឬបង្កើតតារាងស្រមោល (`users_history`) ស្មុគស្មាញ ដែលពិបាកថែទាំ និងងាយនឹងខុសទិន្នន័យ។
+- ការ Debug រកមូលហេតុនៃបញ្ហាក្នុង Production មានភាពលំបាកខ្លាំង ដោយសារគ្មាននរណាដឹងថាមានព្រឹត្តិការណ៍អ្វីខ្លះបានកើតឡើងមុនពេលទិន្នន័យខូច។
+- ថ្នាក់ដឹកនាំអាជីវកម្មចង់ដឹងទិន្នន័យតាមពេលវេលាក្នុងអតីតកាល (Time-travel Query) ដូចជា "បង្ហាញចំនួនទំនិញក្នុងស្តុកកាលពីចុងខែមុន"។
+
+<Callout type="warning" title="ពាក្យបញ្ជា UPDATE ក្នុង CRUD បំផ្លាញបំណងអាជីវកម្មចោលជារៀងរហូត">
+នៅពេលអ្នកដំណើរការ `UPDATE` ដាតាបេសគ្រាន់តែកត់ត្រាថាតើទិន្នន័យមើលទៅដូចម្តេចនៅពេលនេះ ប៉ុន្តែវាលុបបំបាត់ចោលទាំងស្រុងនូវ *ហេតុអ្វី* បានជាវាផ្លាស់ប្តូរ, *នរណា* ជាអ្នកប្តូរ, និង *ស្ថានភាពដើម* របស់វាពីមុន។
+</Callout>
+
+## Diagnose
+
+1. **ពិនិត្យមើលលក្ខខណ្ឌច្បាប់ និងអនុលោមភាព (Compliance)៖** តើអាជីវកម្មរបស់អ្នកស្ថិតក្នុងវិស័យហិរញ្ញវត្ថុ, ធនាគារ, សុខាភិបាល, ឬដឹកជញ្ជូន ដែលច្បាប់តម្រូវឱ្យមានប្រវត្តិទិន្នន័យច្បាស់លាស់មែនទេ?
+2. **ពិនិត្យមើលតារាង Audit Log បច្ចុប្បន្ន៖** តើអ្នកកំពុងបង្កើតតារាង `audit_logs` ដោយដៃក្នុងកូដ Application ដែលជារឿយៗភ្លេចកត់ត្រានៅពេលមានកូដ Update ថ្មីមែនទេ?
+3. **វាយតម្លៃតម្រូវការ Temporal Query៖** តើអ្នកវិភាគទិន្នន័យតែងតែសួរសំណួរអំពីស្ថានភាពទិន្នន័យនៅចំណុចណាមួយជាក់លាក់ក្នុងអតីតកាលដែរឬទេ?
+4. **ពិនិត្យមើលព្រំដែននៃ Aggregate៖** តើដំណើរជីវិតរបស់ទិន្នន័យត្រូវបានកំណត់ដោយ Business Events ច្បាស់លាស់ (ដូចជា `OrderPlaced`, `PaymentAuthorized`, `OrderShipped`) ដែរឬទេ?
+
+## Options
+
+1. **CRUD ជាមួយតារាង Audit Log៖** បន្តប្រើ `UPDATE` ធម្មតា ប៉ុន្តែសរសេរទិន្នន័យស្ទួនមួយជួរទៀតចូលក្នុងតារាង `audit_events`។ (មិនអាចធានាភាពស៊ីសង្វាក់ ១០០% ទេ ប្រសិនបើកូដ Audit ជួបបញ្ហា Error)។
+2. **Database Change Data Capture (CDC)៖** ប្រើប្រាស់ Debezium ឬ System Versioning ក្នុង SQL ដើម្បីចាប់យកភាពខុសគ្នានៃជួរទិន្នន័យ។ (ល្អសម្រាប់ Technical Audit ប៉ុន្តែខ្វះ Business Context)។
+3. **Event Sourcing ពិតប្រាកដ៖** យក Append-only Event Store ធ្វើជា Single Source of Truth តែមួយគត់។ ស្ថានភាពបច្ចុប្បន្នមិនត្រូវបានរក្សាទុកជាតារាងមេឡើយ តែត្រូវបាន Reconstruct តាមតម្រូវការ ឬ Projected ទៅកាន់ Read Model។
+4. **Event Sourcing ជាមួយ Snapshots៖** រក្សាទុក Events ផង និងរក្សាទុក Snapshot នៃ State រៀងរាល់ ១០០ Events ម្តង ដើម្បីឱ្យការ Rehydrate លឿនក្នុងកម្រិតមិល្លីវិនាទី។
+
+## Trade-offs
+
+| ស្ថាបត្យកម្ម | សមត្ថភាព Audit និងប្រវត្តិ | Time-Travel Queries | ភាពសាមញ្ញនៃការ Query | ការកើនឡើងទំហំផ្ទុក |
+| :--- | :--- | :--- | :--- | :--- |
+| **CRUD ប្រពៃណី** | គ្មាន (លុះត្រាតែកត់ដៃ) | មិនអាចទៅរួច | ខ្ពស់បំផុត (`SELECT` ធម្មតា) | ថេរ (កត់ត្រាជាន់លើ) |
+| **CRUD + Audit Table** | មធ្យម (ងាយនឹងភ្លេចកត់) | ពិបាក (ត្រូវរៀបឡើងវិញ) | ខ្ពស់ | មធ្យម |
+| **Event Sourcing** | ១០០% ពេញលេញ និង Immutable | មានស្រាប់ (Replay តាមម៉ោង) | ទាមទារ CQRS Read Model | ខ្ពស់ (កើនឡើងរហូត) |
+| **Event Sourcing + Snapshots** | ១០០% ពេញលេញ | មានស្រាប់ | Rehydrate លឿនបំផុត | ខ្ពស់ |
+
+## Decision
+
+- **ប្រើប្រាស់ Event Sourcing សម្រាប់ប្រព័ន្ធស្នូលហិរញ្ញវត្ថុ និងគណនេយ្យ៖** គណនីធនាគារ, ការគ្រប់គ្រង Order, កំណត់ត្រាវេជ្ជសាស្ត្រ, និងប្រព័ន្ធស្តុកទំនិញ។
+- **កុំប្រើ Event Sourcing សម្រាប់ទិន្នន័យបណ្តោះអាសន្ន៖** User Session Tokens, Cache ទិន្នន័យបណ្តោះអាសន្ន, ឬ UI Preferences គួរតែរក្សាទុកជា Key-Value ឬ CRUD ធម្មតា។
+- **បង្កើត Snapshot តាំងពីដំបូង៖** រាល់ Aggregate ណាដែលមាន Events លើសពី ៥០ ឡើងទៅ ត្រូវតែរក្សាទុក Snapshot រៀងរាល់ ៥០ ឬ ១០០ Events ម្តង ដើម្បីការពារកុំឱ្យការទាញយកមកប្រើប្រាស់មានភាពយឺតយ៉ាវ។
+- **ចាត់ទុក Events ជាកិច្ចសន្យាដែលមិនអាចផ្លាស់ប្តូរបាន៖** នៅពេល Event ត្រូវបានកត់ត្រាក្នុង Production រួចរាល់ វាមិនអាចកែប្រែ ឬលុបចោលបានឡើយ។ បើត្រូវការផ្លាស់ប្តូរ Schema ត្រូវប្រើ Versioning (`OrderPlacedV1`, `OrderPlacedV2`)។
+- **ត្រូវប្រើគូជាមួយ CQRS ជានិច្ច៖** អ្នកមិនអាច Query `SELECT * WHERE status = 'PENDING'` លើ Event Stream ដោយផ្ទាល់ឱ្យមានប្រសិទ្ធភាពបានឡើយ។ ត្រូវ Project ព្រឹត្តិការណ៍ទាំងនោះទៅកាន់ Read Model ជាមុនសិន។
+
+## Implementation
+
+### 1. ការកំណត់ Domain Events និង Bank Account Aggregate៖
+
+```typescript
+// ១. ព្រឹត្តិការណ៍ Domain Events ដែលមិនអាចកែប្រែបាន
+export type BankAccountEvent =
+  | { type: 'AccountOpened'; accountId: string; owner: string; initialBalanceCents: number; timestamp: string }
+  | { type: 'MoneyDeposited'; accountId: string; amountCents: number; timestamp: string }
+  | { type: 'MoneyWithdrawn'; accountId: string; amountCents: number; timestamp: string };
+
+// ២. Aggregate Root ដែលបង្កើតស្ថានភាពបច្ចុប្បន្នចេញពី Events
+export class BankAccount {
+  public id!: string;
+  public owner!: string;
+  public balanceCents = 0;
+  public version = 0;
+
+  // រត់ Replay ព្រឹត្តិការណ៍អតីតកាលឡើងវិញដើម្បីបង្កើត Current State
+  static fromEvents(events: BankAccountEvent[]): BankAccount {
+    const account = new BankAccount();
+    for (const event of events) {
+      account.apply(event);
+      account.version++;
+    }
+    return account;
+  }
+
+  // ផ្ទៀងផ្ទាត់ច្បាប់អាជីវកម្មធៀបនឹងស្ថានភាពបច្ចុប្បន្ន មុននឹងបង្កើត Event ថ្មី
+  withdraw(amountCents: number): BankAccountEvent {
+    if (amountCents <= 0) throw new Error('ចំនួនទឹកប្រាក់ដកត្រូវតែធំជាងសូន្យ');
+    if (this.balanceCents < amountCents) {
+      throw new Error(`សមតុល្យមិនគ្រប់គ្រាន់៖ មានត្រឹម ${this.balanceCents} តែចង់ដក ${amountCents}`);
+    }
+
+    return {
+      type: 'MoneyWithdrawn',
+      accountId: this.id,
+      amountCents,
+      timestamp: new Date().toISOString(),
+    };
+  }
+
+  // State Mutation Handler (Pure function គណនា State ថ្មីតាម Event)
+  private apply(event: BankAccountEvent) {
+    switch (event.type) {
+      case 'AccountOpened':
+        this.id = event.accountId;
+        this.owner = event.owner;
+        this.balanceCents = event.initialBalanceCents;
+        break;
+      case 'MoneyDeposited':
+        this.balanceCents += event.amountCents;
+        break;
+      case 'MoneyWithdrawn':
+        this.balanceCents -= event.amountCents;
+        break;
+    }
+  }
+}
+```
+
+### 2. Append-Only SQL Event Store ជាមួយ Optimistic Concurrency៖
+
+```typescript
+export class EventStore {
+  constructor(private readonly pool: any) {}
+
+  async append(streamId: string, expectedVersion: number, events: BankAccountEvent[]) {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      // ១. ពិនិត្យមើល Version ដើមដើម្បីការពារការសរសេរជាន់គ្នា (Concurrency Conflict)
+      const versionRes = await client.query(
+        'SELECT COALESCE(MAX(version), 0) AS current_version FROM event_stream WHERE stream_id = $1',
+        [streamId]
+      );
+      const currentVersion = parseInt(versionRes.rows[0].current_version, 10);
+
+      if (currentVersion !== expectedVersion) {
+        throw new Error(`ជួប Concurrency Conflict លើ Stream ${streamId}៖ រំពឹងទុក ${expectedVersion} តែជាក់ស្តែងឃើញ ${currentVersion}`);
+      }
+
+      // ២. បន្ថែម Events ថ្មីចូលទៅខាងចុង (Append-only)
+      let newVersion = currentVersion;
+      for (const event of events) {
+        newVersion++;
+        await client.query(
+          `INSERT INTO event_stream (stream_id, version, event_type, payload, created_at)
+           VALUES ($1, $2, $3, $4, NOW())`,
+          [streamId, newVersion, event.type, JSON.stringify(event)]
+        );
+      }
+
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
+  async loadStream(streamId: string): Promise<BankAccountEvent[]> {
+    const res = await this.pool.query(
+      'SELECT payload FROM event_stream WHERE stream_id = $1 ORDER BY version ASC',
+      [streamId]
+    );
+    return res.rows.map((row: any) => row.payload);
+  }
+}
+```
+
+## Verification
+
+1. **ផ្ទៀងផ្ទាត់ភាពប្រាកដនិយមនៃការ Replay (Determinism)៖** Rehydrate គណនីចេញពី ១,០០០ Events ចំនួន ១០ ដងក្នុង Test Suite។ ធានាថាលទ្ធផលសមតុល្យចុងក្រោយគឺដូចគ្នា ១០០% គ្រប់ពេល។
+2. **ផ្ទៀងផ្ទាត់ Concurrency Conflict៖** សាកល្បងដំណើរការដកប្រាក់ពីរព្រមគ្នាប្រជែងគ្នាលើ Version 5 នៃគណនីតែមួយ។ ពិនិត្យមើលថាប្រតិបត្តិការមួយទទួលបានជោគជ័យ ហើយមួយទៀតត្រូវបរាជ័យភ្លាមៗដោយសារ Concurrency Conflict ដោយមិនធ្វើឱ្យខូចសមតុល្យប្រាក់ឡើយ។
+3. **ផ្ទៀងផ្ទាត់ Time-travel Query៖** Replay តែព្រឹត្តិការណ៍ដែលកើតឡើងមុនកាលបរិច្ឆេទ `2026-01-01`។ ផ្ទៀងផ្ទាត់ថាសមតុល្យដែលគណនាបាន ត្រូវគ្នាឥតខ្ចោះជាមួយរបាយការណ៍ធនាគារកាលពីចុងឆ្នាំមុន។
+4. **ការវាស់ល្បឿន Snapshot៖** វាស់វែងរយៈពេល Rehydration សម្រាប់ Entity ដែលមាន ១០,០០០ Events រវាងការប្រើ Snapshot និងមិនប្រើ។ ធានាថា Snapshot ជួយឱ្យល្បឿននៅក្រោម 5 ms ជានិច្ច។
+
+## Why
+
+នៅក្នុងពិភពពិត ប្រតិបត្តិការទាំងអស់សុទ្ធតែជាព្រឹត្តិការណ៍ (Events)៖ អតិថិជនដាក់ប្រាក់ក្នុងធនាគារ, អ្នកដំណើរទិញសំបុត្រយន្តហោះ, គ្រូពេទ្យចេញវេជ្ជបញ្ជា។ ពិភពពិតគឺបែប Append-only; អ្នកមិនអាច "លុប" អតីតកាលបានទេ អ្នកអាចធ្វើបានត្រឹមតែកត់ត្រាព្រឹត្តិការណ៍កែតម្រូវថ្មីមួយទៀតនៅពេលក្រោយប៉ុណ្ណោះ។
+
+Event Sourcing រៀបចំប្រព័ន្ធ Software ឱ្យឆ្លុះបញ្ចាំងពីការពិត។ តាមរយៈការកត់ត្រាការពិតនៅពេលវាកើតឡើង វាធានាថានឹងគ្មានព័ត៌មានណាមួយត្រូវបានបាត់បង់ឡើយ ផ្តល់នូវ Audit Log ដ៏ល្អឥតខ្ចោះ និងអនុញ្ញាតឱ្យអាជីវកម្មអាចស្វែងរកការយល់ដឹងថ្មីៗពីទិន្នន័យអតីតកាលនៅពេលក្រោយបាន។
+
+## When Not To Use
+
+- **CRUD ដែលមានការកែប្រែញឹកញាប់តែមិនខ្វល់ពី Audit៖** ឧបករណ៍ IoT ដែលរាយការណ៍កូអរដោនេ GPS រៀងរាល់ ១០០ មិល្លីវិនាទី នឹងបង្កើត Events រាប់ពាន់លានដែលគ្មានតម្លៃអាជីវកម្មលើសពីការដឹងទីតាំងចុងក្រោយឡើយ។
+- **ច្បាប់លុបទិន្នន័យឯកជនភាពតឹងរ៉ឹង (GDPR Right to be Forgotten)៖** ក្នុង Event Store ដែលមិនអាចលុបបាន ការលុបទិន្នន័យផ្ទាល់ខ្លួនរបស់ User តម្រូវឱ្យប្រើបច្ចេកទេស Crypto Shredding (ការប្រើ Encryption Key ផ្ទាល់ខ្លួនរបស់ User ម្នាក់ៗ រួចលុប Key នោះចោល)។
+
+## Common Mistakes
+
+- **រក្សាទុកស្ថានភាពដែលគណនារួចក្នុង Events៖** Event គួរតែកត់ត្រាតែអង្គហេតុ និងទិន្នន័យដើម (ឧ. `ItemsOrdered`) កុំកត់ត្រាតួលេខសរុបដែលបានគណនា ព្រោះបើរូបមន្តពន្ធឬបញ្ចុះតម្លៃប្រែប្រួលនៅពេលក្រោយ វានឹងធ្វើឱ្យទិន្នន័យខុស។
+- **កែប្រែ Events ចាស់ៗក្នុង Production៖** ការកែប្រែ Events អតីតកាលនឹងធ្វើឱ្យខូច Projection ទាំងអស់ និងបំផ្លាញទំនុកចិត្តលើ Audit Log ទាំងស្រុង។
+- **ភ្លេចប្រើ Snapshot លើ Aggregate ដែលមានអាយុកាលយូរ៖** ការត្រូវ Replay ៥០,០០០ Events ដើម្បីគ្រាន់តែគណនាសមតុល្យកុង នឹងបង្កឱ្យមាន Latency រាប់វិនាទីលើគ្រប់ Transaction ទាំងអស់។

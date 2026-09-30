@@ -1,0 +1,23 @@
+---
+title: "Background jobs and queues"
+summary: "Move slow work out of the request, run it reliably on workers, and keep the queue healthy when jobs fail or pile up."
+level: intermediate
+order: 4
+outcomes:
+  - "Decide which work belongs in the request and which in the background"
+  - "Hand work to a queue and process it with workers that can safely retry"
+  - "Stop failing jobs from blocking the queue with a dead-letter queue"
+  - "Notice when a queue grows faster than it drains, and what to do about it"
+prerequisites:
+  - "You have built an API endpoint that does more than one thing, such as saving and sending an email"
+  - "You can run Redis, RabbitMQ or a similar broker with Docker"
+related: [tradeoffs/sync-vs-async, patterns/dead-letter-queue, problems/unbounded-queue-backpressure, patterns/transactional-outbox, problems/should-i-use-kafka]
+updated: "2026-09-30"
+contributors: [Veasna-Pen]
+---
+
+A sign-up request that saves a user, sends a welcome email, resizes an avatar and notifies a CRM can take seconds, and fails whenever any of those services has a bad minute. Most of that work doesn't need to happen before the user sees "Welcome".
+
+This course shows how to move it out of the way. You start by deciding **what** to move, then hand it to a **queue** and **workers**, then handle jobs that keep failing with a **dead-letter queue**, and finish with the question every queue eventually asks: what happens when work arrives faster than you can do it?
+
+The examples use Node.js with BullMQ on Redis, but the ideas are the same with Sidekiq, Celery, Laravel queues, RabbitMQ or SQS.

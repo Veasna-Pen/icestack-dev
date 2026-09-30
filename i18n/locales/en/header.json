@@ -1,0 +1,38 @@
+{
+  "switchLanguage": "ប្តូរទៅជាភាសាខ្មែរ (Switch to Khmer)",
+  "switchToLight": "Switch to Light theme",
+  "switchToDark": "Switch to Dark theme",
+  "menu": {
+    "learn": "Learn",
+    "knowledge": "Knowledge",
+    "community": "Community",
+    "explore": "Explore",
+    "startCourse": "Start a course",
+    "methodPath": "The method path",
+    "howToThinkRole": "Think it through, step by step",
+    "commonQuestions": "Common questions",
+    "contribute": "Contribute",
+    "helpTranslate": "Help translate",
+    "translateLabel_one": "page needs Khmer",
+    "translateLabel_other": "pages need Khmer",
+    "translateCta": "Pick one to translate",
+    "items": {
+      "guide": {
+        "title": "Contributor guide",
+        "description": "Write, preview and submit a page"
+      },
+      "pageTemplate": {
+        "title": "Page template",
+        "description": "The headings every page walks"
+      },
+      "lessonTemplate": {
+        "title": "Lesson template",
+        "description": "The six steps of every lesson"
+      },
+      "propose": {
+        "title": "Propose a topic",
+        "description": "Open an issue before you write"
+      }
+    }
+  }
+}

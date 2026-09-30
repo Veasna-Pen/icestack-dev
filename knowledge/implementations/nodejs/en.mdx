@@ -1,0 +1,184 @@
+---
+title: "Node.js"
+question: "How do I implement async timeouts, pg connection pooling, idempotency, and rate limiting in Node.js?"
+summary: "Timeouts, retries, idempotency keys, caching, rate limiting and background jobs in Node.js and TypeScript, in small pieces of code you can read in one sitting."
+tags: [nodejs, typescript, express, implementation]
+related: [patterns/retry, patterns/idempotency, patterns/caching, patterns/rate-limiting]
+order: 1
+updated: "2026-09-11"
+---
+
+Production resilience patterns in modern Node.js 22 and TypeScript with Express 5. Demonstrates explicit socket and fetch timeouts, pg pool lifecycle configuration, transactional idempotency, and in-memory rate limiting.
+
+## Timeouts first
+
+Every call that leaves the process needs a deadline before it needs a retry. `AbortSignal.timeout` works with the built-in `fetch`:
+
+```ts
+const res = await fetch('https://api.example.com/rates', {
+  signal: AbortSignal.timeout(2000) // give up after 2 s instead of waiting forever
+});
+if (!res.ok) throw Object.assign(new Error(`HTTP ${res.status}`), { status: res.status });
+```
+
+For Postgres, set timeouts on the pool so a runaway query can't hold a connection:
+
+```ts
+import pg from 'pg';
+
+export const pool = new pg.Pool({
+  connectionString: process.env.DATABASE_URL,
+  max: 10,
+  statement_timeout: 5000,        // ms, enforced by Postgres
+  connectionTimeoutMillis: 2000   // how long to wait for a free connection
+});
+```
+
+## Retry with backoff
+
+Retry only transient failures, with full jitter and an overall deadline. [Retry](../../patterns/retry) covers when not to.
+
+```ts
+const TRANSIENT = new Set([408, 429, 500, 502, 503, 504]);
+
+const isTransient = (err: any) =>
+  err?.name === 'TimeoutError' || err?.code === 'ECONNRESET' || TRANSIENT.has(err?.status);
+
+export async function withRetry<T>(fn: () => Promise<T>, attempts = 3, baseMs = 100, deadlineMs = 5000): Promise<T> {
+  const started = Date.now();
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      const elapsed = Date.now() - started;
+      if (attempt >= attempts || !isTransient(err) || elapsed >= deadlineMs) throw err;
+      const delay = Math.random() * Math.min(2000, baseMs * 2 ** (attempt - 1));
+      await new Promise(resolve => setTimeout(resolve, Math.min(delay, deadlineMs - elapsed)));
+    }
+  }
+}
+```
+
+## Idempotency keys
+
+The key is claimed in the same transaction as the order, and the primary key on `idempotency_keys.key` does the concurrency work: a second request with the same key waits for the first to commit, then finds its stored response. The full reasoning is on [Idempotency](../../patterns/idempotency).
+
+```ts
+app.post('/orders', async (req, res) => {
+  const key = req.header('Idempotency-Key');
+  if (!key) return res.status(400).json({ error: 'Idempotency-Key header is required' });
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const claimed = await client.query(
+      'INSERT INTO idempotency_keys (key) VALUES ($1) ON CONFLICT DO NOTHING RETURNING key',
+      [key]
+    );
+
+    if (claimed.rowCount === 0) {
+      const { rows } = await client.query('SELECT response FROM idempotency_keys WHERE key = $1', [key]);
+      await client.query('ROLLBACK');
+      return rows[0]?.response
+        ? res.json(rows[0].response)
+        : res.status(409).json({ error: 'The original request is still in progress' });
+    }
+
+    const { rows } = await client.query(
+      'INSERT INTO orders (customer_id, total_cents) VALUES ($1, $2) RETURNING *',
+      [req.body.customerId, req.body.totalCents]
+    );
+    await client.query('UPDATE idempotency_keys SET response = $2 WHERE key = $1', [key, rows[0]]);
+    await client.query('COMMIT');
+    res.status(201).json(rows[0]);
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+});
+```
+
+## Caching
+
+For a single server, or data that may briefly differ between servers, an in-process LRU with a single-flight refill is enough. The shared Redis version is on [Caching](../../patterns/caching).
+
+```ts
+import { LRUCache } from 'lru-cache';
+
+type Product = { id: string; name: string; price_cents: number };
+
+const cache = new LRUCache<string, Product>({ max: 5000, ttl: 60_000 });
+const inflight = new Map<string, Promise<Product | null>>();
+
+export function getProduct(id: string): Promise<Product | null> {
+  const key = `product:${id}`;
+  const hit = cache.get(key);
+  if (hit) return Promise.resolve(hit);
+
+  let pending = inflight.get(key);
+  if (!pending) {
+    pending = pool
+      .query<Product>('SELECT id, name, price_cents FROM products WHERE id = $1', [id])
+      .then(result => {
+        const row = result.rows[0] ?? null;
+        if (row) cache.set(key, row);
+        return row;
+      })
+      .finally(() => inflight.delete(key));
+    inflight.set(key, pending);
+  }
+  return pending;
+}
+```
+
+## Rate limiting
+
+`express-rate-limit` with a Redis store gives one shared limit across every instance of the app:
+
+```ts
+import { rateLimit } from 'express-rate-limit';
+import { RedisStore } from 'rate-limit-redis';
+import { createClient } from 'redis';
+
+const redisClient = createClient({ url: process.env.REDIS_URL });
+await redisClient.connect();
+
+app.set('trust proxy', 1); // behind one proxy: take the client address from X-Forwarded-For
+
+app.use('/api', rateLimit({
+  windowMs: 60_000,
+  limit: 100,
+  standardHeaders: 'draft-7', // RateLimit headers tell clients where they stand
+  legacyHeaders: false,
+  store: new RedisStore({ sendCommand: (...args: string[]) => redisClient.sendCommand(args) })
+}));
+```
+
+This limits by IP address. To limit by API key or user instead, pass a `keyGenerator`; the library's documentation explains how to handle IPv6 addresses safely when you do.
+
+## Background jobs
+
+BullMQ moves slow work out of the request. A fixed `jobId` stops the same job being queued twice, and the handler must still be idempotent, because a job can run again after a worker crash:
+
+```ts
+import { Queue, Worker } from 'bullmq';
+import IORedis from 'ioredis';
+
+const connection = new IORedis(process.env.REDIS_URL!, { maxRetriesPerRequest: null });
+export const emails = new Queue('emails', { connection });
+
+// In the request handler, after the order has committed:
+await emails.add('receipt', { orderId }, {
+  jobId: `receipt:${orderId}`,
+  attempts: 5,
+  backoff: { type: 'exponential', delay: 1000 },
+  removeOnComplete: 1000
+});
+
+// In a separate worker process:
+new Worker('emails', async job => {
+  await sendReceipt(job.data.orderId); // checks receipt_sent_at before sending
+}, { connection });
+```

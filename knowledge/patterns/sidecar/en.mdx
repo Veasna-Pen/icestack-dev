@@ -1,0 +1,154 @@
+---
+title: "Sidecar"
+question: "How do I add cross-cutting infrastructure features (mTLS, logging, proxies, metrics) to applications without polluting business logic or language runtimes?"
+summary: "Deploy a secondary helper container alongside the primary application container within the same Pod or host. The sidecar shares network namespace (localhost) and storage volumes, transparently offloading telemetry, security, or proxy routing."
+tags: [architecture, kubernetes, sidecar, containers, cloud-native]
+related: [patterns/api-gateway, patterns/circuit-breaker, patterns/health-check]
+order: 19
+updated: "2026-09-12"
+contributors: [veasna]
+---
+
+## Context
+
+In an organization with polyglot microservices (Node.js, Go, Python, Java, Rust), platform engineers need to enforce company-wide operational standards: mutual TLS encryption (mTLS), distributed tracing headers, log collection to Datadog or Elasticsearch, metric exports to Prometheus, and secrets rotation.
+
+Implementing these capabilities inside the application code is painful. Every team must import, configure, and maintain 5 different client SDKs. If a critical security vulnerability is found in the OpenSSL or TLS library, every single service across the company must update dependencies, retest, and redeploy.
+
+The **Sidecar Pattern** solves this by deploying a supporting helper process or container alongside the main application container. Like a sidecar attached to a motorcycle, the helper process shares the lifecycle, filesystem volumes, and network namespace (`localhost`) with the main application, without modifying the application code itself.
+
+## Symptoms
+
+- Application code is bloated with hundreds of lines of boilerplate for log formatting, tracing header propagation, and TLS certificate loading.
+- A polyglot engineering team wastes weeks reimplementing the exact same rate-limiting, retry, or encryption logic across 4 different programming languages.
+- Security updates to TLS protocols or tracing agents require rebuilding and redeploying dozens of distinct application codebases.
+- Monitored application processes crash because a slow log forwarder or telemetry exporter runs out of memory in the application process.
+
+<Callout type="warning" title="Shared localhost creates invisible network dependencies">
+Because the main container and sidecar share the same network loopback (`localhost`), port collisions can occur. If your app and sidecar both try to bind port 8080, the pod will fail to start.
+</Callout>
+
+## Diagnose
+
+1. **Audit language library duplication:** Are your Go, Python, and Node.js teams maintaining separate custom libraries for logging, telemetry, and mTLS?
+2. **Review pod container counts:** Inspect your Kubernetes deployments. Are you running single-container pods where telemetry logic runs inside the application process?
+3. **Measure maintenance overhead:** How many engineering hours were spent during the last security patch updating OpenSSL/TLS libraries across all services?
+4. **Inspect process memory footprints:** Is a Node.js single-threaded event loop spending 20% of its CPU serializing and shipping log files over HTTPS?
+
+## Options
+
+1. **In-process shared libraries (SDKs):** Import language-specific libraries (e.g., OpenTelemetry SDK, Datadog Tracer) into application code. (Tightly coupled, language-dependent).
+2. **Host / DaemonSet agent:** Run one telemetry agent per physical Kubernetes node (e.g. Datadog agent DaemonSet). (Efficient, but cannot intercept or inject into individual pod network namespaces).
+3. **Container Sidecar (Pod co-location):** Run Envoy, Fluentbit, or Vault Agent as a secondary container inside the same Kubernetes Pod. (Language-agnostic, complete network isolation, independent resource limits).
+4. **Service Mesh (Istio, Linkerd):** Automated sidecar injection that intercepts all inbound and outbound pod network traffic via iptables.
+
+## Trade-offs
+
+| Strategy | Language Independence | Resource Efficiency | Coupling | Maintenance Agility |
+| :--- | :--- | :--- | :--- | :--- |
+| **In-Process SDK** | None (rewrite per language) | High (single process) | High (compiled into app) | Poor (redeploy everything) |
+| **Node DaemonSet** | High | Maximum (1 agent per node) | Low | Good |
+| **Container Sidecar** | **Complete (polyglot)** | Medium (small container RAM) | **Zero (talks via localhost)** | **Instant (update sidecar image)** |
+| **Service Mesh** | Complete | Lower (Envoy per pod) | Zero | Complex to operate |
+
+## Decision
+
+- **Use Sidecars for cross-cutting operational concerns:**
+  - *Network Proxies:* Envoy or Linkerd for transparent mTLS encryption, circuit breaking, and traffic shadowing.
+  - *Log Collection:* Fluentbit or Vector reading log files from a shared `/var/log` memory volume and shipping them to Loki/Elasticsearch.
+  - *Secret Management:* HashiCorp Vault Agent sidecar fetching temporary dynamic database credentials and rendering them to a local configuration file.
+- **Communicate strictly over `localhost` or shared volumes:** Application containers should communicate with sidecars via `http://localhost:<sidecar-port>` or by writing to a shared emptyDir volume.
+- **Set independent resource requests and limits:** Always allocate dedicated CPU and memory limits to sidecar containers to prevent a log forwarder from starving the primary business API.
+- **Order container startup and shutdown:** Ensure the sidecar starts *before* the application container and terminates *after* the application finishes draining in-flight requests.
+
+## Implementation
+
+### Kubernetes Pod Spec with a Fluentbit Log Shipper and Envoy Proxy Sidecar:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: order-service
+spec:
+  replicas: 3
+  template:
+    spec:
+      volumes:
+        # Shared in-memory volume for logs
+        - name: shared-logs
+          emptyDir: {}
+
+      containers:
+        # 1. Primary Application Container (Pure Business Logic)
+        - name: order-api
+          image: order-api:v1.2.0
+          ports:
+            - containerPort: 8080
+          volumeMounts:
+            - name: shared-logs
+              mountPath: /var/log/app
+          env:
+            # Application logs to local file, leaving shipping to the sidecar
+            - name: LOG_PATH
+              value: /var/log/app/orders.log
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "1000m"
+              memory: "1024Mi"
+
+        # 2. Sidecar Container: Fluentbit Log Collector
+        # Language-agnostic, automatically ships logs to cloud aggregator
+        - name: log-shipper-sidecar
+          image: fluent/fluent-bit:2.2
+          volumeMounts:
+            - name: shared-logs
+              mountPath: /var/log/app
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "100m"
+              memory: "128Mi"
+
+        # 3. Sidecar Container: Envoy Local Proxy (mTLS & Outbound Retries)
+        - name: envoy-sidecar
+          image: envoyproxy/envoy:v1.28-latest
+          ports:
+            - containerPort: 15001 # Inbound mesh port
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "200m"
+              memory: "256Mi"
+```
+
+## Verification
+
+1. **Localhost connectivity test:** From inside the primary container, run `curl http://localhost:15001/ready`. Verify that the Envoy sidecar is reachable over loopback.
+2. **Log shipping isolation test:** Blast the application with high log output. Verify that the primary container CPU remains flat while the log-shipper sidecar handles file reading and network streaming.
+3. **Independent sidecar upgrade test:** Update the `log-shipper-sidecar` image version in the deployment manifest. Verify that Kubernetes performs a rolling update without touching the application code.
+4. **Shared volume verification:** Write a test file from the primary container to `/var/log/app/test.txt` and verify it is instantly visible inside the sidecar container.
+
+## Why
+
+Separation of concerns is the foundational rule of scalable software. Mixing infrastructure plumbing (encryption, log parsing, tracing) with core domain logic violates this principle and traps teams in language-specific maintenance cycles.
+
+The Sidecar pattern elevates infrastructure to a modular, language-independent building block. Developers focus exclusively on business features in whatever language fits best, while platform engineers deploy, secure, and monitor applications consistently across the entire enterprise.
+
+## When Not To Use
+
+- **Monolithic single-server deployments:** If you are running an app on a single virtual machine (EC2/Droplet) without containers or Kubernetes, separate sidecar processes add operational friction over systemd daemons.
+- **Ultra-low latency micro-benchmarks (< 100 microseconds):** Adding an Envoy sidecar adds a loopback network hop (approx. 0.3–0.8 ms). If your system requires microsecond-level trading execution, in-process libraries are required.
+
+## Common Mistakes
+
+- **Unrestricted sidecar resource limits:** Allowing a rogue log-collecting sidecar to consume infinite RAM, causing Kubernetes to evict the entire pod (including the healthy application container).
+- **Premature pod termination:** If Kubernetes kills the proxy sidecar before the primary app finishes shutting down, in-flight requests will immediately fail with connection refused errors.
+- **Port namespace collisions:** Forgetting that all containers in a pod share `localhost`, causing port conflicts between the application and sidecar services.

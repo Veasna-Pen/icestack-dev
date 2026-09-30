@@ -1,0 +1,193 @@
+---
+title: "Bun"
+question: "How do I build resilient services with native connection pooling, idempotency, and timeouts in Bun?"
+summary: "High-performance Bun.serve deadlines, native SQLite/PostgreSQL connection pooling, atomic idempotency, and in-memory single-flight caching in Bun."
+tags: [bun, typescript, performance, runtime, implementation]
+related: [patterns/retry, patterns/idempotency, patterns/caching, patterns/rate-limiting]
+order: 17
+updated: "2026-09-12"
+contributors: [veasna]
+---
+
+Production patterns leveraging Bun's native high-speed C++ engine and Web APIs. Focuses on Bun.serve deadlines, native database pooling, atomic idempotency, and single-flight caching.
+
+## Timeouts first
+
+Bun implements Web Standard `fetch` backed by its ultra-fast C++ HTTP stack. Always pass `AbortSignal.timeout` to prevent socket leaks:
+
+```ts
+Bun.serve({
+  port: 3000,
+  async fetch(req) {
+    const url = new URL(req.url);
+
+    if (url.pathname === "/rates") {
+      try {
+        // Enforce 2-second timeout
+        const res = await fetch("https://api.example.com/rates", {
+          signal: AbortSignal.timeout(2000)
+        });
+
+        if (!res.ok) {
+          return Response.json({ error: `Upstream HTTP ${res.status}` }, { status: 502 });
+        }
+
+        const data = await res.json();
+        return Response.json(data);
+      } catch (err: any) {
+        if (err.name === "TimeoutError") {
+          return Response.json({ error: "Upstream exchange rates API timed out" }, { status: 504 });
+        }
+        return Response.json({ error: "Internal server error" }, { status: 500 });
+      }
+    }
+
+    return new Response("Not Found", { status: 404 });
+  }
+});
+```
+
+## Retry with backoff
+
+Retry transient errors with exponential backoff and full jitter:
+
+```ts
+const RETRYABLE_STATUSES = new Set([408, 429, 500, 502, 503, 504]);
+
+export async function fetchWithRetry<T>(url: string, attempts = 3, baseMs = 100): Promise<T> {
+  for (let i = 1; i <= attempts; i++) {
+    try {
+      const res = await fetch(url, { signal: AbortSignal.timeout(2000) });
+      if (!RETRYABLE_STATUSES.has(res.status) && res.ok) {
+        return (await res.json()) as T;
+      }
+      if (i === attempts) throw new Error(`HTTP ${res.status}`);
+    } catch (err: any) {
+      if (i === attempts || (err.name !== "TimeoutError" && !err.message.startsWith("HTTP"))) {
+        throw err;
+      }
+    }
+
+    // Exponential delay with jitter
+    const delay = Math.random() * Math.min(2000, baseMs * 2 ** (i - 1));
+    await Bun.sleep(delay);
+  }
+  throw new Error("Failed after retries");
+}
+```
+
+## Database connection pool (`bun:sqlite` or Postgres)
+
+Bun includes built-in SQLite with high-concurrency WAL mode:
+
+```ts
+import { Database } from "bun:sqlite";
+
+export const db = new Database("production.sqlite", { create: true });
+
+// Enable Write-Ahead Logging for high concurrent read/write throughput
+db.exec("PRAGMA journal_mode = WAL;");
+db.exec("PRAGMA busy_timeout = 5000;"); // 5s lock wait before failing
+db.exec("PRAGMA synchronous = NORMAL;");
+
+// Initialize idempotency table
+db.exec(`
+  CREATE TABLE IF NOT EXISTS idempotency_keys (
+    key TEXT PRIMARY KEY,
+    response TEXT,
+    created_at INTEGER
+  );
+`);
+```
+
+## Idempotency keys
+
+Execute atomic checks inside a transaction to prevent duplicate payment or order processing:
+
+```ts
+export function createOrderWithIdempotency(key: string, customerId: string, totalCents: number) {
+  const checkStmt = db.prepare("SELECT response FROM idempotency_keys WHERE key = ?");
+  const insertKeyStmt = db.prepare("INSERT INTO idempotency_keys (key, response, created_at) VALUES (?, NULL, ?)");
+  const updateKeyStmt = db.prepare("UPDATE idempotency_keys SET response = ? WHERE key = ?");
+  const insertOrderStmt = db.prepare("INSERT INTO orders (customer_id, total_cents) VALUES (?, ?) RETURNING id");
+
+  // Run atomically
+  const transaction = db.transaction(() => {
+    const existing = checkStmt.get(key) as { response: string | null } | null;
+    if (existing) {
+      if (existing.response) {
+        return { status: 200, data: JSON.parse(existing.response) };
+      }
+      return { status: 409, data: { error: "Operation in progress" } };
+    }
+
+    // Claim key
+    insertKeyStmt.run(key, Date.now());
+
+    // Create business record
+    const order = insertOrderStmt.get(customerId, totalCents) as { id: number };
+    const responsePayload = JSON.stringify({ orderId: order.id, status: "created" });
+
+    updateKeyStmt.run(responsePayload, key);
+    return { status: 201, data: JSON.parse(responsePayload) };
+  });
+
+  return transaction();
+}
+```
+
+## Single-flight in-memory caching
+
+Prevent cache stampedes using an in-process promise map:
+
+```ts
+const cache = new Map<string, { value: any; expiry: number }>();
+const inFlight = new Map<string, Promise<any>>();
+
+export async function getCachedProduct(productId: string): Promise<any> {
+  const now = Date.now();
+  const cached = cache.get(productId);
+  if (cached && cached.expiry > now) {
+    return cached.value;
+  }
+
+  // Single-flight deduplication
+  let pending = inFlight.get(productId);
+  if (!pending) {
+    pending = (async () => {
+      // Simulate database read
+      const query = db.prepare("SELECT * FROM products WHERE id = ?");
+      const product = query.get(productId);
+
+      cache.set(productId, { value: product, expiry: now + 60_000 });
+      return product;
+    })().finally(() => {
+      inFlight.delete(productId);
+    });
+
+    inFlight.set(productId, pending);
+  }
+
+  return pending;
+}
+```
+
+## Background workers (`Worker`)
+
+Bun has built-in Web Worker support with fast IPC for offloading heavy tasks:
+
+```ts
+// worker.ts
+declare var self: Worker;
+
+self.onmessage = (event: MessageEvent) => {
+  const { orderId } = event.data;
+  // Perform slow background work (e.g. PDF generation, invoice emails)
+  console.log(`Processing invoice for order ${orderId}`);
+  postMessage({ success: true, orderId });
+};
+
+// In main server:
+const worker = new Worker(new URL("./worker.ts", import.meta.url).href);
+worker.postMessage({ orderId: "ord_123" });
+```

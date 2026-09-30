@@ -1,0 +1,23 @@
+---
+title: "Caching, step by step"
+summary: "Learn when a cache helps, how to add one safely, and how to keep it from serving stale or stampeding data. For developers who have built an API but never added a cache."
+level: beginner
+order: 1
+outcomes:
+  - "Decide whether a piece of data is worth caching"
+  - "Add a cache-aside read path with a sensible TTL"
+  - "Keep cached data fresh when the source changes"
+  - "Protect the database when a popular key expires"
+prerequisites:
+  - "You can build a small API endpoint that reads from a database"
+  - "You have run Redis or can start it with Docker"
+related: [patterns/caching, problems/should-i-use-redis, tradeoffs/cache-aside-vs-write-through, problems/cache-stampede]
+updated: "2026-09-29"
+contributors: [Veasna-Pen]
+---
+
+A cache keeps a copy of data somewhere faster than where it came from. Used well, it turns a 200 ms database query into a 2 ms lookup. Used carelessly, it shows users old prices, hides bugs, and can take your database down the moment it empties.
+
+This course builds the idea one step at a time. You start by deciding **whether** to cache at all, then add the most common pattern, cache-aside, then learn how to keep the copy fresh, and finish with the failure that surprises most teams: many requests missing the cache at the same moment.
+
+Each lesson takes about ten minutes and ends with a few questions. Do the **Try it** step on a real project if you can; that is where the idea sticks.

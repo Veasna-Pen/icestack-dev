@@ -1,0 +1,161 @@
+---
+title: "API Gateway & BFF"
+question: "តើខ្ញុំអាចកំណត់ផ្លូវ (Route), ផ្ទៀងផ្ទាត់សិទ្ធិ (Auth), និងបូកសរុបទិន្នន័យ (Aggregate) ពី Microservices រាប់សិបសម្រាប់ Web, Mobile, និង Client ខាងក្រៅដោយរបៀបណា?"
+summary: "ដាក់ Reverse Proxy ឬ Gateway ជាច្រកចូលតែមួយគត់នៅពីមុខ Microservices ទាំងអស់ ដើម្បីគ្រប់គ្រង SSL, Authentication, Rate Limiting, Routing, និងការច្របាច់ទិន្នន័យរួមគ្នា (BFF Pattern)។"
+tags: [architecture, microservices, api-gateway, bff, routing]
+related: [problems/when-to-use-microservices, patterns/rate-limiting, tradeoffs/rest-vs-grpc]
+order: 11
+updated: "2026-09-12"
+contributors: [veasna]
+translation: draft
+---
+
+## Context
+
+នៅពេលដែលប្រព័ន្ធ Software ត្រូវបានបំបែកជា Microservices រាប់សិប (Orders, Catalog, Reviews, Payments, Shipping) កម្មវិធីខាងក្រៅ (React Web App, iOS/Android Mobile App, Partner Webhooks) ត្រូវការទំនាក់ទំនងជាមួយសេវាកម្មទាំងនោះ។
+
+ប្រសិនបើ Client ភ្ជាប់ទំនាក់ទំនងផ្ទាល់ទៅកាន់ Microservices នីមួយៗ បញ្ហាធំៗនឹងកើតឡើង៖ Client ត្រូវដឹងពី IP address និង Port ខាងក្នុងទាំងអស់, Mobile App ត្រូវផ្ញើ Network Request ១៥ ដងផ្សេងគ្នាដើម្បីគ្រាន់តែ Render ទំព័រទំនិញមួយ, Microservice នីមួយៗត្រូវសរសេរកូដ Auth, JWT, និង CORS ដដែលៗ, ហើយការកែសម្រួល API ខាងក្នុងនឹងធ្វើឱ្យ Mobile App គាំងដំណើរការ។
+
+**API Gateway** ដើរតួជាច្រកទ្វារចូលសាធារណៈតែមួយគត់ដែលស្រោបការពារស្ថាបត្យកម្ម Microservices ខាងក្នុង។ ទម្រង់ពិសេសមួយរបស់វាគឺ **Backend-for-Frontend (BFF)** ដែលកែច្នៃ Endpoint ឱ្យត្រូវនឹងទម្រង់ Client ជាក់លាក់ (ឧ. Mobile ទល់នឹង Desktop)។
+
+## Symptoms
+
+- ទំព័រ Mobile Screen តែមួយត្រូវការផ្ញើ HTTP requests ពី ១០ ទៅ ២០ ដងឆ្លងកាត់សេវាទូរស័ព្ទ ដែលធ្វើឱ្យទំព័រដំណើរការយឺតខ្លាំង និងស៊ីថ្មទូរស័ព្ទ។
+- Microservice នីមួយៗត្រូវសរសេរកូដផ្ទៀងផ្ទាត់ JWT, Rate Limiting, និង CORS Headers ស្ទួនៗគ្នាក្នុងគ្រប់ Codebase ទាំងអស់។
+- ការផ្លាស់ប្តូរ URL របស់ Service ខាងក្នុង ឬការបំបែក Database Table តម្រូវឱ្យមានការកូដនិង Release Mobile App លើ App Store/Play Store ឡើងវិញ។
+- Port និង Endpoint ខាងក្នុងត្រូវបានបើកចំហរទៅកាន់ Internet សាធារណៈ ដែលបង្កើនហានិភ័យសុវត្ថិភាពយ៉ាងខ្លាំង។
+
+<Callout type="warning" title="ការភ្ជាប់ផ្ទាល់រវាង Client និង Microservices បង្កើតជា Distributed Monolith">
+បើគ្មាន Gateway ទេ រាល់ការផ្លាស់ប្តូរព្រំដែនសេវាកម្មខាងក្នុង នឹងធ្វើឱ្យ Client ខាងក្រៅខូចដំណើរការ ហើយចងភ្ជាប់ការងារ Frontend ទៅនឹងស្ថាបត្យកម្ម Backend យ៉ាងស្អិតរមួត។
+</Callout>
+
+## Diagnose
+
+1. **រាប់ចំនួន Network Round-trips របស់ Client៖** បើកផ្ទាំង Network លើ Mobile App ឬ Web Homepage។ តើមាន API calls ចំនួនប៉ុន្មានត្រូវបានហៅ ដើម្បីគ្រាន់តែ Render ទំព័រដំបូង?
+2. **ពិនិត្យមើលកូដដដែលៗ (Cross-cutting Concerns)៖** តើគោលការណ៍សុវត្ថិភាព, TLS Certificates, Rate Limits, និង Auth Middleware ត្រូវបានសរសេរស្ទួនគ្នាក្នុង Codebase ចំនួន ១០ ផ្សេងគ្នាមែនទេ?
+3. **ពិនិត្យមើលភាពឆបគ្នានៃ Protocol៖** តើសេវាកម្មខាងក្នុងចង់ប្រើប្រាស់ Binary gRPC ឬ Protobuf តែ Client ខាងក្រៅចេះតែ JSON/REST តាម HTTP មែនទេ?
+4. **ពិនិត្យមើលការកំណត់ CORS៖** តើ Microservices របស់អ្នកកំពុងជួបបញ្ហា CORS Origin មិនត្រូវគ្នា និងមានសំណើ Preflight `OPTIONS` ស្ទួនៗច្រើនមែនទេ?
+
+## Options
+
+1. **ភ្ជាប់ផ្ទាល់ពី Client ទៅកាន់ Microservice៖** Client ហៅទៅកាន់ Microservices នីមួយៗតាមរយៈ Public DNS។ (ផុយស្រួយ, គ្មានសុវត្ថិភាព, Network Latency ខ្ពស់លើទូរស័ព្ទ)។
+2. **API Gateway កណ្តាល (NGINX, Kong, Envoy, Traefik)៖** Reverse Proxy កម្រិតខ្ពស់ដែលគ្រប់គ្រង TLS Termination, Central Routing, Rate Limiting, និង JWT Authentication នៅ Layer 7។
+3. **Backend-for-Frontend (BFF) Pattern៖** បង្កើត Gateway ស្រាលៗដាច់ដោយឡែកសម្រាប់ Client Platform នីមួយៗ៖ BFF មួយសម្រាប់ Mobile (ប្រគល់ JSON តូចច្រឡឹងដែលច្របាច់រួច) និង BFF មួយទៀតសម្រាប់ Web App។
+4. **GraphQL Gateway (Apollo Federation)៖** បង្កើត Unified GraphQL Schema ដែលទាញយកទិន្នន័យពី Subgraphs របស់ Microservices ខាងក្រោមមកជា Endpoint តែមួយ។
+
+## Trade-offs
+
+| យុទ្ធសាស្ត្រ | Latency របស់ Client | កម្រិតសុវត្ថិភាព | ភាពបត់បែននៃ Protocol | ភាពស្មុគស្មាញប្រតិបត្តិការ |
+| :--- | :--- | :--- | :--- | :--- |
+| **ភ្ជាប់ផ្ទាល់ (Direct)** | ខ្ពស់ (១៥ Round Trips) | ខ្សោយ (Endpoints បើកចំហរច្រើន) | ទាប (ប្រើបានតែ REST) | ទាប (គ្មាន Gateway) |
+| **Gateway កណ្តាល** | មធ្យម (Routing សុទ្ធ) | ខ្ពស់ (Firewall តែមួយ) | ខ្ពស់ (បម្លែង gRPC ទៅ HTTP) | មធ្យម |
+| **Backend-for-Frontend (BFF)** | ទាបបំផុត (ហៅតែ ១ ដង) | ខ្ពស់ | ខ្ពស់បំផុត (Payload តាមតម្រូវការ) | មធ្យមទៅខ្ពស់ |
+| **GraphQL Federation** | ទាបបំផុត | ខ្ពស់ | បត់បែនតាម Client | ខ្ពស់ |
+
+## Decision
+
+- **ប្រើប្រាស់ API Gateway ជាច្រកចូលតែមួយគត់៖** គ្មាន Microservice ខាងក្នុងណាមួយគួរតែមាន Public IP address ឬ Ingress Route បើកចំហរឡើយ។ មានតែ Gateway ប៉ុណ្ណោះដែលប្រឈមមុខនឹង Internet សាធារណៈ។
+- **ផ្ទេរការងារទូទៅ (Cross-cutting Concerns) មកលើ Gateway៖** គ្រប់គ្រង SSL/TLS Termination, JWT Signature Validation, Global Rate Limiting, និង CORS នៅលើ Edge តែមួយ។
+- **ជ្រើសរើស BFF Pattern សម្រាប់ UI ដែលស្មុគស្មាញ៖** នៅពេលដែល Mobile ឬ Web UI ត្រូវការបូកសរុបទិន្នន័យពីសេវាកម្ម ៥ ឡើងទៅ ត្រូវបង្កើត BFF ស្រាលមួយដើម្បី Fetch ទិន្នន័យតាមបណ្តាញខាងក្នុងល្បឿនលឿន (VPC) រួចប្រគល់ JSON តូចច្រឡឹងតែមួយគត់ទៅឱ្យ Client។
+- **ហាមដាក់ Business Logic ធ្ងន់ៗក្នុង Gateway៖** Gateway គួរធ្វើតែ Routing, Auth, និង Aggregation ប៉ុណ្ណោះ។ ជៀសវាងការសរសេរ Domain Logic ឬការសរសេរ Database ចូលទៅក្នុង Gateway Plugins។
+
+## Implementation
+
+### 1. ការបង្កើត BFF Aggregation Endpoint ក្នុង TypeScript៖
+
+```typescript
+import express from 'express';
+
+export const bffRouter = express.Router();
+
+// Endpoint តែមួយគត់សម្រាប់ Mobile ដែលច្របាច់ Product, Inventory, និង Reviews បញ្ចូលគ្នា
+bffRouter.get('/mobile/product/:id', async (req, res) => {
+  const { id } = req.params;
+  const authHeader = req.headers.authorization;
+
+  try {
+    // Fetch ទៅកាន់ Microservices ខាងក្នុងទាំង ៣ ស្របគ្នាលើបណ្តាញ Private Network
+    const [productRes, inventoryRes, reviewsRes] = await Promise.all([
+      fetch(`http://product-service.internal/products/${id}`, { headers: { authorization: authHeader! } }),
+      fetch(`http://inventory-service.internal/stock/${id}`),
+      fetch(`http://review-service.internal/reviews/summary?productId=${id}`),
+    ]);
+
+    if (!productRes.ok) return res.status(productRes.status).json({ error: 'រកមិនឃើញទំនិញឡើយ' });
+
+    const product = await productRes.json();
+    const inventory = inventoryRes.ok ? await inventoryRes.json() : { inStock: false, availableQty: 0 };
+    const reviews = reviewsRes.ok ? await reviewsRes.json() : { averageRating: 0, totalCount: 0 };
+
+    // ប្រគល់ JSON តូចច្រឡឹងដែលកែសម្រួលសម្រាប់តែ Mobile (កាត់បន្ថយទំហំទិន្នន័យបាន 70%)
+    return res.json({
+      id: product.id,
+      title: product.name,
+      priceFormatted: `$${(product.priceCents / 100).toFixed(2)}`,
+      inStock: inventory.availableQty > 0,
+      rating: reviews.averageRating,
+      reviewCount: reviews.totalCount,
+      thumbnailUrl: product.images[0]?.url || null,
+    });
+  } catch (err) {
+    return res.status(500).json({ error: 'បរាជ័យក្នុងការបូកសរុបទិន្នន័យទំនិញ', details: (err as Error).message });
+  }
+});
+```
+
+### 2. ការកំណត់ Reverse Proxy Routing ក្នុង NGINX / Gateway៖
+
+```nginx
+# NGINX Edge Gateway Configuration
+server {
+    listen 443 ssl http2;
+    server_name api.mycompany.com;
+
+    ssl_certificate /etc/ssl/certs/api.crt;
+    ssl_certificate_key /etc/ssl/private/api.key;
+
+    # កំណត់ Rate Limiting នៅច្រកទ្វារកណ្តាល
+    limit_req zone=global_ip burst=20 nodelay;
+
+    # គ្រប់គ្រង CORS ជាសកល
+    add_header 'Access-Control-Allow-Origin' 'https://www.mycompany.com' always;
+    add_header 'Access-Control-Allow-Methods' 'GET, POST, PUT, DELETE, OPTIONS' always;
+
+    # Route ទៅកាន់ Mobile BFF
+    location /mobile/ {
+        proxy_pass http://mobile-bff-service.internal:3000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+    }
+
+    # Route ទៅកាន់ Orders Microservice ផ្ទាល់
+    location /v1/orders/ {
+        proxy_pass http://order-service.internal:8080/;
+        proxy_set_header X-Request-ID $request_id;
+    }
+}
+```
+
+## Verification
+
+1. **ការកាត់បន្ថយ Network Round-trips៖** វាស់វែងរយៈពេលដែល Mobile App ប្រើដើម្បី Render ទំព័រដើម។ ផ្ទៀងផ្ទាត់ថារយៈពេល Network សរុបធ្លាក់ចុះពី ៦០ ទៅ ៨០% បើធៀបនឹងការហៅផ្ទាល់ជាច្រើនដង។
+2. **ការពិនិត្យសុវត្ថិភាពបណ្តាញ៖** ដំណើរការ Port scan (nmap) លើ Service Nodes ខាងក្នុង។ ផ្ទៀងផ្ទាត់ថាមានតែ Port 80/443 លើ API Gateway ប៉ុណ្ណោះដែលបើកចំហរជាសាធារណៈ។
+3. **ផ្ទៀងផ្ទាត់ CORS Preflight៖** ផ្ញើសំណើ `OPTIONS` ទៅកាន់ `/v1/orders/`។ ពិនិត្យមើលថា Gateway ឆ្លើយតប Headers `Access-Control-Allow-*` ក្នុងពេល < 5 ms ដោយមិនចាំបាច់បញ្ជូនបន្តទៅកាន់ Microservice ខាងក្រោយឡើយ។
+4. **ផ្ទៀងផ្ទាត់ Edge Rate Limiting៖** ផ្ញើ ១០០ Requests ក្នុង ១ វិនាទី។ ផ្ទៀងផ្ទាត់ថា Gateway ឆ្លើយតប `429 Too Many Requests` នៅមាត់ទ្វារភ្លាមៗ មុនពេលវាស៊ី CPU របស់ Backend សេវាកម្ម។
+
+## Why
+
+ស្ថាបត្យកម្ម Microservices ដោះស្រាយបញ្ហាការធ្វើការងាររបស់ក្រុមធំៗ និងការ Deploy ដោយឯករាជ្យនៅខាងក្រោយ ប៉ុន្តែវាបង្កើតភាពស្មុគស្មាញយ៉ាងខ្លាំងសម្រាប់ Client ខាងមុខ។
+
+API Gateway និង BFF Patterns ដោះស្រាយទំនាស់នេះយ៉ាងល្អឥតខ្ចោះ។ ពួកគេផ្តល់សេរីភាពពេញលេញដល់ក្រុម Backend ក្នុងការកែប្រែកូដ ឬបំបែក Microservices ដោយមិនបាច់បារម្ភថានឹងធ្វើឱ្យខូច Client ខាងក្រៅ ខណៈដែលផ្តល់ឱ្យក្រុម Frontend នូវ API ដែលលឿន មានសុវត្ថិភាព និងត្រូវតាមតម្រូវការជាក់ស្តែង។
+
+## When Not To Use
+
+- **Monolithic Applications៖** ប្រសិនបើអ្នកដំណើរការ Monolith តែមួយ (Laravel, Django, Rails) ការបន្ថែម API Gateway គ្រាន់តែបន្ថែមជំហាន Network និងបង្កើន Latency ឥតប្រយោជន៍។
+- **ការទាក់ទងគ្នាក្នុង Cluster ខាងក្នុង៖** ការទាក់ទងគ្នាពី Service មួយទៅ Service មួយទៀតក្នុង Private Network គួរតែហៅផ្ទាល់ ឬប្រើ Service Mesh ជាជាងហោះកាត់ Public API Gateway។
+
+## Common Mistakes
+
+- **ប្រែក្លាយ Gateway ទៅជា Monolith ថ្មី (Smart Gateway, Dumb Services)៖** ការសរសេរ Business Logic ឬ Database Query ធ្ងន់ៗក្នុង Gateway នឹងបង្កើតបញ្ហាស្ទះកណ្តាលផ្លូវ។
+- **បង្កើត BFF ធំតែមួយសម្រាប់គ្រប់ Platform ទាំងអស់៖** ការបង្កើត BFF តែមួយសម្រាប់ទាំង IoT, Mobile, និង Web នឹងប្រែក្លាយវាទៅជាចំណុចកកស្ទះជាថ្មី។ គួររក្សា BFF ឱ្យនៅដាច់ដោយឡែកតាមក្រុម Client នីមួយៗ។
+- **ភ្លេចកំណត់ Timeout លើការហៅរួមគ្នា (Aggregated Calls)៖** ក្នុង BFF ដែលហៅទៅ ៤ សេវាកម្ម បើមានសេវាកម្មមួយគាំង ៣០ វិនាទីដោយគ្មាន Timeout នោះ Client ទាំងមូលនឹងត្រូវរង់ចាំ ៣០ វិនាទី។ ត្រូវប្រើ `Promise.all` ជាមួយ Timeout តឹងរ៉ឹង និង Fallback ជានិច្ច។

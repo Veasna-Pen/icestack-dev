@@ -1,0 +1,195 @@
+---
+title: "Elixir (Phoenix)"
+question: "How do I implement receive timeouts, Ecto multi-transactions, Oban background jobs, and rate limiting in Phoenix?"
+summary: "Timeouts with Finch/Req, Ecto pool and multi-step transactions for idempotency, ETS/Cachex, Hammer rate limiting, and Oban background jobs in Elixir."
+tags: [elixir, phoenix, otp, ecto, implementation]
+related: [patterns/retry, patterns/idempotency, patterns/caching, patterns/rate-limiting]
+order: 11
+updated: "2026-09-12"
+contributors: [veasna]
+---
+
+Production patterns for Elixir 1.16+ and Phoenix 1.7+. Exploits BEAM process isolation and OTP primitives for non-blocking HTTP deadlines, Ecto atomic transactions, high-concurrency ETS caching, and transactional Oban background processing.
+
+## Timeouts first
+
+In Elixir, processes communicate via message passing and HTTP clients like `Req` or `Finch` enforce deadlines via `receive_timeout`:
+
+```elixir
+defmodule MyApp.ExchangeRates do
+  @doc """
+  Fetches foreign exchange rates with a strict 2-second receive deadline.
+  """
+  def fetch_rates do
+    case Req.get("https://api.example.com/rates", receive_timeout: 2_000, connect_options: [timeout: 1_000]) do
+      {:ok, %Req.Response{status: 200, body: body}} ->
+        {:ok, body}
+
+      {:error, %Mint.TransportError{reason: :timeout}} ->
+        {:error, :timeout}
+
+      {:ok, %Req.Response{status: status}} ->
+        {:error, {:upstream_error, status}}
+    end
+  end
+end
+```
+
+For database queries, set statement and pool timeouts in `config/runtime.exs`:
+
+```elixir
+config :my_app, MyApp.Repo,
+  url: database_url,
+  pool_size: String.to_integer(System.get_env("POOL_SIZE") || "10"),
+  timeout: 5_000,       # 5s query execution deadline
+  queue_target: 50,     # Time in queue before backpressure warns
+  queue_interval: 1_000
+```
+
+## Retry with backoff
+
+Req includes an automatic retry step supporting exponential backoff, jitter, and status code filters:
+
+```elixir
+defmodule MyApp.InventoryClient do
+  def fetch_item(sku) do
+    Req.new(base_url: "https://inventory.example.com")
+    |> Req.Request.put_header("accept", "application/json")
+    |> Req.get(
+      url: "/items/#{sku}",
+      retry: :transient, # Retries 408, 429, and 5xx
+      max_retries: 3,
+      retry_delay: fn attempt ->
+        # Exponential backoff with full jitter
+        trunc(:rand.uniform() * min(2_000, 100 * :math.pow(2, attempt)))
+      end
+    )
+  end
+end
+```
+
+## Idempotency keys with `Ecto.Multi`
+
+In Phoenix controllers, wrap idempotency checks and order creation in an atomic `Ecto.Multi`:
+
+```elixir
+defmodule MyAppWeb.OrderController do
+  use MyAppWeb, :controller
+  alias MyApp.{Repo, Orders.Order, Idempotency.Record}
+
+  def create(conn, %{"customer_id" => customer_id, "total_cents" => total_cents}) do
+    idempotency_key = get_req_header(conn, "idempotency-key") |> List.first()
+
+    if is_nil(idempotency_key) do
+      conn |> put_status(:bad_request) |> json(%{error: "Idempotency-Key header is required"})
+    else
+      multi =
+        Ecto.Multi.new()
+        |> Ecto.Multi.insert(:idempotency_claim, Record.changeset(%Record{}, %{key: idempotency_key}),
+          on_conflict: :nothing,
+          conflict_target: :key
+        )
+        |> Ecto.Multi.run(:verify_claim, fn _repo, %{idempotency_claim: claim} ->
+          if is_nil(claim) do
+            # Conflict occurred: retrieve previous record
+            case Repo.get_by(Record, key: idempotency_key) do
+              %Record{response_body: body, status_code: code} when not is_nil(body) ->
+                {:error, {:cached_response, code, body}}
+              _ ->
+                {:error, :in_progress}
+            end
+          else
+            {:ok, claim}
+          end
+        end)
+        |> Ecto.Multi.insert(:order, Order.changeset(%Order{}, %{customer_id: customer_id, total_cents: total_cents}))
+        |> Ecto.Multi.update(:finalize_claim, fn %{idempotency_claim: claim, order: order} ->
+          Record.changeset(claim, %{status_code: 201, response_body: %{id: order.id, total: order.total_cents}})
+        end)
+
+      case Repo.transaction(multi) do
+        {:ok, %{order: order}} ->
+          conn |> put_status(:created) |> json(%{id: order.id, total: order.total_cents})
+
+        {:error, :verify_claim, {:cached_response, code, body}, _changes} ->
+          conn |> put_status(code) |> json(body)
+
+        {:error, :verify_claim, :in_progress, _changes} ->
+          conn |> put_status(:conflict) |> json(%{error: "Request currently being processed"})
+
+        {:error, _failed_op, _failed_val, _changes} ->
+          conn |> put_status(:internal_server_error) |> json(%{error: "Database transaction failed"})
+      end
+    end
+  end
+end
+```
+
+## Caching with Cachex (In-Memory ETS)
+
+Elixir's ETS tables provide sub-microsecond in-memory reads across Erlang processes:
+
+```elixir
+defmodule MyApp.ProductCache do
+  def get_product(product_id) do
+    Cachex.fetch(:my_cache, "product:#{product_id}", fn _key ->
+      case MyApp.Repo.get(MyApp.Catalog.Product, product_id) do
+        nil -> {:ignore, nil}
+        product -> {:commit, product, expire: :timer.minutes(5)}
+      end
+    end)
+  end
+end
+```
+
+## Rate limiting with Hammer
+
+Token-bucket rate limiting based on client IP or user identity:
+
+```elixir
+defmodule MyAppWeb.Plugs.RateLimiter do
+  import Plug.Conn
+
+  def init(opts), do: opts
+
+  def call(conn, _opts) do
+    client_ip = conn.remote_ip |> :inet.ntoa() |> to_string()
+    key = "rate:#{client_ip}"
+
+    # Allow 100 requests per 60,000 milliseconds (1 minute)
+    case Hammer.check_rate(key, 60_000, 100) do
+      {:allow, _count} ->
+        conn
+
+      {:deny, _limit} ->
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(429, ~s({"error": "Too Many Requests"}))
+        |> halt()
+    end
+  end
+end
+```
+
+## Background jobs with Oban
+
+Oban stores background jobs in the same PostgreSQL database as your business tables, guaranteeing zero lost jobs:
+
+```elixir
+defmodule MyApp.Workers.SendReceipt do
+  use Oban.Worker, queue: :mailers, max_attempts: 5
+
+  @impl Oban.Worker
+  def perform(%Oban.Job{args: %{"order_id" => order_id}}) do
+    order = MyApp.Repo.get!(MyApp.Orders.Order, order_id)
+
+    # Idempotency check:
+    if is_nil(order.receipt_sent_at) do
+      MyApp.Mailer.send_receipt(order)
+      order |> Ecto.Changeset.change(receipt_sent_at: DateTime.utc_now()) |> MyApp.Repo.update!()
+    end
+
+    :ok
+  end
+end
+```

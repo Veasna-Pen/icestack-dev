@@ -1,0 +1,98 @@
+---
+title: "What belongs in the request, and what can wait"
+summary: "Split an endpoint's work into what the user must wait for and what can happen a few seconds later."
+minutes: 10
+related: [tradeoffs/sync-vs-async]
+updated: "2026-09-30"
+contributors: [Veasna-Pen]
+---
+
+## The problem
+
+Your sign-up endpoint does five things, one after another:
+
+| Step | Time |
+| --- | --- |
+| Save the user | 15 ms |
+| Send the welcome email | 900 ms |
+| Resize the avatar | 1,200 ms |
+| Add the contact to the CRM | 600 ms |
+| Return "Welcome" | — |
+
+Sign-up takes **2.7 seconds**. When the email provider is down, sign-up **fails**, even though the account was saved. Users try again and get "email already taken".
+
+## The idea
+
+Split the work by one question: **does the user need this result before they see the response?**
+
+- **Synchronous** (in the request): the work the answer depends on. Here: saving the user. If it fails, the request must fail.
+- **Asynchronous** (in the background): work that can finish a few seconds later without the user noticing. Here: the email, the avatar, the CRM.
+
+Background work goes into a **job**: a small message such as "send welcome email to user 42". A **worker**, a separate process, picks jobs up and runs them. The request only has to **save the job**, which takes a few milliseconds.
+
+Moving work to the background has a cost: the user can't be told right away if it fails, and you now run a queue and workers. Keep work synchronous when the user needs the outcome now, such as a payment result or a validation error.
+
+## Example
+
+Before, everything in the request:
+
+```ts
+app.post('/signup', async (req, res) => {
+  const user = await db.user.create({ data: req.body });
+  await email.sendWelcome(user); // 900 ms, can fail
+  await images.resizeAvatar(user); // 1,200 ms
+  await crm.addContact(user); // 600 ms, can fail
+  res.status(201).json(user);
+});
+```
+
+After, only the save is in the request; the rest becomes jobs:
+
+```ts
+app.post('/signup', async (req, res) => {
+  const user = await db.user.create({ data: req.body });
+  await jobs.add('welcome-email', { userId: user.id });
+  await jobs.add('resize-avatar', { userId: user.id });
+  await jobs.add('crm-sync', { userId: user.id });
+  res.status(201).json(user); // about 25 ms
+});
+```
+
+Sign-up now takes about **25 ms**, and an email outage no longer breaks it: the email job waits and retries until the provider is back.
+
+<Tip title="Put IDs in jobs, not whole objects">
+Send `{ userId: 42 }` and let the worker load the user. The data in the database may change before the job runs, and small jobs are cheaper to store.
+</Tip>
+
+## Try it
+
+1. Pick one slow endpoint in your project and list every step it performs, with rough timings.
+2. Mark each step **sync** (the response depends on it) or **async** (it can finish later).
+3. For each async step, write what the user sees if it fails an hour later. If the answer is "nothing bad", it is a good background job.
+
+## Check yourself
+
+**1. A checkout endpoint charges a card and sends a receipt. Which part can move to the background?**
+
+<Answer>
+The receipt. The user needs to know whether the payment succeeded before the page answers, so the charge stays synchronous. The receipt email can arrive a few seconds later.
+</Answer>
+
+**2. Why put `userId` in the job instead of the whole user object?**
+
+<Answer>
+The worker loads fresh data when it runs, so it never acts on an outdated copy, and the job stays small. The job also doesn't carry personal data around the queue.
+</Answer>
+
+**3. What new failure do you have to think about once work is asynchronous?**
+
+<Answer>
+The user got a success response, but the job can still fail later. You need retries, a place for jobs that keep failing, and a way to see them. The next lessons cover these.
+</Answer>
+
+## Key takeaways
+
+- Ask: **does the response depend on this?** If not, it can be a background job.
+- The request saves a small **job**; a **worker** does the slow part later.
+- Background work makes requests fast and **isolates them from other services' outages**.
+- It moves failure out of sight, so you must handle it on purpose.

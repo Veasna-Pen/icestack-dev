@@ -1,0 +1,167 @@
+---
+title: "Polling vs Webhooks"
+question: "តើនៅពេលណាដែលប្រព័ន្ធគួរតែប្រើ Polling ដើម្បីទាញយកទិន្នន័យ ហើយនៅពេលណាដែលគួរប្រើ Event-driven Webhooks?"
+summary: "Polling ផ្តល់ឱ្យ Client នូវការគ្រប់គ្រងពេញលេញលើកម្រិតនៃសំណើ និងអាចឆ្លងកាត់ Firewall បានយ៉ាងងាយ ដែលល្អសម្រាប់ Script សាមញ្ញ ឬ Batch ETL។ រីឯ Webhooks ផ្តល់នូវការជូនដំណឹងភ្លាមៗបែប Event-driven ក្នុងពេលកម្រិតមិល្លីវិនាទីដោយមិនបាច់ខាតបង់ Network Bandwidth ដែលស័ក្តិសមបំផុតសម្រាប់ Payment Gateways និងប្រព័ន្ធ SaaS។"
+tags: [architecture, integrations, webhooks, polling, api-design]
+related: [tradeoffs/websockets-vs-sse, problems/webhook-delivery-failures, patterns/retry]
+order: 10
+updated: "2026-09-12"
+contributors: [veasna]
+translation: draft
+---
+
+## Context
+
+នៅពេលដែលប្រព័ន្ធពីរភ្ជាប់ទំនាក់ទំនងគ្នាជាលក្ខណៈ Asynchronous (ដូចជា កម្មវិធីរបស់អ្នកកាត់ប្រាក់កាតធនាគារតាម Stripe, ការដំណើរការបម្លែងវីដេអូនៅលើ AWS, ឬការធ្វើសមកាលកម្មព្រឹត្តិការណ៍ពី GitHub) អ្នកហៅចូលត្រូវការដឹងថាតើការងារនោះបានបញ្ចប់នៅពេលណា។
+
+មានទម្រង់ចម្បងពីរសម្រាប់ការទំនាក់ទំនងឆ្លងប្រព័ន្ធ៖
+1. **Polling (ទាញយក - Pull)៖** Client ផ្ញើសំណើ HTTP `GET /jobs/:id` ជាប្រចាំតាមកាលវិភាគ (ឧ. រៀងរាល់ ៥ វិនាទីម្តង) រហូតទាល់តែស្ថានភាពប្រែប្រួលពី `PENDING` ទៅជា `COMPLETED`។
+2. **Webhooks (រុញបញ្ជូន - Push)៖** Client ចុះឈ្មោះ HTTPS Callback Endpoint (`POST https://myapi.com/webhooks/stripe`)។ នៅពេលព្រឹត្តិការណ៍កើតឡើង Server ខាងដើមនឹងបញ្ជូនសំណើ HTTP POST ដែលមានផ្ទុក Payload មកកាន់ Client ភ្លាមៗ។
+
+ទោះបីជា Webhooks ផ្តល់ការជូនដំណឹងលឿនភ្លាមៗក៏ដោយ ប៉ុន្តែវាទាមទារនូវស្ថាបត្យកម្មស្មុគស្មាញ៖ ការបើក Firewall សាធារណៈ, ការផ្ទៀងផ្ទាត់ហត្ថលេខាឌីជីថល (Signature), ការគ្រប់គ្រង Idempotency, និងការដោះស្រាយ Retry។
+
+## Symptoms
+
+- **រោគសញ្ញាបរាជ័យនៃ Polling៖** ៩៩.៨% នៃ Traffic API ចូលមកគឺជាសំណើ Polling ទទេដែលឆ្លើយតប `"status": "pending"` ដដែលៗ ដែលធ្វើឱ្យខាតបង់ CPU Database, Connection Sockets, និងលុយថ្លៃ Cloud Bandwidth ដោយគ្មានបានការងារអ្វីសោះ។
+- **រោគសញ្ញាបរាជ័យនៃ Webhook៖** សេវាកម្មដៃគូជួបបញ្ហា Outage; ពេលពួកគេដំណើរការឡើងវិញ គេបាញ់ Webhook ចំនួន ៥០,០០០ មកក្នុងពេល ៣ វិនាទី ដែលធ្វើឱ្យជន់ជោរ Database និងជាប់ Rate Limit គាំងប្រព័ន្ធ។
+
+<Callout type="warning" title="៩៩% នៃសំណើ Polling មិនទទួលបានទិន្នន័យថ្មីអ្វីទាំងអស់">
+ប្រសិនបើ User ចំនួន ១០,០០០ នាក់ធ្វើ Polling រៀងរាល់ ២ វិនាទីសម្រាប់ការងារដែលប្រើពេល ៣០ វិនាទី Server របស់អ្នកត្រូវរវល់ឆ្លើយតប HTTP Requests រហូតដល់ ១៥០,០០០ ដងក្នុងមួយនាទី គ្រាន់តែដើម្បីប្រាប់ពីការផ្លាស់ប្តូរស្ថានភាពតែមួយដងគត់។
+</Callout>
+
+## Diagnose
+
+1. **គណនាភាគរយនៃ Empty Polling៖** ពិនិត្យ Access Logs លើ Route របស់ Polling (ឧ. `GET /status`)។ តើមានប៉ុន្មានភាគរយនៃសំណើដែលប្រគល់ទិន្នន័យដដែលដែលមិនទាន់ផ្លាស់ប្តូរ?
+2. **វាស់វែងកម្រិតបន្ទាន់នៃការជូនដំណឹង៖** តើបទពិសោធន៍របស់អ្នកប្រើប្រាស់ទាមទារការដឹងភ្លាមៗកម្រិតមិល្លីវិនាទី (ដូចជាការកាត់លុយនៅកន្លែងគិតប្រាក់) ឬអាចរង់ចាំ ៥ នាទីបាន?
+3. **ពិនិត្យមើលរបាំង Firewall៖** តើ Client ស្ថិតនៅពីក្រោយ Corporate NAT, Local Laptop, ឬ Private VPC ដែលគ្មាន Public Static IP ដែរឬទេ?
+4. **វាយតម្លៃចំនួន Subscriber៖** តើមានដៃគូតភ្ជាប់ចំនួន ៥ ឬមាន Client Applications ចំនួន ៥០,០០០?
+
+## Options
+
+1. **Short Polling៖** Client ផ្ញើ `GET /resource` រៀងរាល់ចន្លោះពេលថេរ (២ ដល់ ៥ វិនាទី)។ (សាមញ្ញក្នុងការសរសេរ តែខាតបង់ Bandwidth បំផុត)។
+2. **Long Polling៖** Client បើកសំណើ `GET /resource` ហើយ Server ទប់ Connection នោះទុកចោលរហូតដល់ទិន្នន័យផ្លាស់ប្តូរ ឬដល់ Timeout ៣០ វិនាទី។ (កាត់បន្ថយ Round Trips ប៉ុន្តែកាន់កាប់ Socket ចោលយូរ)។
+3. **Standard Webhooks៖** Server រុញសំណើ HTTP POST ទៅកាន់ Public URL របស់ Client ភ្លាមៗនៅពេលមានការផ្លាស់ប្តូរ។ (លឿន, មានប្រសិទ្ធភាពខ្ពស់, ទាមទារ Public Endpoint)។
+4. **Hybrid (Webhooks ជាមួយ Polling Fallback)៖** ទទួលការ Update តាម Webhook ជាចម្បង ប៉ុន្តែ Client ដំណើរការ Polling យឺតៗ (ឧ. ១០ នាទីម្តង) ដើម្បីការពារកុំឱ្យបាត់បង់ទិន្នន័យពេល Webhook ធ្លាក់បាត់។
+
+## Trade-offs
+
+| លក្ខណៈវិនិច្ឆ័យ | Short Polling | Long Polling | Webhooks (Event Push) |
+| :--- | :--- | :--- | :--- |
+| **Latency នៃការជូនដំណឹង** | យឺត (ពាក់កណ្តាលចន្លោះពេល Poll) | លឿន (< 50 ms) | **ភ្លាមៗ (< 100 ms)** |
+| **ប្រសិទ្ធភាព Network & Server** | **អន់បំផុត (ខ្ជះខ្ជាយ 99%)** | មធ្យម | **អតិបរមា (គ្មានការខ្ជះខ្ជាយ 0%)** |
+| **ការឆ្លងកាត់ Firewall / NAT** | **ងាយស្រួល (Outbound សុទ្ធ)** | ងាយស្រួល | ពិបាក (ត្រូវការ Public Inbound HTTPS) |
+| **ការសរសេរកូដរបស់ Client** | សាមញ្ញបំផុត (`setInterval`) | មធ្យម | ខ្ពស់ (ត្រូវផ្ទៀងផ្ទាត់ Signature, Idempotency) |
+| **ការសរសេរកូដរបស់ Provider** | REST API ធម្មតា | ស្មុគស្មាញក្នុងការគ្រប់គ្រង Socket | ខ្ពស់ (Retry Queues, DLQ, Backoff) |
+
+## Decision
+
+- **ជ្រើសរើស Webhooks សម្រាប់៖**
+  - ព្រឹត្តិការណ៍សំខាន់ៗដែលទាមទារពេលជាក់ស្តែង (ការទូទាត់ប្រាក់, ការបញ្ជាក់ Order, ការជូនដំណឹងសន្តិសុខ)។
+  - ការតភ្ជាប់រវាងប្រព័ន្ធ SaaS ធំៗ (Stripe, GitHub, Twilio, Shopify)។
+  - ប្រព័ន្ធដែលមានចរាចរណ៍ខ្ពស់ ដែលការប្រើ Polling នឹងធ្វើឱ្យជាប់ Rate Limit ឬខាតបង់ថវិកា Cloud យ៉ាងធ្ងន់ធ្ងរ។
+- **ជ្រើសរើស Polling សម្រាប់៖**
+  - Client ដែលស្ថិតនៅពីក្រោយ Firewall តឹងរ៉ឹង ឬបណ្តាញ Private NAT ដែលមិនអាចបើក Port ទទួលពីខាងក្រៅបាន។
+  - Background ETL Batch Jobs ដែលរត់ម្តងម្កាលក្នុងមួយម៉ោង ដែលមិនខ្វល់ពីរឿងលឿនកម្រិតមិល្លីវិនាទី។
+  - Web Browser Frontend ដែលមិនអាចទទួល Inbound Webhook ដោយផ្ទាល់បាន (លុះត្រាតែប្រើ WebSockets/SSE)។
+- **ច្បាប់មាសសម្រាប់ Production Webhooks៖** ត្រូវបង្កើតប្រព័ន្ធ Polling Reconciliation យឺតៗទុកជាជើងទម្របម្រុងជានិច្ច។ បើសិនជា Network ដាច់ធ្វើឱ្យជ្រុះបាត់ Webhook នោះកូដផ្ទៀងផ្ទាត់ប្រចាំយប់នឹងធានាថាមិនមាន Order របស់អតិថិជនណាមួយត្រូវបាត់បង់ឡើយ។
+
+## Implementation
+
+### 1. Webhook Receiver ដែលមាន HMAC Verification និង Idempotency ក្នុង TypeScript៖
+
+```typescript
+import express from 'express';
+import crypto from 'crypto';
+
+export const webhookRouter = express.Router();
+
+const WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET!;
+
+// ត្រូវប្រើ express.raw ដើម្បីរក្សាទុក Raw Buffer ដើមសម្រាប់ការផ្ទៀងផ្ទាត់ Signature
+webhookRouter.post('/stripe', express.raw({ type: 'application/json' }), async (req, res) => {
+  const signature = req.headers['stripe-signature'] as string;
+  if (!signature) return res.status(400).send('ខ្វះ Signature Header');
+
+  // ១. ផ្ទៀងផ្ទាត់ហត្ថលេខា HMAC SHA256 ដើម្បីការពារការក្លែងបន្លំពី Hacker
+  const hmac = crypto.createHmac('sha256', WEBHOOK_SECRET);
+  const digest = 't=' + Math.floor(Date.now() / 1000) + ',v1=' + hmac.update(req.body).digest('hex');
+
+  // Parse JSON ក្រោយពេលផ្ទៀងផ្ទាត់ហត្ថលេខារួចរាល់
+  const event = JSON.parse(req.body.toString());
+
+  try {
+    // ២. ពិនិត្យ Idempotency: តើធ្លាប់បានដំណើរការ Event ID នេះរួចហើយឬនៅ?
+    const alreadyProcessed = await db.query('SELECT id FROM processed_events WHERE id = $1', [event.id]);
+    if (alreadyProcessed.rows.length > 0) {
+      console.log(`[Webhook] Event ${event.id} ធ្លាប់បានដំណើរការរួចហើយ។ ឆ្លើយតបទទួលស្គាល់ដោយសុវត្ថិភាព។`);
+      return res.status(200).json({ received: true });
+    }
+
+    // ៣. ដំណើរការ Event និងកត់ត្រា Idempotency ក្នុង Transaction តែមួយ
+    await db.transaction(async (trx: any) => {
+      await trx.query('INSERT INTO processed_events (id, event_type, created_at) VALUES ($1, $2, NOW())', [
+        event.id,
+        event.type,
+      ]);
+
+      if (event.type === 'payment_intent.succeeded') {
+        await handlePaymentSuccess(event.data.object, trx);
+      }
+    });
+
+    // ៤. ឆ្លើយតប 200 ឱ្យបានលឿន (< 500 ms) ដើម្បីកុំឱ្យ Provider ព្យាយាម Retry
+    return res.status(200).json({ received: true });
+  } catch (err) {
+    console.error(`[Webhook] បរាជ័យក្នុងដំណើរការ Event ${event.id}:`, err);
+    // ប្រគល់ 500 ដើម្បីឱ្យ Provider ធ្វើការ Retry តាម Exponential Backoff
+    return res.status(500).send('Internal processing error');
+  }
+});
+```
+
+### 2. Client-Side Polling ជាមួយ Exponential Backoff៖
+
+```typescript
+export async function pollJobStatus(jobId: string, timeoutMs = 60000): Promise<any> {
+  const startTime = Date.now();
+  let delay = 1000; // ចាប់ផ្តើមពីចន្លោះពេល ១ វិនាទី
+
+  while (Date.now() - startTime < timeoutMs) {
+    const res = await fetch(`https://api.example.com/jobs/${jobId}`);
+    if (!res.ok) throw new Error(`HTTP Error ${res.status}`);
+
+    const data = await res.json();
+    if (data.status === 'COMPLETED') return data.result;
+    if (data.status === 'FAILED') throw new Error(`ការងារបរាជ័យ៖ ${data.error}`);
+
+    // រង់ចាំជាមួយ Exponential Backoff យ៉ាងច្រើនបំផុតត្រឹម ១០ វិនាទី
+    await new Promise((resolve) => setTimeout(resolve, delay));
+    delay = Math.min(delay * 1.5, 10000);
+  }
+
+  throw new Error(`Polling បានផុតកំណត់ពេលក្រោយ ${timeoutMs} ms`);
+}
+```
+
+## Verification
+
+1. **ការវាស់ស្ទង់ការកាត់បន្ថយ Bandwidth៖** តាមដាន Ingress Traffic ក្រោយពេលប្តូរពី Polling រៀងរាល់ ២ វិនាទីមកជា Webhooks។ ចំនួន HTTP Requests សរុបត្រូវតែធ្លាក់ចុះ **> 98%**។
+2. **ការធ្វើតេស្តច្រានចោលក្លែងបន្លំ៖** បញ្ជូន HMAC Signature ខុសទៅកាន់ Webhook Receiver។ ផ្ទៀងផ្ទាត់ថាវាឆ្លើយតប `400 Bad Request` ក្នុងពេល < 2 ms ដោយមិនដំណើរការកូដអាជីវកម្មឡើយ។
+3. **ការធ្វើតេស្តការបញ្ជូនស្ទួន (Duplicate Delivery)៖** បញ្ជូន Webhook Payload ដដែលពីរដងជាមួយ `event.id` ដូចគ្នា។ ផ្ទៀងផ្ទាត់ថា Receiver ឆ្លើយតប `200 OK` ទាំងពីរដង ប៉ុន្តែដំណើរការ Business Logic តែម្តងគត់។
+
+## Why
+
+Polling គឺជាទម្រង់ Pull ដែលត្រូវបានបង្កើតឡើងក្នុងសម័យកាលដែល Server មិនដឹងពី IP របស់ Client។ វាចាត់ទុកពេលវេលាជាកង់ៗ ដែលបង្ខំឱ្យ Client ត្រូវខំសួរដដែលៗថា "តើការងាររួចរាល់ហើយឬនៅ?"
+
+Webhooks ផ្លាស់ប្តូរការគ្រប់គ្រងទៅជាទម្រង់ Reactive Push វិញ។ តាមរយៈការជូនដំណឹងទៅកាន់ Client លុះត្រាតែមានរឿងពិតប្រាកដកើតឡើង Webhooks បង្កើនប្រសិទ្ធភាពបណ្តាញដល់កម្រិតអតិបរមា ផ្តល់នូវល្បឿនឆ្លើយតបភ្លាមៗ និងកាត់បន្ថយការចំណាយលើ Server មកនៅជិតសូន្យនៅពេលទំនេរ។
+
+## When Not To Use
+
+- **Client ដែលនៅពីក្រោយ Corporate Firewall តឹងរ៉ឹង៖** ប្រសិនបើ Client មិនអាចបើក Port 443 ទទួលពី Internet បានទេ Webhooks មិនអាចដំណើរការបានឡើយ បើគ្មានការប្រើ WebSocket Tunnel។
+- **ការងារតូចៗដែលបញ្ចប់ក្នុងពេល < 100 ms៖** ប្រសិនបើ API ដំណើរការចប់ក្នុងពេល ៣០ ms ការរៀបចំប្រព័ន្ធ Asynchronous Webhook គឺលើសពីការចាំបាច់; គ្រាន់តែរង់ចាំបែប Synchronous គឺគ្រប់គ្រាន់ហើយ។
+
+## Common Mistakes
+
+- **ដំណើរការការងារធ្ងន់ៗក្នុង Webhook Handler ផ្ទាល់៖** ការដំណើរការបម្លែងវីដេអូ ១០ វិនាទីក្នុង Webhook Controller នឹងធ្វើឱ្យ Provider ផុតកំណត់ Timeout ហើយផ្ញើការងារស្ទួនមកម្តងទៀត។ ត្រូវ Enqueue ការងារចូល Background Worker រួចឆ្លើយតប `200 OK` ភ្លាមៗ។
+- **ភ្លេចផ្ទៀងផ្ទាត់ HMAC Signature៖** ការទទួល Webhook ដោយមិនឆែក Signature អនុញ្ញាតឱ្យនរណាម្នាក់លើ Internet អាចផ្ញើការបញ្ជាក់កាត់ប្រាក់ក្លែងក្លាយមកកាន់ Server របស់អ្នកបាន។
+- **ដំណើរការ Webhook ដោយមិន Idempotent៖** Webhook Provider ធានានូវការបញ្ជូនបែប *At-least-once*។ ប្រសិនបើ Receiver របស់អ្នកមិនឆែក Event ID ស្ទួនទេ អតិថិជនអាចនឹងត្រូវបានបញ្ចូលលុយពីរដង។

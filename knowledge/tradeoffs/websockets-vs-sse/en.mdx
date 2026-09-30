@@ -1,0 +1,156 @@
+---
+title: "WebSockets vs SSE"
+question: "Should I use WebSockets, Server-Sent Events (SSE), or Polling for real-time updates?"
+summary: "Use Server-Sent Events (SSE) for unidirectional server-to-client streaming (AI responses, notifications, live feeds); use WebSockets for high-frequency bidirectional interactions (chat, games, collaborative canvases); use polling only for rare background status checks."
+tags: [realtime, websockets, sse, polling, networking, architecture]
+related: [tradeoffs/rest-vs-grpc, tradeoffs/sync-vs-async, patterns/circuit-breaker]
+order: 5
+updated: "2026-09-12"
+contributors: [veasna]
+---
+
+## Context
+
+A team needs to deliver live updates to web and mobile clients: order status tracking, background job progress, real-time dashboard graphs, collaborative multi-user editing, or streaming generative AI responses.
+
+Developers frequently reach for **WebSockets** by default for any real-time requirement. Soon, they discover that WebSockets require custom heartbeat pings, complex sticky sessions across load balancers, manual reconnection and buffering logic, and struggle with enterprise corporate firewalls. Meanwhile, **Server-Sent Events (SSE)** or HTTP polling would have solved the problem with a fraction of the operational overhead.
+
+## Symptoms
+
+- **Over-engineered notification services:** Building a full WebSocket server cluster with Redis pub/sub backplanes just to push a notification badge once an hour.
+- **Firewall drops and proxy buffering:** Corporate firewalls or mobile cellular gateways dropping long-lived raw TCP WebSocket connections after 60 seconds of silence.
+- **Lost reconnect context:** Clients reconnecting after brief network drops having to re-fetch entire application states because WebSockets lack native event ID tracking.
+- **Load balancer sticky session headaches:** Deploying updates or scaling WebSocket servers terminating thousands of client connections simultaneously.
+
+<Callout type="warning" title="WebSockets are not a drop-in replacement for HTTP">
+A WebSocket upgrades away from standard HTTP into a raw bidirectional TCP stream. You lose HTTP status codes, standard authentication headers on frames, request-response pairing, HTTP caching, and standard HTTP metrics.
+</Callout>
+
+## Diagnose
+
+To choose the correct protocol, evaluate your data flow requirements:
+
+1. **Direction of data:** Does data only flow from server to client (e.g. AI token streaming, order status, price ticker), or does the client need to send hundreds of small messages back per minute (e.g. cursor coordinates, gamepad inputs)?
+2. **Frequency of updates:** Are messages arriving once every few seconds/minutes, or 30+ times per second?
+3. **Payload format:** Is the payload text/JSON or raw binary buffers?
+4. **Transport environment:** Will clients connect from enterprise networks with strict corporate proxies, or public internet mobile devices?
+
+## Options
+
+1. **Short Polling:** Client sends standard `GET` requests every $N$ seconds (e.g., `setInterval(fetch, 5000)`).
+2. **Long Polling:** Client sends an HTTP request; server holds it open until data arrives or a timeout occurs, then client immediately reconnects.
+3. **Server-Sent Events (SSE):** Standard persistent HTTP connection (`Content-Type: text/event-stream`) streaming text data from server to client with native browser reconnection and event IDs.
+4. **WebSockets:** Full-duplex, bidirectional TCP connection established via an HTTP Upgrade handshake.
+
+## Trade-offs
+
+| Feature | Short Polling | Long Polling | Server-Sent Events (SSE) | WebSockets |
+| :--- | :--- | :--- | :--- | :--- |
+| **Direction** | Client $\to$ Server | Client $\to$ Server | **Server $\to$ Client only** | **Bidirectional (Full Duplex)** |
+| **Protocol** | Standard HTTP | Standard HTTP | **Standard HTTP / HTTP/2** | TCP (Upgraded from HTTP) |
+| **Reconnection** | N/A (new request) | Manual in JS | **Built-in browser auto-reconnect** | Manual implementation |
+| **Message IDs & Resumption** | Manual query params | Manual | **Native (`Last-Event-ID`)** | Custom protocol required |
+| **Firewall / Proxy Friendly** | Universal | Universal | **High (Standard HTTP)** | Moderate (often blocked or terminated) |
+| **Binary Data** | Yes | Yes | No (Text/UTF-8 only) | **Native binary support** |
+| **Server Resource Cost** | High request overhead | Moderate | **Low (especially over HTTP/2)** | Moderate (long-lived socket) |
+
+## Decision
+
+- **Use Server-Sent Events (SSE) when:**
+  - Data flows strictly from **server to client** (LLM AI token streaming, order delivery tracking, build status logs, news feeds, stock tickers).
+  - You want zero extra client libraries (the browser's built-in `EventSource` API handles reconnection and message ordering out of the box).
+  - You operate behind standard HTTP/2 reverse proxies (Cloudflare, AWS ALB, Nginx).
+- **Use WebSockets when:**
+  - You need **high-frequency bidirectional** communication with sub-50 ms latency (online multiplayer games, shared collaborative whiteboards like Figma, low-latency live chat).
+  - You are sending raw binary frames (audio/video streaming chunks).
+- **Use Short Polling when:**
+  - The status only changes once every few hours or days (e.g., checking for new software updates, batch export status).
+
+## Implementation
+
+### Server-Sent Events (SSE) in Node.js / Express:
+
+```typescript
+import express from 'express';
+
+const app = express();
+
+app.get('/api/orders/:id/stream', (req, res) => {
+  // 1. Set required SSE headers
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive',
+  });
+
+  // Check if client provided last received event ID upon reconnection
+  const lastEventId = req.headers['last-event-id'];
+  if (lastEventId) {
+    console.log(`Client reconnected, resuming from event ${lastEventId}`);
+  }
+
+  // 2. Stream events to client
+  let eventCounter = 1;
+  const interval = setInterval(() => {
+    const payload = JSON.stringify({ status: 'preparing', progress: eventCounter * 20 });
+    
+    // SSE protocol format: id, event name, data, followed by double newline
+    res.write(`id: ${eventCounter}\n`);
+    res.write(`event: order-update\n`);
+    res.write(`data: ${payload}\n\n`);
+
+    eventCounter++;
+    if (eventCounter > 5) {
+      clearInterval(interval);
+      res.end();
+    }
+  }, 2000);
+
+  // 3. Clean up on client disconnect
+  req.on('close', () => {
+    clearInterval(interval);
+  });
+});
+```
+
+### Browser Client consuming SSE with native `EventSource`:
+
+```javascript
+// Native browser API - NO external libraries required!
+const eventSource = new EventSource('/api/orders/123/stream');
+
+eventSource.addEventListener('order-update', (event) => {
+  const data = JSON.parse(event.data);
+  console.log('Order status:', data.status, 'Progress:', data.progress);
+});
+
+eventSource.onerror = (err) => {
+  // Browser automatically retries connection with backoff
+  // and sends "Last-Event-ID" header on reconnect!
+  console.warn('Connection lost, browser is auto-reconnecting...', err);
+};
+```
+
+## Verification
+
+1. **Reconnection resilience:** In browser DevTools, toggle "Offline" in the Network tab for 5 seconds and switch back to "Online".
+   - With **WebSockets**, custom JavaScript reconnection handlers must fire and manually handle state recovery.
+   - With **SSE**, the browser's native `EventSource` automatically reconnects and includes the `Last-Event-ID` header to resume without missed events.
+2. **HTTP/2 multiplexing:** Inspect network requests. Under HTTP/2, multiple SSE streams share a single underlying TCP connection without consuming additional socket descriptors.
+
+## Why
+
+WebSockets require a protocol upgrade to a raw duplex socket. This breaks many HTTP-level optimizations: request compression, HTTP/2 multiplexing, standard caching proxies, and edge CDN termination.
+
+Server-Sent Events run over plain HTTP. When served over HTTP/2, multiple concurrent SSE streams can be multiplexed through a single TCP connection alongside normal API calls, drastically reducing resource consumption on both mobile devices and servers.
+
+## When Not To Use
+
+- **Bidirectional data on the same connection:** SSE cannot send data from client to server. If the client must push high-frequency updates, sending separate HTTP `POST` requests can incur HTTP header overhead; use WebSockets instead.
+- **Legacy HTTP/1.1 browser connection limits:** In old HTTP/1.1 browsers, there is a limit of 6 open connections per domain. If a user opens 6 tabs with SSE over HTTP/1.1, the 7th tab blocks. Always serve SSE over HTTP/2 to allow infinite multiplexing.
+
+## Common Mistakes
+
+- **Using WebSockets for one-way notifications.** Introducing stateful socket servers and pub/sub message routers when an SSE endpoint would have taken 20 lines of code.
+- **Forgetting `Cache-Control: no-cache` on SSE.** Without this header, intermediary proxies or Nginx will buffer server events until the buffer fills (often 4 KB) rather than sending them instantly.
+- **Missing heartbeat comments.** In SSE, proxies can drop idle connections after 60 seconds. Send a simple `: ping\n\n` comment every 15–30 seconds to keep the channel open.

@@ -1,0 +1,184 @@
+---
+title: "CQRS"
+question: "តើខ្ញុំអាចពង្រីកសមត្ថភាព Query អានទិន្នន័យស្មុគស្មាញ (Read) យ៉ាងដូចម្តេចដោយមិនធ្វើឱ្យប៉ះពាល់ ឬ Lock ប្រតិបត្តិការកត់ត្រាទិន្នន័យ (Write) ដែលមានបរិមាណច្រើន?"
+summary: "បែងចែកប្រតិបត្តិការអាន (Query) និងប្រតិបត្តិការសរសេរ (Command) ទៅជា Data Model និង Database ដាច់ដោយឡែកពីគ្នា។ ការសរសេរធ្វើឡើងលើ Normalized Tables ដើម្បីធានាភាពត្រឹមត្រូវនៃទិន្នន័យ ខណៈដែលការអានទាញចេញពី Denormalized Views ដែលរៀបចំទិន្នន័យរួចជាស្រេចដើម្បីល្បឿនលឿនបំផុត។"
+tags: [architecture, cqrs, event-driven, database, scalability]
+related: [patterns/event-sourcing, patterns/transactional-outbox, tradeoffs/saga-orchestration-vs-choreography]
+order: 12
+updated: "2026-09-12"
+contributors: [veasna]
+translation: draft
+---
+
+## Context
+
+នៅក្នុងស្ថាបត្យកម្ម CRUD បែបប្រពៃណី Database Schema តែមួយគត់ត្រូវបានប្រើប្រាស់សម្រាប់ទាំងការអាន (Read) និងការសរសេរ (Write)។ ទម្រង់តារាងបែប Normalized (3NF) គឺល្អឥតខ្ចោះសម្រាប់ការសរសេរ៖ វាជៀសវាងការស្ទួនទិន្នន័យ, ធានា Foreign Key Constraints, និងគាំទ្រ ACID Transactions។
+
+ប៉ុន្តែផ្ទាំងបង្ហាញរបស់អ្នកប្រើប្រាស់ (User Interface) ដ៏ស្មុគស្មាញ កម្រនឹងត្រូវគ្នាជាមួយ Normalized Schema ណាស់។ ឧទាហរណ៍ ផ្ទាំង Dashboard អតិថិជនមួយ ត្រូវការ Join តារាងចំនួន ៨ ផ្សេងគ្នា៖ Orders, Order Items, Products, Customers, Shipping Tracking, Billing Addresses, Discounts, និង Payment Statuses។ នៅពេលដែលទិន្នន័យ និងចំនួន Query កើនឡើង ការ Join ច្រើនតារាងបែបនេះនឹងចាក់សោ (Lock) ជួរទិន្នន័យ, ស៊ី CPU របស់ Database ដល់ ៨៥%, និងធ្វើឱ្យទាំងការអាន និងការសរសេរធ្លាក់ចុះយឺតខ្លាំង។
+
+**CQRS (Command Query Responsibility Segregation)** បំបែកប្រព័ន្ធជាពីរផ្លូវដាច់ពីគ្នា៖
+1. **Commands (ការសរសេរ)៖** ផ្លាស់ប្តូរស្ថានភាពទិន្នន័យ ផ្ទៀងផ្ទាត់ Business Rules និងសរសេរទៅកាន់ Write Model (ឧ. តារាង Normalized ក្នុង PostgreSQL)។
+2. **Queries (ការអាន)៖** Read Model ដែលទាញទិន្នន័យចេញពីតារាង Denormalized ដែលបាន Join រួចជាស្រេច (ឧ. Elasticsearch, MongoDB, ឬ Read-Replica Table) តាមរយៈការបញ្ជូន Events បែប Asynchronous។
+
+## Symptoms
+
+- Query បង្ហាញ Dashboard ឬរបាយការណ៍ស្មុគស្មាញត្រូវការ Join តារាងចំនួន ៨ ដែលស៊ី CPU Database លើសពី ៨០% និង Lock តារាងអាជីវកម្ម។
+- ការបន្ថែម Database Index ដើម្បីជួយឱ្យការ Search លឿន បែរជាធ្វើឱ្យការបង្កើត Order ឬការ Checkout យឺតយ៉ាវខ្លាំងទៅវិញ។
+- អត្រាអាននិងសរសេរខុសគ្នាខ្លាំង (ឧ. អាន ១,០០០ ដង ធៀបនឹងសរសេរតែ ១ ដង) តែនៅពេលមានអ្នកចូលមើលច្រើន បែរជាធ្វើឱ្យគាំងដល់ប្រព័ន្ធកត់ត្រាទិន្នន័យ។
+- Domain Model ពោរពេញទៅដោយ Field សម្រាប់តែការបង្ហាញ (DTOs), បញ្ហា ORM Lazy-loading, និងស្ថាបត្យកម្មដែលមិនល្អទាំងការអាន និងការសរសេរ។
+
+<Callout type="warning" title="ការប្រើ Schema តែមួយសម្រាប់ទាំង Read និង Write បង្កើតជាចំណុចទាល់ច្រក">
+Schema ដែលរៀបចំយ៉ាងល្អសម្រាប់ការសរសេរ (Normalized) នឹងធ្វើឱ្យការអានយឺតយ៉ាវ។ រីឯ Schema ដែលរៀបចំសម្រាប់ការអានលឿន (Denormalized) នឹងជួបបញ្ហាទិន្នន័យមិនត្រូវគ្នា និងការ Lock ជួរពេលសរសេរ។
+</Callout>
+
+## Diagnose
+
+1. **វាស់វែងសមាមាត្រ Read/Write៖** ពិនិត្យ Metrics របស់ Database។ តើការអានមានលើសពី ៩០% នៃចំនួន Query សរុបមែនទេ?
+2. **វិភាគ Slow Query Logs៖** តើ Query ដែលយឺតបំផុតរបស់អ្នកគឺជាប្រតិបត្តិការ `JOIN` ច្រើនតារាងដើម្បីបង្ហាញទំព័រ UI មែនទេ?
+3. **ពិនិត្យមើលបញ្ហា Lock Contention៖** តើការដំណើរការ `SELECT` យូរៗបង្កឱ្យមានបញ្ហា `Lock:transaction` លើប្រតិបត្តិការ `UPDATE` ដែរឬទេ?
+4. **វាយតម្លៃកម្រិតទទួលយកភាពយឺតនៃទិន្នន័យ (Staleness Tolerance)៖** តើផ្ទាំង Dashboard ឬប្រព័ន្ធស្វែងរកអាចទទួលយកការពន្យារពេល ៥០០ មិល្លីវិនាទីក្រោយពេលកត់ត្រាទិន្នន័យ (Eventual Consistency) បានដែរឬទេ?
+
+## Options
+
+1. **Database តែមួយជាមួយ Read Replicas៖** បង្វែរ Query អានទៅកាន់ PostgreSQL Read Replica តាមរយៈ Streaming Replication។ (សាមញ្ញ ប៉ុន្តែនៅតែប្រើ Normalized Schema ដដែលដែលទាមទារការ Join ធ្ងន់ធ្ងរ)។
+2. **CQRS លើ Database តែមួយ (Logical CQRS)៖** ប្រើ Database Engine តែមួយ ប៉ុន្តែបំបែកកូដ Command Handler និង Query Handler ដាច់ពីគ្នា។ Query អានពី SQL Materialized Views ឬតារាង Denormalized ដែលត្រៀមទុកជាស្រេច។
+3. **CQRS ជាមួយ Polyglot Persistence (ញែកដាច់ស្រឡះ)៖** ការសរសេរចូលទៅកាន់ PostgreSQL; រីឯ Event Pipeline រុញទិន្នន័យបែប Asynchronous ទៅកាន់ Document Store (MongoDB) ឬ Search Engine (Elasticsearch)។
+
+## Trade-offs
+
+| ស្ថាបត្យកម្ម | ល្បឿនអាន (Read) | លទ្ធភាពពង្រីកការសរសេរ (Write) | ភាពស៊ីសង្វាក់នៃទិន្នន័យ | ភាពស្មុគស្មាញនៃកូដ |
+| :--- | :--- | :--- | :--- | :--- |
+| **CRUD ប្រពៃណី** | ទាប (Join ច្រើន) | មានកម្រិត | ភ្លាមៗ (ACID) | ទាបបំផុត |
+| **Read Replicas** | មធ្យម | មធ្យម | ជិតភ្លាមៗ (ms lag) | ទាប |
+| **CQRS (Views ក្នុង DB តែមួយ)** | ខ្ពស់ | ខ្ពស់ | ជិតភ្លាមៗ | មធ្យម |
+| **CQRS (Polyglot DBs)** | អតិបរមា (< 10 ms) | អតិបរមា | Eventual (50–500 ms) | ខ្ពស់ |
+
+## Decision
+
+- **កុំប្រើ CQRS គ្រប់កន្លែង៖** ជ្រើសរើស CRUD ជាលំនាំដើម។ ប្រើ CQRS សម្រាប់តែមុខងារណាដែលមានការអានច្រើនលើសលុប ឬ Query ស្មុគស្មាញខ្លាំងប៉ុណ្ណោះ (ដូចជា ការស្វែងរកទំនិញ, Dashboard របាយការណ៍, Audit Log)។
+- **ចាប់ផ្តើមជាមួយ Logical CQRS ជាមុន៖** បំបែកកូដជា Command និង Query Classes មុននឹងបំបែក Database តាម Hardware។ ជាញឹកញាប់ ការប្រើតារាង Denormalized ក្នុង PostgreSQL តែមួយអាចដោះស្រាយបញ្ហាបាន ៩០% ដោយមិនចាំបាច់មានបន្ទុក Distributed Systems ឡើយ។
+- **ទទួលយក Eventual Consistency ឱ្យបានត្រឹមត្រូវ៖** នៅពេលប្រើ Polyglot CQRS (Postgres សរសេរ -> Elasticsearch អាន) ត្រូវរៀបចំ UI ឱ្យយល់ពីភាពយឺតយ៉ាវ (Replication Lag) ដូចជាការប្រើ Optimistic UI update លើ Client។
+- **ប្រើគូជាមួយ Transactional Outbox ជានិច្ច៖** នៅពេលបញ្ជូន Event ទៅកាន់ Read Database ខាងក្រៅ ត្រូវប្រើ Transactional Outbox ដើម្បីធានាថាមិនមាន Event ណាមួយត្រូវបាត់បង់ឡើយ។
+
+## Implementation
+
+### 1. ផ្នែក Command (Write Model): Business logic តឹងរ៉ឹង និង Normalized Write
+
+```typescript
+// Command: CreateOrderCommand
+export interface CreateOrderCommand {
+  orderId: string;
+  customerId: string;
+  items: Array<{ productId: string; quantity: number; priceCents: number }>;
+}
+
+export class OrderCommandHandler {
+  constructor(private readonly db: any, private readonly eventBus: any) {}
+
+  async handle(cmd: CreateOrderCommand): Promise<void> {
+    // ១. ផ្ទៀងផ្ទាត់លក្ខខណ្ឌអាជីវកម្ម
+    if (cmd.items.length === 0) throw new Error('Order ត្រូវតែមានទំនិញយ៉ាងហោចណាស់ ១');
+
+    // ២. សរសេរចូលតារាង Normalized ក្នុង SQL ដោយប្រើ Transaction
+    await this.db.transaction(async (trx: any) => {
+      const totalCents = cmd.items.reduce((acc, i) => acc + i.priceCents * i.quantity, 0);
+
+      await trx('orders').insert({
+        id: cmd.orderId,
+        customer_id: cmd.customerId,
+        total_cents: totalCents,
+        status: 'PENDING',
+        created_at: new Date(),
+      });
+
+      for (const item of cmd.items) {
+        await trx('order_items').insert({
+          order_id: cmd.orderId,
+          product_id: item.productId,
+          quantity: item.quantity,
+          unit_price_cents: item.priceCents,
+        });
+      }
+
+      // ៣. បញ្ចេញ Domain Event សម្រាប់ឱ្យ Read Model យកទៅធ្វើ Projection
+      await this.eventBus.publish('OrderCreated', {
+        orderId: cmd.orderId,
+        customerId: cmd.customerId,
+        totalCents,
+        itemsCount: cmd.items.length,
+        createdAt: new Date().toISOString(),
+      });
+    });
+  }
+}
+```
+
+### 2. ផ្នែក Projector: បង្កើត Denormalized Read Model បែប Asynchronous
+
+```typescript
+// Event handler ធ្វើបច្ចុប្បន្នភាពលើ Dashboard View ក្នុង MongoDB ឬ Read Store
+export class OrderDashboardProjector {
+  constructor(private readonly readDb: any) {}
+
+  async onOrderCreated(event: any) {
+    // Upsert ចូលក្នុង Flat Document ដោយផ្ទាល់ដែលរៀបចំស្រេចសម្រាប់ Query ភ្លាមៗ
+    await this.readDb.collection('customer_order_summaries').updateOne(
+      { customerId: event.customerId },
+      {
+        $inc: { totalOrdersCount: 1, lifetimeSpendCents: event.totalCents },
+        $set: { lastOrderAt: event.createdAt },
+        $push: {
+          recentOrders: {
+            $each: [{ orderId: event.orderId, totalCents: event.totalCents, itemsCount: event.itemsCount }],
+            $slice: -5, // រក្សាទុកតែ ៥ ចុងក្រោយ
+          },
+        },
+      },
+      { upsert: true }
+    );
+  }
+}
+```
+
+### 3. ផ្នែក Query (Read Model): ទាញយកទិន្នន័យលឿនដូចផ្លេកបន្ទោរដោយគ្មាន Join
+
+```typescript
+export class CustomerDashboardQueryHandler {
+  constructor(private readonly readDb: any) {}
+
+  async getDashboard(customerId: string) {
+    // គ្មានការ Join ឡើយ! ទាញយក O(1) តាមរយៈ Primary Key ផ្ទាល់
+    const summary = await this.readDb.collection('customer_order_summaries').findOne({ customerId });
+    if (!summary) {
+      return { totalOrdersCount: 0, lifetimeSpendCents: 0, recentOrders: [] };
+    }
+    return summary;
+  }
+}
+```
+
+## Verification
+
+1. **ការវាស់ស្ទង់ Latency នៃការ Query៖** ប្រៀបធៀប Relational Query ចាស់ដែលមាន ៨ Joins ធៀបនឹង Denormalized Read Query ថ្មី។ ផ្ទៀងផ្ទាត់ថា Latency ធ្លាក់ចុះពី > 300 ms មកនៅត្រឹម < 5 ms។
+2. **Throughput នៃការសរសេរទិន្នន័យ៖** ធ្វើតេស្តបន្ទុក Write Model នៅកម្រិត 2,000 writes/sec។ ផ្ទៀងផ្ទាត់ថាការដក Index មិនចាំបាច់ចេញពី Write Table ជួយកាត់បន្ថយ Disk I/O និង Lock Waits។
+3. **ការតាមដាន Projection Lag៖** បង្កើត Metric `projection_lag_ms = now() - event.createdAt`។ បញ្ចេញ Alert ប្រសិនបើ Projection Lag លើសពី 2,000 ms។
+4. **ផ្ទៀងផ្ទាត់ភាពត្រឹមត្រូវនៃទិន្នន័យ៖** ដំណើរការ Script ផ្ទៀងផ្ទាត់ទិន្នន័យរៀងរាល់យប់រវាង Write Database និង Read Store ដើម្បីរកមើលថាតើមាន Event ណាដែលធ្លាក់បាត់ឬទេ។
+
+## Why
+
+ក្នុងប្រព័ន្ធធំៗ ទម្រង់នៃការអាន និងការសរសេរមានតម្រូវការផ្ទុយគ្នាស្រឡះ៖
+- ការសរសេរត្រូវការ Consistency, ការផ្ទៀងផ្ទាត់ច្បាប់អាជីវកម្ម, Normalized Constraints, និង Index តិចបំផុត។
+- ការអានត្រូវការការបូកសរុបទិន្នន័យ (Aggregation), Denormalization, ការចម្រាញ់ស្វែងរកបត់បែន, និងការ Cache ទុកជាមុន។
+
+ការបង្ខំឱ្យទម្រង់ទាំងពីរប្រើប្រាស់ Model តែមួយ គឺជាការសម្របសម្រួលដែលទាញទម្លាក់ល្បឿនប្រព័ន្ធទាំងមូល។ CQRS ជួយដោះលែងទំនាស់នេះ ដោយអនុញ្ញាតឱ្យផ្នែកនីមួយៗជ្រើសរើស Storage Engine និងទម្រង់ទិន្នន័យដែលស័ក្តិសមបំផុត។
+
+## When Not To Use
+
+- **កម្មវិធី CRUD សាមញ្ញ៖** សម្រាប់ប្រព័ន្ធផ្ទៃក្នុងតូចៗ, Blog, ឬ Admin Tools ទូទៅដែលមិនសូវមាន Traffic ការប្រើ CQRS បង្កើតតែបន្ទុកកូដស្មុគស្មាញឥតប្រយោជន៍។
+- **តម្រូវការទិន្នន័យដែលត្រូវតែស្រស់ភ្លាមៗ (Strict Read-your-own-writes)៖** ប្រសិនបើអ្នកប្រើប្រាស់កែទិន្នន័យហើយរំពឹងថានឹងឃើញវាលើបញ្ជីរួមភ្លាមៗក្នុងពេល 0 ms នោះ Eventual Consistency នឹងធ្វើឱ្យអ្នកប្រើប្រាស់យល់ច្រឡំ ប្រសិនបើមិនបានរៀបចំ Optimistic UI លើ Frontend ទេ។
+
+## Common Mistakes
+
+- **យក CQRS ទៅប្រើប្រាស់គ្រប់កន្លែង៖** ចាត់ទុក CQRS ជាច្បាប់ស្ថាបត្យកម្មទូទៅជាជាងការអនុវត្តលើផ្នែកជាក់លាក់ដែលមាន Traffic ខ្ពស់។
+- **ធ្វើ Projection បែប Synchronous៖** ការ Update លើ Read Model ដោយផ្ទាល់ក្នុង Write Transaction ធ្វើឱ្យបាត់បង់អត្ថប្រយោជន៍ទាំងស្រុងនៃ CQRS និងនាំមកនូវបញ្ហា Lock Contention ដដែល។
+- **គ្មានយន្តការ Replay ឡើងវិញ៖** មិនបានរក្សាទុក Event ឬ Outbox Logs ដែលធ្វើឱ្យពិបាកក្នុងការ Rebuild Read Model ឡើងវិញនៅពេលកូដ Projection មានបញ្ហា Bug។

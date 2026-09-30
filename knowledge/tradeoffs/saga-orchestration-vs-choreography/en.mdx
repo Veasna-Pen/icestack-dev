@@ -1,0 +1,172 @@
+---
+title: "Orchestration vs Choreography"
+question: "Should I coordinate distributed transactions via Orchestration or Choreography?"
+summary: "Use Choreography for simple 2–3 step linear flows where services publish domain events; use Orchestration when workflows have branching logic, timeouts, explicit compensating rollbacks, or audit requirements."
+tags: [architecture, saga, distributed-transactions, microservices, event-driven]
+related: [tradeoffs/monolith-vs-microservices, tradeoffs/sync-vs-async, patterns/transactional-outbox]
+order: 6
+updated: "2026-09-12"
+contributors: [veasna]
+---
+
+## Context
+
+In a microservices architecture, a single business process often requires coordinated updates across multiple independent services and databases:
+1. **Order Service:** Create pending order.
+2. **Customer Service:** Reserve customer loyalty points.
+3. **Payment Service:** Authorize credit card charge.
+4. **Inventory Service:** Reserve warehouse stock.
+
+Because distributed ACID transactions (Two-Phase Commit / 2PC) do not scale and introduce locking bottlenecks, distributed systems use the **Saga Pattern**: a sequence of local transactions where each step publishes an event or executes a command. If any step fails, the Saga executes **compensating transactions** to undo the previous changes.
+
+The critical architectural decision is how to coordinate the Saga: **Choreography** (decentralized, event-driven) or **Orchestration** (centralized state machine)?
+
+## Symptoms
+
+- **The Choreography "Pinball" Effect:** Teams adopt choreography because "microservices should be decoupled," but soon nobody can trace how an order transitions through the system. Events trigger other events, creating cyclic event storms and phantom duplicate executions.
+- **Unclear Failure States:** When step 3 of a 5-step choreographed flow fails, finding out which services rolled back and which are stuck requires manually correlating logs across 5 different services in Datadog.
+- **The Orchestrator Monolith:** Teams adopt orchestration, but developers dump all business validation into the central coordinator, turning it into a bloated, tightly coupled "god service."
+
+<Callout type="warning" title="Compensating transactions are not rollbacks">
+A database rollback erases dirty writes as if they never happened. A compensating transaction in a Saga is a new forward write that logically counteracts a previous write (e.g. issuing a refund rather than un-charging a credit card).
+</Callout>
+
+## Diagnose
+
+Evaluate the complexity of your business workflow:
+
+1. **Step count and branching:** How many services participate? Is the flow linear ($A \to B \to C$), or does it contain conditional branches, parallel steps ($B$ and $C$ in parallel), or external waiting timeouts?
+2. **Failure frequency and compensating complexity:** If step 4 fails, how difficult is it to compensate steps 1, 2, and 3?
+3. **Audit and visibility requirements:** Does compliance or operations require an immediate answer to "what exact state is order #1084 in right now?"
+4. **Team structure:** Is one team responsible for the end-to-end user checkout experience, or are 4 independent teams strictly owning decoupled domain events?
+
+## Options
+
+1. **Choreography (Event-Driven Pub/Sub):** Each service listens to domain events from other services, performs its local transaction, and publishes a new event. There is no central controller.
+2. **Orchestration (Command-Driven State Machine):** A dedicated coordinator service (or workflow engine like Temporal, AWS Step Functions, or Camunda) sends direct commands to participant services, waits for replies, and executes compensating commands if a step fails.
+3. **Two-Phase Commit (2PC / XA):** Distributed database locking. (Avoid in microservices due to coordinator failure modes and network latency).
+
+## Trade-offs
+
+| Dimension | Choreography | Orchestration |
+| :--- | :--- | :--- |
+| **Conceptual Coupling** | Low (services only know events) | Higher (orchestrator knows participants) |
+| **Workflow Observability** | **Difficult** (distributed across many event logs) | **Trivial** (single state machine log) |
+| **Handling Failures & Rollbacks** | **Complex** (each service must listen for failure events) | **Simple & Explicit** (orchestrator invokes undo commands) |
+| **Debugging & Troubleshooting** | Hard (requires distributed tracing / Jaeger) | Easy (view current state in orchestrator UI) |
+| **Single Point of Failure** | No single coordinator service | Orchestrator service must be highly available |
+| **Best For** | 2–3 step simple linear workflows | Complex, multi-step flows with timeouts & branching |
+
+## Decision
+
+- **Use Choreography when:**
+  - The workflow has only **2 to 3 steps** with little or no branching (e.g., Order Created $\to$ Send Notification $\to$ Update Analytics).
+  - The business process rarely changes.
+  - You already have mature distributed tracing (OpenTelemetry/Jaeger) in place.
+- **Use Orchestration when:**
+  - The workflow has **4 or more steps**, or contains parallel branching (e.g., charge card while reserving inventory).
+  - Compensating actions are complex (e.g. if payment fails, unlock seats, restock inventory, and send apology email).
+  - The business needs immediate visibility into order states.
+  - You have human-in-the-loop steps or long-running delays (e.g., wait 24 hours for wire transfer).
+
+## Implementation
+
+### Orchestrated Saga State Machine (TypeScript):
+
+```typescript
+interface SagaStep {
+  name: string;
+  execute: (context: any) => Promise<any>;
+  compensate: (context: any) => Promise<void>;
+}
+
+export class OrderSagaOrchestrator {
+  private steps: SagaStep[] = [];
+  private executedSteps: SagaStep[] = [];
+
+  addStep(step: SagaStep) {
+    this.steps.push(step);
+    return this;
+  }
+
+  async execute(context: any) {
+    console.log(`Starting Order Saga for order ${context.orderId}`);
+
+    for (const step of this.steps) {
+      try {
+        console.log(`Executing step: ${step.name}`);
+        await step.execute(context);
+        this.executedSteps.push(step);
+      } catch (err) {
+        console.error(`Step ${step.name} failed! Starting compensation...`, err);
+        await this.rollback(context);
+        throw new Error(`Saga failed at step ${step.name}: ${err}`);
+      }
+    }
+
+    console.log(`Order Saga ${context.orderId} completed successfully.`);
+  }
+
+  private async rollback(context: any) {
+    // Roll back in REVERSE order of execution
+    for (const step of this.executedSteps.reverse()) {
+      try {
+        console.log(`Compensating step: ${step.name}`);
+        await step.compensate(context);
+      } catch (compensateErr) {
+        // Critical: Log to dead-letter queue / alert for manual intervention
+        console.error(`FATAL: Compensation failed for ${step.name}`, compensateErr);
+      }
+    }
+  }
+}
+```
+
+### Defining the Saga Steps:
+
+```typescript
+const saga = new OrderSagaOrchestrator()
+  .addStep({
+    name: 'ReserveInventory',
+    execute: async (ctx) => await inventoryClient.reserve(ctx.orderId, ctx.items),
+    compensate: async (ctx) => await inventoryClient.release(ctx.orderId),
+  })
+  .addStep({
+    name: 'ProcessPayment',
+    execute: async (ctx) => await paymentClient.charge(ctx.orderId, ctx.amount),
+    compensate: async (ctx) => await paymentClient.refund(ctx.orderId),
+  })
+  .addStep({
+    name: 'ShipOrder',
+    execute: async (ctx) => await shippingClient.scheduleDelivery(ctx.orderId),
+    compensate: async (ctx) => await shippingClient.cancelDelivery(ctx.orderId),
+  });
+
+// Execute the workflow
+await saga.execute({ orderId: 'ord_9182', amount: 150, items: ['item_1'] });
+```
+
+## Verification
+
+1. **Failure compensation test:** In your staging environment, inject a simulated failure into `ProcessPayment`. Verify that `inventoryClient.release` is automatically called, and inventory counts return to their exact original numbers.
+2. **State inspection:** Query the orchestrator database; it must report status `COMPENSATED` with exact timestamps and error logs for the failed payment step.
+3. **No orphaned locks:** Ensure no database rows remain locked in pending states after a saga failure.
+
+## Why
+
+As systems scale, **comprehensibility becomes the primary bottleneck**, not CPU cycles. 
+
+In a choreographed architecture with 10 services, understanding the control flow requires reconstructing an implicit graph from 10 different codebases. When a bug occurs, tracking event ordering race conditions across distributed queues is one of the hardest tasks in software engineering.
+
+Orchestration replaces implicit distributed event chains with an explicit, readable flowchart in code or state machine definition.
+
+## When Not To Use
+
+- **Do not use Sagas if you can use a Monolith.** If all tables can live in the same PostgreSQL database, use a standard ACID transaction (`BEGIN ... COMMIT`). Sagas add massive eventual consistency and rollback overhead.
+- **Do not use Orchestration for simple notifications.** If a user updates their avatar and 5 services just need to refresh their display caches, simple event choreography (pub/sub) is far cleaner.
+
+## Common Mistakes
+
+- **Writing non-idempotent compensating actions.** If the network drops while issuing a refund in a compensation step, the orchestrator will retry. The refund API must accept an idempotency key to prevent double refunds!
+- **Mixing commands and domain events.** In choreography, services should emit past-tense domain events (`OrderPlaced`), not imperative commands masquerading as events (`ChargePaymentRequested`).
+- **Forgetting that intermediate state is visible.** Sagas lack ACID "Isolation" ($I$). While a saga is running, other users can see "pending" orders or reserved items. Always design UI states to accommodate pending statuses.

@@ -1,0 +1,192 @@
+---
+title: ".NET (C#)"
+question: "How do I configure Polly v8 resilience pipelines, EF Core pooling, and HybridCache in ASP.NET Core?"
+summary: "Timeouts with CancellationToken, resilient retries with Polly, connection pooling with EF Core, and rate limiting with System.Threading.RateLimiting in ASP.NET Core."
+tags: [dotnet, csharp, aspnetcore, backend, implementation]
+related: [patterns/retry, patterns/circuit-breaker, patterns/rate-limiting, patterns/idempotency]
+order: 8
+updated: "2026-09-12"
+contributors: [veasna]
+---
+
+Production patterns for modern .NET 8/9 and ASP.NET Core Minimal APIs. Covers request cancellation tokens, Polly v8 resilience pipelines, EF Core database pooling, HybridCache two-tier caching, and partitioned rate limiters.
+
+## Timeouts first
+
+In .NET, cancellation and timeouts are driven by `CancellationToken`. Every asynchronous network or database call must receive and check a cancellation token:
+
+```csharp
+using System.Net.Http;
+
+var builder = WebApplication.CreateBuilder(args);
+var app = builder.Build();
+
+app.MapGet("/rates", async (IHttpClientFactory clientFactory, CancellationToken ct) =>
+{
+    // Combine client cancellation with a strict 2-second timeout
+    using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+    cts.CancelAfter(TimeSpan.FromSeconds(2));
+
+    var client = clientFactory.CreateClient();
+    try
+    {
+        var response = await client.GetAsync("https://api.example.com/rates", cts.Token);
+        response.EnsureSuccessStatusCode();
+        var data = await response.Content.ReadAsStringAsync(cts.Token);
+        return Results.Ok(data);
+    }
+    catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+    {
+        return Results.Problem(
+            title: "Gateway Timeout",
+            detail: "Upstream exchange rates API failed to respond within 2 seconds.",
+            statusCode: StatusCodes.Status504GatewayTimeout);
+    }
+});
+
+app.Run();
+```
+
+## Retry with backoff (Polly v8)
+
+Use Polly's modern `ResiliencePipeline` to handle transient HTTP errors with exponential backoff and jitter:
+
+```csharp
+using Polly;
+using Polly.Retry;
+
+var pipeline = new ResiliencePipelineBuilder<HttpResponseMessage>()
+    .AddRetry(new RetryStrategyOptions<HttpResponseMessage>
+    {
+        MaxRetryAttempts = 3,
+        BackoffType = DelayBackoffType.Exponential,
+        UseJitter = true,
+        BaseDelay = TimeSpan.FromMilliseconds(200),
+        ShouldHandle = new PredicateBuilder<HttpResponseMessage>()
+            .HandleResult(res => (int)res.StatusCode is 408 or 429 or >= 500)
+            .Handle<HttpRequestException>()
+            .Handle<TimeoutException>()
+    })
+    .Build();
+
+// Executing with pipeline
+var response = await pipeline.ExecuteAsync(async token =>
+{
+    return await httpClient.GetAsync("https://api.example.com/inventory", token);
+}, cancellationToken);
+```
+
+## Database connection pool (EF Core)
+
+Configure Entity Framework Core connection pooling (`AddDbContextPool`) and command timeouts in `Program.cs`:
+
+```csharp
+builder.Services.AddDbContextPool<AppDbContext>(options =>
+{
+    options.UseNpgsql(builder.Configuration.GetConnectionString("DefaultConnection"), npgsqlOptions =>
+    {
+        npgsqlOptions.CommandTimeout(5); // 5-second statement timeout
+        npgsqlOptions.EnableRetryOnFailure(
+            maxRetryCount: 3,
+            maxRetryDelay: TimeSpan.FromSeconds(2),
+            errorCodesToAdd: null);
+    });
+    options.ConfigureWarnings(w => w.Throw(RelationalEventId.MultipleCollectionIncludeWarning));
+}, poolSize: 128);
+```
+
+## Idempotency keys
+
+Use a database transaction with a unique constraint on `idempotency_key` to guarantee at-most-once processing:
+
+```csharp
+app.MapPost("/orders", async (OrderRequest req, AppDbContext db, HttpContext ctx) =>
+{
+    if (!ctx.Request.Headers.TryGetValue("Idempotency-Key", out var rawKey) || string.IsNullOrWhiteSpace(rawKey))
+    {
+        return Results.BadRequest(new { error = "Idempotency-Key header is required" });
+    }
+    var key = rawKey.ToString();
+
+    await using var tx = await db.Database.BeginTransactionAsync();
+    try
+    {
+        var existing = await db.IdempotencyRecords.FindAsync(key);
+        if (existing is not null)
+        {
+            await tx.RollbackAsync();
+            return existing.ResponseBody is not null
+                ? Results.Content(existing.ResponseBody, "application/json", statusCode: existing.StatusCode)
+                : Results.Conflict(new { error = "Request currently in progress" });
+        }
+
+        // Claim key
+        var record = new IdempotencyRecord { Key = key, CreatedAt = DateTime.UtcNow };
+        db.IdempotencyRecords.Add(record);
+        await db.SaveChangesAsync();
+
+        // Create business order
+        var order = new Order { CustomerId = req.CustomerId, TotalCents = req.TotalCents };
+        db.Orders.Add(order);
+        await db.SaveChangesAsync();
+
+        record.StatusCode = 201;
+        record.ResponseBody = JsonSerializer.Serialize(order);
+        await db.SaveChangesAsync();
+
+        await tx.CommitAsync();
+        return Results.Created($"/orders/{order.Id}", order);
+    }
+    catch (Exception)
+    {
+        await tx.RollbackAsync();
+        throw;
+    }
+});
+```
+
+## Caching (HybridCache)
+
+.NET 9 introduces `HybridCache`, combining fast in-process L1 memory with distributed L2 Redis and single-flight stampede prevention:
+
+```csharp
+app.MapGet("/products/{id}", async (string id, HybridCache cache, AppDbContext db, CancellationToken ct) =>
+{
+    var product = await cache.GetOrCreateAsync(
+        $"product:{id}",
+        async cancelToken =>
+        {
+            return await db.Products
+                .AsNoTracking()
+                .FirstOrDefaultAsync(p => p.Id == id, cancelToken);
+        },
+        new HybridCacheEntryOptions
+        {
+            Expiration = TimeSpan.FromMinutes(5),
+            LocalCacheExpiration = TimeSpan.FromMinutes(1)
+        },
+        cancellationToken: ct);
+
+    return product is not null ? Results.Ok(product) : Results.NotFound();
+});
+```
+
+## Rate limiting (System.Threading.RateLimiting)
+
+ASP.NET Core has built-in rate limiting middleware:
+
+```csharp
+builder.Services.AddRateLimiter(options =>
+{
+    options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
+    options.AddFixedWindowLimiter("api-policy", opt =>
+    {
+        opt.PermitLimit = 100;
+        opt.Window = TimeSpan.FromMinutes(1);
+        opt.QueueLimit = 0; // Reject immediately without buffering memory
+    });
+});
+
+app.UseRateLimiter();
+app.MapGet("/public/data", () => "OK").RequireRateLimiter("api-policy");
+```

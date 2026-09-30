@@ -1,0 +1,167 @@
+---
+title: "ហេតុអ្វីបានជាកម្មវិធី leak memory?"
+question: "ហេតុអ្វីបានជាកម្មវិធីរបស់ខ្ញុំចេះតែអស់ memory រហូត (OOM)?"
+summary: "Memory leaks នៅក្នុង garbage-collected runtimes កើតឡើងនៅពេលដែល objects ដែលលែងប្រើ នៅតែអាចភ្ជាប់ទៅដល់ GC roots បាន។ សូមប្រៀបធៀប heap snapshots មុនពេលអ្នកសម្រេចចិត្តដំឡើងទំហំ container memory ឬកំណត់ cron restart ជាប្រចាំ។"
+tags: [memory, performance, nodejs, debugging, containers]
+related: [problems/database-is-slow, patterns/caching]
+order: 7
+updated: "2026-09-12"
+contributors: [veasna]
+translation: draft
+---
+
+## Context
+
+សេវាកម្ម backend មួយដំណើរការក្នុង Kubernetes ជាមួយទំហំ memory limit 512 MB (`resources.limits.memory: 512Mi`)។ នៅពេលទើប deploy ដំបូង process ស៊ី memory ត្រឹមតែប្រហែល 120 MB ប៉ុណ្ណោះ។ ប៉ុន្តែក្នុងរយៈពេល 3 ថ្ងៃបន្ទាប់ ការប្រើប្រាស់ memory ចេះតែកើនឡើងឥតឈប់ឈររហូតដល់ Kubernetes kubelet បិទ container ភ្លាមៗជាមួយ error `Exit Code 137` (`OOMKilled`)។
+
+ការឆ្លើយតបដំបូងរបស់ក្រុមការងារគឺដំឡើងទំហំ memory របស់ container ឱ្យឡើងដល់ 1024 MB។ Container អាចរស់បាន 6 ថ្ងៃជំនួសឱ្យ 3 ថ្ងៃ រួចហើយក៏គាំងដួលរលំសារជាថ្មីដដែល។
+
+## Symptoms
+
+- Pods ក្នុង Kubernetes ជួបប្រទះការ restart ដដែលៗជាមួយ `OOMKilled` (Exit Code 137)។
+- ក្រាហ្វិក memory បង្ហាញទម្រង់ "ធ្មេញរណារ" (sawtooth)៖ កើនឡើងជាលំដាប់រហូតដល់ធ្លាក់ចុះមកសូន្យភ្លាមៗនៅពេល server គាំង។
+- Application latency កើនឡើងយឺតខ្លាំង ហើយ CPU ឡើងខ្ពស់ខុសធម្មតានៅមុនពេលគាំង ដោយសារតែ V8 Garbage Collector (GC) ត្រូវចំណាយកម្លាំង mark-and-sweep ដើម្បីព្យាយាមដណ្តើម memory ត្រឡប់មកវិញ។
+- Request ដែលកំពុងដំណើរការត្រូវកាត់ផ្តាច់ភ្លាមៗដោយគ្មាន graceful cleanup នៅពេល Linux kernel ហៅ Out-Of-Memory (OOM) killer។
+
+<Callout type="warning" title="ការដំឡើង container memory មិនមែនជាការជួសជុល memory leak ទេ">
+ការដំឡើង RAM ឱ្យ container គ្រាន់តែពន្យារពេលនៃការគាំងប៉ុណ្ណោះ ហើយបង្កើនការចំណាយលើ cloud របស់អ្នកទ្វេដង។ Memory leak បណ្តាលមកពីកូដដែលនៅតែបន្តកាន់កាប់ reference ទៅកាន់ objects បើទោះបីជាអាយុកាលប្រើប្រាស់របស់វាបានបញ្ចប់ទៅហើយក៏ដោយ។
+</Callout>
+
+## Diagnose
+
+នៅក្នុងបរិស្ថានដែលមាន garbage collector (ដូចជា Node.js, Go, ឬ Java) memory មិនអាចត្រូវបានសម្អាតបានឡើយ ប្រសិនបើ object នោះនៅតែអាចភ្ជាប់ទៅកាន់ **GC Root** (global variables, active closures, ឬ event listener registries)។
+
+**1. បែងចែកការកើនឡើង memory ធម្មតា និង Memory Leak។**
+Garbage collector មិនបញ្ចេញ memory ភ្លាមៗនោះទេ។ ប្រសិនបើ memory កើនឡើងពេលមាន traffic ហើយធ្លាក់ចុះមកវិញពេលស្ងប់ស្ងាត់ នោះមិនមែនជា leak ទេ។ ប៉ុន្តែប្រសិនបើ memory **មិនដែលធ្លាក់ចុះទាល់តែសោះ** សូម្បីតែនៅពេលយប់ដែលគ្មាន traffic សោះក៏ដោយ នោះមានន័យថាមាន memory leak ច្បាស់ណាស់៖
+
+```bash
+# ពិនិត្យមើលនិន្នាការ memory រយៈពេល ២៤ ម៉ោង
+kubectl top pod -l app=api-service --containers
+```
+
+**2. ចាប់យក Heap Snapshots។**
+កុំស្មានថា function ណាធ្វើឱ្យ leak។ ត្រូវថតយក heap snapshots ចំនួនពីរ៖ មួយភ្លាមៗក្រោយពេល startup (baseline) និងមួយទៀតបន្ទាប់ពីដំណើរការ 10,000 requests ពេលមាន load។
+
+នៅក្នុង Node.js អ្នកអាចថតយក heap snapshot តាមរយៈកូដដោយមិនចាំបាច់បិទ process ឡើយ៖
+
+```typescript
+import v8 from 'v8';
+import fs from 'fs';
+
+export function takeHeapSnapshot(label: string) {
+  const fileName = `/tmp/heap-${label}-${Date.now()}.heapsnapshot`;
+  const stream = v8.getHeapSnapshot();
+  const fileStream = fs.createWriteStream(fileName);
+  stream.pipe(fileStream);
+  console.log(`Heap snapshot written to ${fileName}`);
+}
+```
+
+**3. ពិនិត្យក្នុង Chrome DevTools។**
+បើក Chrome, វាយបញ្ចូល `chrome://inspect`, load snapshots ទាំងពីរចូល រួចជ្រើសរើសផ្ទាំង **"Comparison"**៖
+
+| Constructor | # Alloc | # Freed | Alloc. Size | Size Delta |
+| :--- | :--- | :--- | :--- | :--- |
+| `(closure)` | 14,200 | 200 | 12.8 MB | **+12.6 MB** |
+| `Object` (cache entries) | 52,000 | 100 | 48.2 MB | **+48.1 MB** |
+| `EventEmitter` listeners | 8,400 | 0 | 4.2 MB | **+4.2 MB** |
+
+សង្កេតមើល **Size Delta** ហើយ sort តាម **Retained Size**។ ពង្រីក constructor ណាដែលមានទំហំធំជាងគេ ដើម្បីស្វែងរក "Distance to GC Root"។
+
+## Options
+
+1. **ដំឡើងទំហំ container memory limits។** បិទបាំងបញ្ហាដោយការទិញ RAM បន្ថែម។
+2. **កំណត់ពេល restart container ជាប្រចាំ (Cron)។** Restart container រៀងរាល់ពាក់កណ្តាលអធ្រាត្រ ដើម្បីសម្អាត memory មុនពេលវាគាំង។
+3. **ជំនួស cache ដែលគ្មានកម្រិតដោយ Bounded LRU Cache។** កំណត់ចំនួនទិន្នន័យអតិបរមាដែលអាចផ្ទុកក្នុង memory ជាមួយពេលវេលាផុតកំណត់។
+4. **ដកចេញ event listeners និង timers ដែលលែងប្រើ។** សម្អាត listeners និង intervals ចោលនៅពេល request ឬ socket connection បញ្ចប់។
+5. **ផ្ទេរ state ទៅកាន់ Redis។** យក user sessions និង temporary tokens ចេញពី memory របស់ application ទៅដាក់លើ external store វិញ។
+
+## Trade-offs
+
+| ជម្រើស | កម្លាំងអនុវត្ត | និរន្តរភាពនៃការដោះស្រាយ | ការចំណាយប្រតិបត្តិការ | ផលប៉ះពាល់ (Trade-offs) |
+| :--- | :--- | :--- | :--- | :--- |
+| **ដំឡើង RAM** | គ្មាន | បណ្តោះអាសន្ន | ខ្ពស់ ($$ វិក្កយបត្រ Cloud) | គ្រាន់តែពន្យារពេលនៃការគាំង។ |
+| **Restart ជាប្រចាំ** | ទាប | ដំណោះស្រាយបណ្តោះអាសន្ន | ទាប | រំខានដល់ request និងបិទបាំង bug ពិតប្រាកដ។ |
+| **Bounded LRU Cache** | ទាប (១ ម៉ោង) | **អចិន្ត្រៃយ៍** | គ្មាន | ការពារមិនឱ្យ memory កើនគ្មានព្រំដែន; entries ចាស់ៗត្រូវលុបដោយស្វ័យប្រវត្តិ។ |
+| **ជួសជុល Event Listeners** | មធ្យម | **អចិន្ត្រៃយ៍** | គ្មាន | លុបបំបាត់ retaining roots ទាំងស្រុង។ |
+| **ប្តូរទៅប្រើ Redis** | មធ្យម | **អចិន្ត្រៃយ៍** | មធ្យម | បន្ថែម network dependency ប៉ុន្តែធ្វើឱ្យ container ក្លាយជា stateless ពិតប្រាកដ។ |
+
+## Decision
+
+1. **ស្វែងរក និងលុបបំបាត់ root cause៖**
+   - កុំប្រើប្រាស់ `Map` ឬ `Object` ធម្មតាដែលគ្មានដែនកំណត់ធ្វើជា cache ឱ្យសោះ។ ត្រូវប្រើ **LRU (Least Recently Used)** cache ដែលមានដែនកំណត់ `max` ច្បាស់លាស់ និង TTL។
+   - ពិនិត្យមើលរាល់ការចុះឈ្មោះ `emitter.on(...)`។ ប្រសិនបើ listener ត្រូវបានបន្ថែមនៅខាងក្នុង HTTP request handler ដោយមិនបានដកចេញវិញតាម `.off(...)` នោះ memory នឹង leak គ្រប់ពេលដែលមាន request ចូលមក។
+2. **កំណត់កម្រិត Node.js heap ឱ្យស្របតាម container limits៖**
+   - ក្នុង Docker/Kubernetes ជាទូទៅ Node.js កំណត់ `--max-old-space-size` ប្រហែល 1.4 GB តាមលំនាំដើម។ ប្រសិនបើ container limit របស់អ្នកគឺ 512 MB នោះ Node.js នឹងព្យាយាមពង្រីក memory លើស 512 MB មុនពេល GC ដំណើរការ ដែលបណ្តាលឱ្យ Linux kernel សម្លាប់ process ភ្លាមៗ។
+   - ត្រូវកំណត់ `--max-old-space-size` ត្រឹមតែ **៧៥% នៃ container memory limit** ប៉ុណ្ណោះ (ឧទាហរណ៍ `384` សម្រាប់ container ទំហំ `512Mi`)។
+
+## Implementation
+
+### 1. ជំនួស cache ដែលគ្មានដែនកំណត់ដោយ Bounded LRU Cache
+
+```typescript
+// កំហុស៖ Memory កើនឡើងរហូតដោយសារ key មិនដែលត្រូវលុប
+// const cache = new Map<string, UserProfile>();
+
+import { LRUCache } from 'lru-cache';
+
+// ត្រឹមត្រូវ៖ កំណត់ទំហំ memory ជាក់លាក់
+export const userProfileCache = new LRUCache<string, UserProfile>({
+  max: 1000,             // ផ្ទុកយ៉ាងច្រើនបំផុត ១០០០ items
+  ttl: 1000 * 60 * 15,   // ផុតកំណត់ស្វ័យប្រវត្តិក្នងរយៈពេល ១៥ នាទី
+  updateAgeOnGet: true,  // កែប្រែ TTL ឡើងវិញពេលមាន cache hit
+});
+```
+
+### 2. សម្អាត Event Listeners ក្នុង Request Handlers
+
+```typescript
+// កំហុស៖ បង្កើត listener ថ្មីលើ shared messageBus រាល់ពេលមាន HTTP request ចូលមក
+// messageBus.on('notification', handler);
+
+// ត្រឹមត្រូវ៖ ដក listener ចេញនៅពេល HTTP response បញ្ចប់
+app.get('/events', (req, res) => {
+  const onNotification = (data: any) => {
+    res.write(`data: ${JSON.stringify(data)}\n\n`);
+  };
+
+  messageBus.on('notification', onNotification);
+
+  // សម្អាតចេញវិញនៅពេល client ផ្តាច់ connection
+  req.on('close', () => {
+    messageBus.off('notification', onNotification);
+  });
+});
+```
+
+### 3. កំណត់បញ្ជា Startup ក្នុង Container ជាមួយ GC Headroom សមស្រប
+
+នៅក្នុង `Dockerfile` ឬ Kubernetes `command`៖
+
+```dockerfile
+# សម្រាប់ container ដែលមាន limit: 512Mi
+# កំណត់ max old space size ត្រឹម 384 MB (៧៥% នៃ limit)
+CMD ["node", "--max-old-space-size=384", "dist/index.js"]
+```
+
+## Verification
+
+1. **Load testing verification៖** ដំណើរការ stress test ចំនួន 50,000 requests ដោយប្រើ HTTP benchmark tool (`autocannon -c 100 -d 60s http://localhost:3000/api`)។
+2. **ការរក្សាស្ថិរភាព Memory៖** សង្កេតមើល memory របស់ container។ វានឹងកើនឡើងពេលមាន load រួចហើយនឹងរក្សាស្ថិរភាពនៅត្រឹមកម្រិតកំណត់មួយ (ឧទាហរណ៍ 250 MB) ដោយមិនលើសពី `--max-old-space-size` ឡើយ។
+3. **ការផ្ទៀងផ្ទាត់ Heap Snapshot ក្រោយ Test៖** ថតយក heap snapshot មួយទៀតក្រោយពេល test ចប់ ៥ នាទី។ ចំនួន objects ត្រូវតែធ្លាក់ចុះមកជិតកម្រិត baseline ដើមវិញ។
+
+## Why
+
+Garbage collection នៅក្នុង runtimes ទំនើបដំណើរការផ្អែកលើ **tracing reachability from roots**។ Garbage collector មិនអាចដឹងថាកម្មវិធីរបស់អ្នកត្រូវការទិន្នន័យអ្វីពិតប្រាកដនោះទេ; វាគ្រាន់តែដឹងថាតើ object នោះនៅតែអាចរុករកទៅដល់តាមរយៈ global variable ឬ active call stack ដែរឬទេ។
+
+ប្រសិនបើទិន្នន័យក្នុង `Map` ជាសកល ឬ callback របស់ event listener នៅតែកាន់កាប់ reference ទៅកាន់ request context នោះ closure ទាំងមូល (រាប់ទាំង request body, headers និង database results) នឹងមិនអាចត្រូវសម្អាតបានឡើយ។
+
+## When Not To Use
+
+- កុំច្រឡំការឡើង memory ខ្ពស់បណ្តោះអាសន្នអំឡុងពេលធ្វើការងារធំៗ (ដូចជាការដំណើរការ CSV file ទំហំ 500 MB) ថាជា memory leak។ ប្រសិនបើ memory ធ្លាក់ចុះមកវិញក្រោយការងារចប់ នោះមិនមែនជា leak ឡើយ (សម្រាប់ការងារធំៗបែបនេះ គួរប្រើ streaming ជំនួសឱ្យការផ្ទុកក្នុង memory)។
+
+## Common Mistakes
+
+- **កំណត់ Cron Restart Container រៀងរាល់យប់។** វិធីនេះបិទបាំងបញ្ហា និងប្រឈមនឹងការដាច់ request ពេលថ្ងៃ ប្រសិនបើមាន traffic ឡើងខ្ពស់មុនម៉ោង restart។
+- **ការភ្លេចសរសេរ `const` ឬ `let`។** ក្នុង JavaScript ការបង្កើត variable ដោយគ្មាន `const` ឬ `let` នឹងភ្ជាប់វាទៅកាន់ `global` object ដោយស្វ័យប្រវត្តិ ដែលធ្វើឱ្យ GC មិនអាចសម្អាតវាបានរហូត។
+- **ការ Log Request Object ទាំងមូល។** ការបញ្ជូន objects ធំៗដែលមាន cyclic references (`req`, `res`, ឬ ORM results) ទៅកាន់ logger ដែលរក្សាទុកក្នុង memory នឹងបណ្តាលឱ្យ memory ពេញយ៉ាងឆាប់រហ័ស។

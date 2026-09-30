@@ -1,0 +1,96 @@
+---
+title: "Logging users out, even with JWTs"
+summary: "Make logout and 'sign out of all devices' actually work, with short-lived access tokens and revocable refresh tokens."
+minutes: 12
+related: [problems/jwt-revocation, tradeoffs/jwt-vs-session-tokens]
+updated: "2026-09-30"
+contributors: [Veasna-Pen]
+---
+
+## The problem
+
+Your mobile app uses JWTs that are valid for **30 days**. A user reports their phone stolen and taps "Sign out of all devices" on the website. Nothing happens to the stolen phone: its token is still correctly signed and not expired, so your API keeps accepting it for up to 30 more days.
+
+Deleting the token from the phone's storage doesn't help either. Logging out on one device only forgets the token **there**.
+
+## The idea
+
+A JWT is checked by its **signature**, not by a lookup, so the server has nowhere to mark it "revoked". The usual answer is to use **two tokens**:
+
+| Token | Lifetime | Checked by | Revocable? |
+| --- | --- | --- | --- |
+| **Access token** (JWT) | Short: 5 to 15 minutes | Signature only, on every request | No, but it expires soon |
+| **Refresh token** | Long: days or weeks | A lookup in the database | Yes: delete it |
+
+The app sends the access token with each request. When it expires, the app sends the refresh token to `/token/refresh`, and the server, **after checking the database**, issues a new access token.
+
+To log out, or sign out of all devices, delete the refresh tokens. The stolen phone keeps working for at most one access-token lifetime, 15 minutes, and then can't get another one.
+
+**Rotate** refresh tokens: each refresh returns a new refresh token and invalidates the old one. If an old one is ever used again, someone copied it: revoke that whole login.
+
+## Example
+
+Issuing a short access token and a stored refresh token:
+
+```ts
+async function issueTokens(userId: string) {
+  const accessToken = jwt.sign({ sub: userId }, ACCESS_SECRET, { expiresIn: '15m' });
+  const refreshToken = crypto.randomBytes(32).toString('base64url');
+  await db.refreshToken.create({
+    data: { userId, tokenHash: sha256(refreshToken), expiresAt: daysFromNow(30) }
+  });
+  return { accessToken, refreshToken };
+}
+```
+
+Refreshing, with rotation, and signing out everywhere:
+
+```ts
+app.post('/token/refresh', async (req, res) => {
+  const stored = await db.refreshToken.findUnique({ where: { tokenHash: sha256(req.body.refreshToken) } });
+  if (!stored || stored.expiresAt < new Date()) return res.sendStatus(401);
+  await db.refreshToken.delete({ where: { id: stored.id } }); // rotate: the old one is used up
+  res.json(await issueTokens(stored.userId));
+});
+
+app.post('/logout-everywhere', requireUser, async (req, res) => {
+  await db.refreshToken.deleteMany({ where: { userId: req.user.id } });
+  res.sendStatus(204);
+});
+```
+
+After "Sign out of all devices", the stolen phone's access token dies within 15 minutes, and its refresh token no longer exists.
+
+## Try it
+
+1. Find out how long your app's tokens or sessions live.
+2. Answer honestly: if a user clicks "log out everywhere", when does a stolen device lose access?
+3. If the answer is "when the token expires, in days", shorten the access token and add a stored, revocable refresh token.
+4. Test it: log in on two browsers, sign out everywhere from one, and check that the other stops working within one access-token lifetime.
+
+## Check yourself
+
+**1. Why can't you simply "delete" a JWT on the server?**
+
+<Answer>
+The server doesn't keep JWTs; it only checks their signature and expiry. A copy of a valid token keeps working wherever it is until it expires, unless the server adds a lookup, such as a refresh token check or a deny-list.
+</Answer>
+
+**2. Why store a hash of the refresh token rather than the token itself?**
+
+<Answer>
+For the same reason you hash passwords: if the database leaks, the stored values can't be used to refresh sessions. The server only needs to compare hashes.
+</Answer>
+
+**3. With 15-minute access tokens, how long can a stolen device keep working after "sign out everywhere"?**
+
+<Answer>
+Up to 15 minutes: until its current access token expires. It can't get a new one, because its refresh token was deleted. If that is too long for your app, shorten the lifetime or add a deny-list check for sensitive actions.
+</Answer>
+
+## Key takeaways
+
+- A JWT can't be revoked, only **left to expire**.
+- Use **short-lived access tokens** and **long-lived refresh tokens stored on the server**.
+- Logout means **deleting refresh tokens**; rotate them on every use.
+- The access-token lifetime is your **worst-case revocation delay**.

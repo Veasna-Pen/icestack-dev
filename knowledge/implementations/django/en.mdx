@@ -1,0 +1,203 @@
+---
+title: "Django"
+question: "How do I configure database statement timeouts, atomic idempotency, and Redis caching in Django?"
+summary: "Database statement timeouts, atomic idempotency keys, django-redis caching, django-ratelimit, and Celery background tasks in production Django."
+tags: [django, python, celery, orm, implementation]
+related: [patterns/retry, patterns/idempotency, patterns/caching, patterns/rate-limiting]
+order: 9
+updated: "2026-09-12"
+contributors: [veasna]
+---
+
+Production patterns for Django 5+ and Python 3.12+. Covers database statement timeouts, transactional idempotency guarantees, Redis cache caching patterns, rate-limiting middlewares, and Celery task retries.
+
+## Timeouts first
+
+In Django, network requests must always define timeouts, and database queries should be bounded by PostgreSQL statement timeouts in `settings.py`:
+
+```python
+# settings.py
+DATABASES = {
+    'default': {
+        'ENGINE': 'django.db.backends.postgresql',
+        'NAME': 'production_db',
+        'USER': 'postgres',
+        'PASSWORD': 'secretpassword',
+        'HOST': 'localhost',
+        'PORT': '5432',
+        'CONN_MAX_AGE': 60, # Reuse connection for 60 seconds (pooling)
+        'OPTIONS': {
+            'options': '-c statement_timeout=5000ms -c lock_timeout=2000ms',
+        },
+    }
+}
+```
+
+For outbound HTTP calls, always pass explicit timeouts:
+
+```python
+import httpx
+from django.http import JsonResponse
+
+def get_rates(request):
+    try:
+        # Strict 2.0 second connect and read timeout
+        response = httpx.get("https://api.example.com/rates", timeout=2.0)
+        response.raise_for_status()
+        return JsonResponse(response.json())
+    except httpx.TimeoutException:
+        return JsonResponse({"error": "Rates provider timed out"}, status=504)
+    except httpx.HTTPStatusError as exc:
+        return JsonResponse({"error": f"Upstream returned {exc.response.status_code}"}, status=502)
+```
+
+## Retry with backoff (Tenacity)
+
+Use `tenacity` to decorate client calls with exponential backoff, jitter, and transient exception filters:
+
+```python
+import httpx
+from tenacity import retry, stop_after_attempt, wait_exponential_jitter, retry_if_exception
+
+def is_transient_error(exception):
+    if isinstance(exception, httpx.TimeoutException):
+        return True
+    if isinstance(exception, httpx.HTTPStatusError):
+        return exception.response.status_code in {408, 429, 500, 502, 503, 504}
+    return False
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential_jitter(initial=0.2, max=2.0),
+    retry=retry_if_exception(is_transient_error),
+    reraise=True
+)
+def fetch_inventory(sku: str) -> dict:
+    resp = httpx.get(f"https://inventory.example.com/items/{sku}", timeout=1.5)
+    resp.raise_for_status()
+    return resp.json()
+```
+
+## Idempotency keys with `transaction.atomic()`
+
+Use Django's atomic database transaction and `IntegrityError` to claim idempotency keys atomically:
+
+```python
+from django.db import transaction, IntegrityError
+from django.http import JsonResponse
+from .models import IdempotencyRecord, Order
+
+def create_order(request):
+    key = request.headers.get("Idempotency-Key")
+    if not key:
+        return JsonResponse({"error": "Idempotency-Key header is required"}, status=400)
+
+    try:
+        with transaction.atomic():
+            # Attempt to claim the key
+            record, created = IdempotencyRecord.objects.select_for_update().get_or_create(key=key)
+
+            if not created:
+                if record.response_body:
+                    return JsonResponse(record.response_body, status=record.status_code)
+                return JsonResponse({"error": "Operation already in progress"}, status=409)
+
+            # Create domain order
+            order = Order.objects.create(
+                customer_id=request.POST["customer_id"],
+                total_cents=int(request.POST["total_cents"])
+            )
+
+            data = {"id": order.id, "total_cents": order.total_cents}
+            record.status_code = 201
+            record.response_body = data
+            record.save()
+
+            return JsonResponse(data, status=201)
+    except IntegrityError:
+        return JsonResponse({"error": "Concurrent request collision"}, status=409)
+```
+
+## Caching with Redis (`django-redis`)
+
+Configure Redis caching in `settings.py` and use `cache.get_or_set` to avoid redundant database reads:
+
+```python
+# settings.py
+CACHES = {
+    "default": {
+        "BACKEND": "django_redis.cache.RedisCache",
+        "LOCATION": "redis://127.0.0.1:6379/1",
+        "OPTIONS": {
+            "CLIENT_CLASS": "django_redis.client.DefaultClient",
+            "SOCKET_CONNECT_TIMEOUT": 2,
+            "SOCKET_TIMEOUT": 2,
+        }
+    }
+}
+```
+
+```python
+from django.core.cache import cache
+from .models import Product
+
+def get_product_details(product_id: int):
+    cache_key = f"product:{product_id}"
+
+    def fetch_from_db():
+        return list(Product.objects.filter(id=product_id).values("id", "name", "price_cents"))
+
+    # Cache for 300 seconds
+    return cache.get_or_set(cache_key, fetch_from_db, timeout=300)
+```
+
+## Rate limiting (`django-ratelimit`)
+
+Protect API endpoints from abuse using IP or user-based rate limit decorators:
+
+```python
+from django_ratelimit.decorators import ratelimit
+from django.http import JsonResponse
+
+@ratelimit(key='ip', rate='60/m', block=False)
+def login_view(request):
+    was_limited = getattr(request, 'limited', False)
+    if was_limited:
+        return JsonResponse(
+            {"error": "Too many requests. Please retry later."},
+            status=429
+        )
+    return JsonResponse({"status": "authenticated"})
+```
+
+## Background jobs with Celery
+
+Enqueue slow tasks after the database transaction commits to avoid race conditions:
+
+```python
+from celery import shared_task
+from django.db import transaction
+from .models import Order
+
+@shared_task(
+    bind=True,
+    autoretry_for=(httpx.HTTPError,),
+    retry_backoff=True,
+    retry_kwargs={'max_retries': 5}
+)
+def send_order_confirmation(self, order_id: int):
+    order = Order.objects.get(id=order_id)
+    if order.confirmation_sent_at:
+        return # Idempotent check
+
+    # Send receipt logic...
+    order.confirmation_sent_at = timezone.now()
+    order.save()
+
+# In view:
+def checkout_view(request):
+    with transaction.atomic():
+        order = create_order_logic(request)
+        # Enqueue only after successful commit
+        transaction.on_commit(lambda: send_order_confirmation.delay(order.id))
+```

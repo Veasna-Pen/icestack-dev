@@ -1,0 +1,145 @@
+---
+title: "តើខ្ញុំគួរប្រើ Kafka ដែរឬទេ?"
+question: "តើខ្ញុំត្រូវការ Kafka មែនទេ?"
+summary: "ប្រហែលជាមិនទាន់ទេ។ Kafka គឺជា log ដែលរក្សាទុកបានយូរ និង replay បាន សម្រាប់ event streams បរិមាណច្រើន ដែល consumers ឯករាជ្យជាច្រើនអានដូចគ្នា។ ប្រសិនបើអ្នកត្រូវការត្រឹមតែ background jobs ឬបំបែក services ពីរចេញពីគ្នា queue មួយ (ឬ database របស់អ្នក) គឺសាមញ្ញជាង ហើយគ្រប់គ្រាន់ហើយ។"
+tags: [kafka, messaging, queues, events, architecture]
+related: [tradeoffs/sync-vs-async, patterns/idempotency, patterns/retry, problems/should-i-use-redis]
+order: 2
+updated: "2026-09-11"
+translation: draft
+---
+
+## Context
+
+Kafka ជាធម្មតាចូលមកក្នុងការពិភាក្សា នៅពេលប្រព័ន្ធចាប់ផ្តើមធ្វើការងារនៅពីក្រោយ (background)៖ ផ្ញើ email បន្ទាប់ពីមាន order, sync ទៅកាន់ search index ឬបញ្ជូនទិន្នន័យទៅ analytics។ សូមស្រមៃមើលក្រុមអ្នកអភិវឌ្ឍពីបីទៅដប់ប្រាំនាក់ ដែលមាន monolith ឬ services មួយចំនួនតូច និង relational database មួយ។ មាននរណាម្នាក់និយាយថា «យើងគួរដាក់ Kafka នៅចំកណ្តាល»។
+
+Kafka មិនមែនជា queue តាមន័យធម្មតានោះទេ។ វាគឺជា **log** ដែលចែកចាយលើម៉ាស៊ីនច្រើន ហើយសរសេរបន្ថែមតែនៅខាងចុង (append-only)។ Producers បន្ថែម events ទៅក្នុង topics ដែលបែងចែកជា partitions, events ត្រូវបានរក្សាទុកក្នុងរយៈពេលកំណត់មួយ (ប៉ុន្មានថ្ងៃ ឬជារៀងរហូត) ហើយ consumer group នីមួយៗតាមដានទីតាំងអានរបស់ខ្លួន។ Consumers ជាច្រើនអាចអាន events ដដែលដោយឯករាជ្យ ហើយណាមួយក៏អាចថយក្រោយ និង replay ឡើងវិញបាន។
+
+## Symptoms
+
+អ្វីដែលជាធម្មតាធ្វើឱ្យកើតសំណួរនេះ៖
+
+- Request មួយធ្វើការងារបន្ទាប់បន្សំដែលយឺត (emails, PDFs, webhooks) ហើយ timeout។
+- Service មួយនៅខាងក្រោយគាំង ហើយនាំ requests ឱ្យបរាជ័យតាមវា។
+- Services ពីរត្រូវឆ្លើយតបនឹង event ដដែល ដូចជា `OrderPlaced` ហើយការហៅពីមួយទៅមួយកាន់តែកើនច្រើន។
+- Analytics ឬ search ត្រូវការ feed នៃរាល់ការផ្លាស់ប្តូរ។
+- «ក្រុមហ៊ុនធំៗប្រើ Kafka»។ នោះមិនមែនជារោគសញ្ញាទេ។
+
+## Diagnose
+
+ឆ្លើយសំណួរទាំងនេះ មុននឹងប្រៀបធៀបឧបករណ៍៖
+
+1. **តើ message ជាអ្វី?** ជា *command* («ផ្ញើ email នេះ» មាន handler តែមួយ) ឬជា *event* («order មួយត្រូវបានបញ្ជាទិញ» អាចមានអ្នកស្តាប់ប៉ុន្មានក៏បាន)?
+2. **មាន consumers ប៉ុន្មាន?** ក្រុម workers តែមួយ ឬក្រុមឯករាជ្យច្រើន?
+3. **បរិមាណប៉ុន្មាន?** ចំនួន messages ក្នុងមួយវិនាទីនៅម៉ោងមមាញឹក និងទំហំរបស់វា។ រាប់រយក្នុងមួយវិនាទីគឺតិច; រាប់សែនទើបជាកន្លែងដែលការរចនារបស់ Kafka ផ្តល់ផលចំណេញ។
+4. **តើអ្នកត្រូវការ replay ដែរឬទេ?** តើ consumer ថ្មីនឹងត្រូវដំណើរការ events កាលពីខែមុន ឬអ្នកនឹងដំណើរការឡើងវិញបន្ទាប់ពីជួសជុល bug?
+5. **លំដាប់ (ordering) បែបណា?** លំដាប់សកលស្ទើរតែមិនដែលចាំបាច់ទេ។ លំដាប់ *តាម entity* ដូចជាតាម order ID ជាធម្មតាចាំបាច់។
+6. **នរណាជាអ្នកដំណើរការវា?** Kafka ត្រូវការ brokers, partitions, ការកំណត់ retention, ការតាមដាន consumer lag និង upgrades ឬ managed service ដែលមានវិក្កយបត្ររបស់វាផ្ទាល់។
+
+ប្រសិនបើចម្លើយស្មោះត្រង់គឺ «commands, consumer តែមួយ, ប៉ុន្មានរយក្នុងមួយវិនាទី, មិនត្រូវការ replay» នោះអ្នកត្រូវការ job queue មិនមែន Kafka ទេ។
+
+## Options
+
+1. **នៅតែ synchronous តែឱ្យលឿនជាងមុន។** ពេលខ្លះការងារយឺតអាចធ្វើឱ្យលឿនជាងមុន ឬផ្លាស់ទៅធ្វើក្រោយពេលផ្ញើការឆ្លើយតបរួច។
+2. **Job queue លើ infrastructure ដែលអ្នកមានស្រាប់៖** Postgres ជាមួយ `SKIP LOCKED` (pg-boss, Oban, GoodJob) ឬ Redis (BullMQ, Sidekiq, Laravel queues)។
+3. **Managed queue៖** Amazon SQS, Google Cloud Tasks ឬ RabbitMQ។
+4. **Transactional outbox បូក queue** នៅពេល event ត្រូវតែ publish លុះត្រាតែការ write ទៅ database បាន commit។
+5. **Kafka** ដែលគ្រប់គ្រងដោយខ្លួនឯង ឬជា managed service (Confluent Cloud, Amazon MSK, Redpanda)។
+
+## Trade-offs
+
+| | Queue លើ database | Queue លើ Redis | SQS / RabbitMQ | Kafka |
+| :--- | :--- | :--- | :--- | :--- |
+| ម៉ូដែល | Jobs | Jobs | Messages | Log ដែល replay បាន |
+| Consumers ឯករាជ្យច្រើន | ពិបាក | ពិបាក | តាមរយៈ fan-out (SNS, exchanges) | មានស្រាប់ |
+| Replay messages ចាស់ | ទេ | ទេ | ទេ | បាន ក្នុងរយៈពេល retention |
+| Throughput ដែលស្រួល | រហូតដល់ ~1k/s | ~10k/s | ~10k/s ឡើងទៅ | 100k/s ឡើងទៅ |
+| Ordering | ប្រហែលតាម queue | តាម queue | មានជម្រើស FIFO | តាម partition |
+| Infrastructure ថ្មី | គ្មាន | ប្រហែល | Managed service មួយ | Cluster ឬ managed service, schemas, ការតាមដាន lag |
+| ជំនាញដែលក្រុមត្រូវការ | ទាប | ទាប | ទាប ដល់មធ្យម | ខ្ពស់ |
+
+គុណសម្បត្តិពិតរបស់ Kafka គឺ **consumers ឯករាជ្យជាច្រើនអាន stream តែមួយដែលរក្សាទុកបានយូរ មានលំដាប់ និង replay បាន ក្នុងបរិមាណខ្ពស់។** ប្រសិនបើអ្នកមិនត្រូវការយ៉ាងហោចណាស់ពីរក្នុងចំណោមលក្ខណៈទាំងនេះ អ្នកកំពុងបង់ថ្លៃប្រតិបត្តិការរបស់ Kafka ដើម្បីទទួលបានអត្ថប្រយោជន៍ត្រឹមតែ queue មួយ។
+
+## Decision
+
+- **Background jobs និង retries** (emails, PDFs, webhooks)៖ job queue ល្អបំផុតលើ infrastructure ដែលអ្នកដំណើរការស្រាប់។
+- **បំបែកខ្លួនចេញពី dependency ដែលយឺត ឬមិនស្ថិតស្ថេរ៖** queue មួយ បូក retries និង consumers ដែល idempotent។
+- **Events ដែលត្រូវតែស៊ីគ្នាជាមួយ state ក្នុង database៖** transactional outbox ដែល publish ទៅ broker ណាក៏ដោយដែលអ្នកមាន។
+- **ជ្រើសរើស Kafka** នៅពេលក្រុម ឬ services ជាច្រើនអាន stream បរិមាណខ្ពស់ដដែលដោយឯករាជ្យ នៅពេលពួកគេត្រូវការ replay ឬនៅពេលអ្នកកំពុងសាងសង់ data pipeline (change data capture, analytics)។
+
+ពិនិត្យឡើងវិញ នៅពេល consumer ឯករាជ្យទីពីរ ឬទីបី នៃ events ដដែលលេចឡើង ឬនៅពេលអ្នកត្រូវបង្កើត read model ឡើងវិញពីប្រវត្តិ។
+
+## Implementation
+
+Outbox គឺជាជំហានដែលក្រុមភាគច្រើនត្រូវការ មុននឹងសម្រេចជ្រើសរើស broker ណាមួយ៖ សរសេរ event នៅក្នុង transaction ដដែលជាមួយទិន្នន័យអាជីវកម្ម បន្ទាប់មក publish វាដោយឡែក។
+
+```sql
+CREATE TABLE outbox (
+  id           bigserial   PRIMARY KEY,
+  topic        text        NOT NULL,
+  key          text        NOT NULL,       -- e.g. the order id, for per-entity ordering
+  payload      jsonb       NOT NULL,
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  published_at timestamptz
+);
+CREATE INDEX outbox_unpublished_idx ON outbox (id) WHERE published_at IS NULL;
+```
+
+```ts
+// In the request: one transaction, so the event exists if and only if the order does.
+await db.transaction(async tx => {
+  const order = await tx.orders.insert(input);
+  await tx.outbox.insert({
+    topic: 'order.placed',
+    key: order.id,
+    payload: { orderId: order.id, totalCents: order.totalCents }
+  });
+});
+
+// A separate relay publishes pending events, then marks them as sent.
+async function relayOnce() {
+  await db.transaction(async tx => {
+    const batch = await tx.query(
+      `SELECT * FROM outbox
+       WHERE published_at IS NULL
+       ORDER BY id
+       LIMIT 100
+       FOR UPDATE SKIP LOCKED`
+    );
+    for (const event of batch) {
+      await broker.publish(event.topic, event.key, event.payload); // a queue today, Kafka later
+      await tx.query('UPDATE outbox SET published_at = now() WHERE id = $1', [event.id]);
+    }
+  });
+}
+```
+
+ប្រសិនបើ relay គាំងនៅចន្លោះការ publish និងការ commit នោះ events ទាំងនោះនឹងត្រូវ publish ម្តងទៀត ដូច្នេះ consumers ត្រូវតែ idempotent; សូមមើល [Idempotency](../../patterns/idempotency)។ Broker នៅពីក្រោយ `broker.publish` អាចផ្លាស់ប្តូរនៅពេលក្រោយ ដោយមិនចាំបាច់ប៉ះកូដរបស់ request ឡើយ។
+
+## Verification
+
+- **រោគសញ្ញាដើមបានបាត់។** p95 របស់ request លែងរួមបញ្ចូលការងារបន្ទាប់បន្សំ ហើយការគាំងរបស់ email service លែងធ្វើឱ្យ checkout បរាជ័យ។
+- **គ្មានអ្វីបាត់បង់។** រាប់ rows ក្នុង outbox ដែលគ្មាន `published_at` ហើយចាស់ជាងមួយនាទី រួចដាក់ alert នៅពេលចំនួននោះកើនឡើង។
+- **Consumers តាមទាន់។** ជម្រៅ queue (ឬ consumer lag សម្រាប់ Kafka) នៅថេរក្នុងម៉ោងមមាញឹក។
+- **Duplicates មិនបង្កគ្រោះថ្នាក់។** Replay batch មួយក្នុង staging ហើយបញ្ជាក់ថាគ្មាន email ស្ទួន ឬការគិតលុយស្ទួនគ្នាឡើយ។
+
+## Why
+
+Kafka ដោះស្រាយបញ្ហា *ការចែកចាយ* (distribution)៖ បញ្ជូន stream នៃការពិតតែមួយ ទៅកាន់អ្នកអានឯករាជ្យជាច្រើន ដោយរក្សាទុកបានយូរ និងក្នុងទំហំធំ។ ក្រុមភាគច្រើនដែលសួរអំពីវា តាមពិតមានបញ្ហា *ការបំបែក* (decoupling)៖ យកការងារដែលយឺត ឬមិនអាចទុកចិត្តបាន ចេញពីផ្លូវរបស់ request។ Queue ណាមួយ បូក consumers ដែល idempotent អាចដោះស្រាយការបំបែកបាន។ ការចែកចាយទើបជាអ្វីដែលធ្វើឱ្យការចំណាយរបស់ Kafka សមហេតុផល។ ដាក់ឈ្មោះបញ្ហាដែលអ្នកពិតជាមាន ហើយឧបករណ៍នឹងមកតាមក្រោយ។
+
+## When Not To Use
+
+- **Task queues ដែលមាន consumer តែមួយ** ដូចជា emails, ការប្តូរទំហំរូបភាព ឬការបង្កើតរបាយការណ៍។
+- **Request និង response រវាង services។** Kafka បន្ថែម latency និងភាពស្មុគស្មាញ ដោយគ្មានអត្ថប្រយោជន៍។
+- **បរិមាណតិច** រាប់រយ messages ក្នុងមួយវិនាទី ដោយមិនត្រូវការ replay។
+- **ក្រុមតូចៗដែលគ្មាននរណាទទួលខុសត្រូវវា។** Kafka cluster ដែលគ្មាននរណាតាមដាន ខូចដោយស្ងាត់ៗ៖ consumer lag កើនឡើង disks ពេញ ហើយ retention លុបទិន្នន័យដែលគ្មាននរណាបានអាន។
+- **លំដាប់សកលដ៏តឹងរ៉ឹង។** Kafka រក្សាលំដាប់ messages តែនៅក្នុង partition តែមួយប៉ុណ្ណោះ។
+
+## Common Mistakes
+
+- **Dual writes៖** រក្សាទុកក្នុង database និង publish ទៅ Kafka ជាពីរជំហានដាច់ដោយឡែក។ មិនយូរមិនឆាប់ មួយនឹងបរាជ័យដោយគ្មានមួយទៀត។ សូមប្រើ outbox។
+- **សន្មតថាមាន exactly-once delivery ពីដើមដល់ចប់។** រៀបចំសម្រាប់ at-least-once ហើយធ្វើឱ្យ consumers ក្លាយជា idempotent។
+- **Partitions តិចពេក** ដែលកំណត់ចំនួន consumers ដែលអាចធ្វើការស្របគ្នា ឬច្រើនហួសហេតុ ដែលធ្វើឱ្យ cluster យឺត។ កំណត់ទំហំតាមចំនួន consumers ដែលដំណើរការស្របគ្នានៅម៉ោងមមាញឹក។
+- **Partition keys ចៃដន្យ** ដូច្នេះ events របស់ order តែមួយធ្លាក់ទៅ partitions ផ្សេងៗគ្នា ហើយមកដល់ខុសលំដាប់។ ប្រើ entity ID ជា key។
+- **គ្មានការតាមដាន lag។** Consumer lag គឺជា metric តែមួយដែលប្រាប់អ្នកថាប្រព័ន្ធកំពុងធ្លាក់ពីក្រោយ។
+- **ចាត់ទុក Kafka ដូច database** ដោយមិនគិតពី retention, compaction និង schemas។ Event schemas គឺជា public API; សូមគ្រប់គ្រង version របស់វាឱ្យដូច API។

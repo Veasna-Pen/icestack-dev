@@ -1,0 +1,179 @@
+---
+title: "តើខ្ញុំ revoke JWT ដោយរបៀបណា?"
+question: "តើខ្ញុំអាចលុបចោល (Revoke) JWT មុនពេលវាផុតកំណត់ដោយរបៀបណា?"
+summary: "Stateless JWT មិនអាចលុបចោលមុនពេលផុតកំណត់បានទេបើគ្មានការរក្សាទុក state។ អនុវត្តស្ថាបត្យកម្មកូនកាត់ (Hybrid)៖ ប្រើ Access Token រយៈពេលខ្លី (៥–១៥ នាទី) រួមជាមួយ Token Version ឬ Redis Revocation Blocklist លើ server សម្រាប់ពេល logout និង password reset។"
+tags: [auth, jwt, security, redis, architecture]
+related: [problems/should-i-use-redis, patterns/caching]
+order: 19
+updated: "2026-09-12"
+contributors: [veasna]
+translation: draft
+---
+
+## Context
+
+កម្មវិធី web និង mobile មួយប្រើប្រាស់ stateless JSON Web Tokens (JWT) សម្រាប់ការផ្ទៀងផ្ទាត់សិទ្ធិ (Authentication)។ នៅពេលអ្នកប្រើប្រាស់ login ជោគជ័យ server ចុះហត្ថលេខាឌីជីថលលើ JWT ដែលមានសុពលភាព 30 ថ្ងៃ រួចប្រគល់ឱ្យ client។ រាល់ពេលមាន request ចូលមក API microservices គ្រាន់តែផ្ទៀងផ្ទាត់ signature ដោយប្រើ public key—ដោយមិនចាំបាច់ query ទៅកាន់ database ឬពិនិត្យ session កណ្តាលសូម្បីតែម្តងឡើយ។
+
+នៅថ្ងៃមួយនោះ អតិថិជនម្នាក់បានរាយការណ៍ថាទូរស័ព្ទរបស់គាត់ត្រូវបានគេលួច ឬបុគ្គលិកម្នាក់ត្រូវបានបញ្ឈប់ពីការងារជាបន្ទាន់។ Administrator បានធ្វើការ reset password និងចុចប៊ូតុង "Log out of all devices"។
+
+ប៉ុន្តែ ដោយសារតែ JWT នោះមានហត្ថលេខាឌីជីថលត្រឹមត្រូវ Token ដែលចោរបានលួចនោះ **នៅតែអាចបន្តប្រើប្រាស់បានលើគ្រប់ API endpoints ទាំងអស់** រយៈពេល ២៩ ថ្ងៃបន្តទៀត។
+
+## Symptoms
+
+- អ្នកប្រើប្រាស់ចុច "Log out" រួចហើយ ប៉ុន្តែ Token របស់ពួកគេនៅតែអាចប្រើប្រាស់ដើម្បីហៅ API តាម curl ឬ Postman បានធម្មតា។
+- ការ Reset Password មិនបានជួយផ្តាច់ active sessions នៅលើឧបករណ៍ផ្សេងទៀតឡើយ។
+- គណនីដែលត្រូវគេ ban ឬបិទចោល នៅតែអាចបន្តអាន និងសរសេរទិន្នន័យឯកជនបានដដែល រហូតទាល់តែ token នោះផុតកំណត់តាមធម្មជាតិ។
+- ក្រុម Security Audit រកឃើញចំណុចខ្សោយធ្ងន់ធ្ងរ៖ «ខ្វះសមត្ថភាពក្នុងការលុបចោល active bearer tokens ជាបន្ទាន់»។
+
+<Callout type="warning" title="ភាព Stateless និងការ Revoke ភ្លាមៗ គឺមិនអាចនៅជាមួយគ្នាបានឡើយ">
+ប្រសិនបើ Authorization Token ពិតជា stateless ពិតប្រាកដ (មានន័យថាសេវាកម្មអាច verify វាបានដោយមិនបាច់ឆែក database) នោះវាមិនអាចទៅរួចជាដាច់ខាតសម្រាប់ server ក្នុងការលុបចោលវាមុនពេល timestamp `exp` របស់វាបានឡើយ។ នៅវិនាទីដែលអ្នកចាប់ផ្តើមឆែកការ revoke នោះអ្នកកំពុងតែរក្សាទុក state រួចទៅហើយ។
+</Callout>
+
+## Diagnose
+
+1. **ពិនិត្យមើលអាយុកាលរបស់ Token៖** Decode មើល payload នៃ access token របស់អ្នក៖
+   ```json
+   {
+     "sub": "usr_9481",
+     "iat": 1718000000,
+     "exp": 1720592000 // ៣០ ថ្ងៃទៅមុខទៀត!
+   }
+   ```
+   ប្រសិនបើ stateless access token របស់អ្នកមានសុពលភាពលើសពី ១៥ នាទី ចន្លោះប្រហោងសុវត្ថិភាពរបស់អ្នកគឺធំខ្លាំងណាស់។
+2. **ពិនិត្យមើល Logic នៃ Logout៖** តើ endpoint `/logout` របស់អ្នកគ្រាន់តែប្រាប់ឱ្យ client លុប token ចេញពី `localStorage` ដែរឬទេ? បើអ៊ីចឹងមែន server មិនបាន revoke token ឡើយ; ជនអនាមិកណាដែលមាន token នោះនៅតែអាចចូលប្រើប្រាស់បានដដែល។
+
+## Options
+
+1. **Traditional Server-Side Sessions (Redis / DB)។** បោះបង់ JWT ចោលទាំងស្រុង ហើយប្រើ Session IDs (`session:xyz`) ដែលត្រូវផ្ទៀងផ្ទាត់ជាមួយ Redis រាល់ពេលមាន request។ (អាច revoke បានភ្លាមៗ ប៉ុន្តែទាមទារការហៅទៅ Redis គ្រប់ request ទាំងអស់)។
+2. **Short-Lived Access Token + Refresh Token Rotation។** ចេញ Access Token ដែលមានសុពលភាពត្រឹមតែ **៥ ទៅ ១៥ នាទី** ប៉ុណ្ណោះ។ ចេញ Refresh Token រយៈពេលវែងដែលរក្សាទុកក្នុង database។ ពេល access token ផុតកំណត់ client ប្រើ refresh token ដើម្បីសុំ token ថ្មី។ ការ revoke refresh token នឹងផ្តាច់សិទ្ធិប្រើប្រាស់ក្នុងរយៈពេលតែប៉ុន្មាននាទី។
+3. **Redis Token Blocklist។** រក្សាទុក ID របស់ JWT ដែលត្រូវបាន revoke (`jti`) ក្នុង Redis ជាមួយ TTL ស្មើនឹងរយៈពេលដែលនៅសល់នៃ token នោះ។
+4. **User Token Versioning (`token_version`)។** បន្ថែមលេខ integer `token_version` លើ table `users`។ បង្កប់ `ver: 3` ក្នុង JWT។ ការដំឡើងលេខ `token_version` របស់អ្នកប្រើប្រាស់ នឹងធ្វើឱ្យ tokens ទាំងអស់ដែលចេញពីមុនក្លាយជាអសព្វសង្ខ័យភ្លាមៗនៅពេល refresh លើកក្រោយ។
+
+## Trade-offs
+
+| យុទ្ធសាស្ត្រ | ល្បឿននៃការ Revoke | បន្ទុកលើ DB / Cache | ភាពស្មុគស្មាញនៃស្ថាបត្យកម្ម |
+| :--- | :--- | :--- | :--- |
+| **Traditional Session (Redis)** | **ភ្លាមៗ (0 ms)** | ហៅ Redis ១ ដងរាល់ request | ទាប |
+| **Short JWT (10m) + Refresh** | ក្នុងរង្វង់ ១០ នាទី | ហៅ DB ១ ដងរៀងរាល់ ១០ នាទី | មធ្យម |
+| **Redis Blocklist** | **ភ្លាមៗ (0 ms)** | ហៅ Redis ១ ដងរាល់ request | មធ្យម (ត្រូវការ Redis) |
+| **User Token Version** | ក្នុងរង្វង់ ១០ នាទី | ឆែក DB តែពេល refresh | **ទាប (មិនបាច់មាន Redis ក៏បាន)** |
+
+## Decision
+
+ជ្រើសរើស **គំរូកូនកាត់ស្តង់ដារឧស្សាហកម្ម (Hybrid Standard)៖ Short-Lived Access Tokens ជាមួយ Token Versioning**៖
+
+1. **Access Tokens មានអាយុកាលត្រឹមតែ ១០ នាទី៖** ចុះហត្ថលេខាឌីជីថល, បង្កប់ user ID, role និង `token_version`។ Microservices ទាំងអស់អាច verify វាបានយ៉ាងលឿនបែប stateless ដោយមិនបាច់ប៉ះពាល់ database ឡើយ។
+2. **Refresh Tokens មានអាយុកាល ៣០ ថ្ងៃ៖** ជា random strings ដែលរក្សាទុកក្នុង PostgreSQL ឬ Redis។
+3. **ការ Revoke ភ្លាមៗ (Logout / Password Reset)៖**
+   - នៅពេលអ្នកប្រើប្រាស់ប្តូរ password ឬ admin ចង់ដកសិទ្ធិ គ្រាន់តែដំឡើង `token_version = token_version + 1` ក្នុង database និងលុប refresh tokens ទាំងអស់ចោល។
+   - Access token បច្ចុប្បន្នរបស់អ្នកប្រើប្រាស់នឹងនៅបន្តដំណើរការយ៉ាងច្រើនបំផុតត្រឹមតែ ១០ នាទីទៀតប៉ុណ្ណោះ។
+   - នៅពេល client ព្យាយាមយក refresh token មកសុំ token ថ្មី ភាពមិនត្រូវគ្នានៃ version នឹងច្រានចោល request នោះភ្លាម ដែលកាត់ផ្តាច់ session លើគ្រប់ឧបករណ៍ទាំងអស់។
+4. **សម្រាប់តម្រូវការសុវត្ថិភាពកម្រិតខ្ពស់បំផុត (Zero-delay)៖** ពិនិត្យមើល Redis blocklist (`EXISTS blacklist:jti`) តែលើ endpoints រសើបខ្លាំងប៉ុណ្ណោះ (ដូចជាការផ្ទេរប្រាក់ធំៗ)។
+
+## Implementation
+
+### 1. ការបង្កើត Tokens ជាមួយ `token_version` (Node.js)៖
+
+```typescript
+import jwt from 'jsonwebtoken';
+
+interface User {
+  id: string;
+  role: string;
+  token_version: number;
+}
+
+export function generateTokens(user: User) {
+  // Access Token រយៈពេលខ្លីបែប Stateless (១០ នាទី)
+  const accessToken = jwt.sign(
+    {
+      sub: user.id,
+      role: user.role,
+      version: user.token_version,
+    },
+    process.env.JWT_SECRET!,
+    { expiresIn: '10m' }
+  );
+
+  // Refresh Token រយៈពេលវែង
+  const refreshToken = jwt.sign(
+    { sub: user.id, version: user.token_version },
+    process.env.REFRESH_SECRET!,
+    { expiresIn: '30d' }
+  );
+
+  return { accessToken, refreshToken };
+}
+```
+
+### 2. ការ Revoke ភ្លាមៗពេល Reset Password / Logout All៖
+
+```typescript
+export async function revokeAllUserSessions(userId: string) {
+  // ការដំឡើង token_version នឹងធ្វើឱ្យរាល់ការ refresh ទៅមុខត្រូវបរាជ័យភ្លាមៗ!
+  await db.query(
+    `UPDATE users 
+     SET token_version = token_version + 1 
+     WHERE id = $1`,
+    [userId]
+  );
+
+  // លុប refresh tokens ទាំងអស់ចោល
+  await db.query(`DELETE FROM refresh_tokens WHERE user_id = $1`, [userId]);
+}
+```
+
+### 3. Refresh Endpoint ផ្ទៀងផ្ទាត់ Token Version៖
+
+```typescript
+app.post('/auth/refresh', async (req, res) => {
+  const { refreshToken } = req.body;
+  
+  let payload: any;
+  try {
+    payload = jwt.verify(refreshToken, process.env.REFRESH_SECRET!);
+  } catch {
+    return res.status(401).send('Refresh token មិនត្រឹមត្រូវ');
+  }
+
+  // ទាញយក token_version បច្ចុប្បន្នរបស់ user ពី database
+  const userRes = await db.query(
+    `SELECT id, role, token_version FROM users WHERE id = $1`,
+    [payload.sub]
+  );
+  const user = userRes.rows[0];
+
+  // បើ version មិនត្រូវគ្នា មានន័យថា session ត្រូវបាន revoke រួចហើយ!
+  if (!user || user.token_version !== payload.version) {
+    return res.status(401).send('Session ត្រូវបានលុបចោល។ សូម login ម្តងទៀត។');
+  }
+
+  // ចេញ access token ថ្មីសន្លាង
+  const tokens = generateTokens(user);
+  res.json(tokens);
+});
+```
+
+## Verification
+
+1. **ការធ្វើតេស្ត Session Revocation៖**
+   - ធ្វើការ Login ដើម្បីទទួលបាន access token និង refresh token។
+   - ដំណើរការ password reset (`token_version++`)។
+   - សាកល្បងហៅ `/auth/refresh` ជាមួយ refresh token ចាស់។
+   - Endpoint ត្រូវតែច្រានចោលភ្លាមៗជាមួយ **HTTP 401 Unauthorized**។
+2. **ការផុតកំណត់នៃ Access Token៖** ផ្ទៀងផ្ទាត់ថាក្រោយរយៈពេល ១០ នាទីបន្ទាប់ពី revoke រាល់ API requests ទាំងអស់ដែលប្រើ access token ចាស់នឹងបរាជ័យជាមួយ `jwt expired`។
+
+## Why
+
+ភាព Stateless សុទ្ធសាធ គឺជាការស្រមើស្រមៃសម្រាប់កម្មវិធីដែលត្រូវការសុវត្ថិភាពខ្ពស់។ ភាព stateless ទាំងស្រុងមានន័យថាអ្នកបានបោះបង់ចោលសមត្ថភាពក្នុងការដកហូតសិទ្ធិ (revocation)។
+
+តាមរយៈការបង្រួញអាយុកាលរបស់ access token មកត្រឹម ១០ នាទី យើងទទួលបានតុល្យភាពដ៏ល្អឥតខ្ចោះ៖ ៩៩% នៃ request ដំណើរការលឿនដោយមិនបាច់ឆែក database ខណៈដែលចន្លោះប្រហោងសុវត្ថិភាពអតិបរមាត្រូវបានកម្រិតត្រឹមតែ ១០ នាទីប៉ុណ្ណោះ។
+
+## When Not To Use
+
+- **B2B API Keys៖** API keys រយៈពេលវែងសម្រាប់ម៉ាស៊ីនទាក់ទងម៉ាស៊ីន (ដូចជា `sk_live_...`) មិនគួរប្រើ JWT ឡើយ។ ត្រូវប្រើ random opaque tokens ដែលរក្សាទុកក្នុង database ឬ Redis ដើម្បីអាច revoke បានភ្លាមៗក្នុង 0 ms។
+
+## Common Mistakes
+
+- **រក្សាទុក JWT ក្នុង `localStorage`។** `localStorage` ងាយរងគ្រោះបំផុតពីការវាយប្រហារ Cross-Site Scripting (XSS)។ ត្រូវរក្សាទុក refresh token ក្នុង `HttpOnly, Secure, SameSite=Strict` cookies ជានិច្ច។
+- **ដាក់ទិន្នន័យរសើបដែលងាយប្រែប្រួលក្នុង JWT Payload។** ការដាក់ permissions ឬ email ក្នុង JWT មានន័យថាបើ user ត្រូវគេបញ្ចុះស័ក្តិពី "admin" មក "viewer" គាត់នៅតែជា admin ដដែលរហូតទាល់តែ JWT ផុតកំណត់។ ត្រូវរក្សា payload ឱ្យតូចបំផុត៖ `sub`, `role` និង `version`។

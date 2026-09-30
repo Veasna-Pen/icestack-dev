@@ -1,0 +1,157 @@
+---
+title: "Saga"
+question: "How do I maintain data consistency across multiple microservices without two-phase commit (2PC) locks?"
+summary: "Coordinate a sequence of local transactions across distinct microservices. If any local step fails, execute a series of compensating transactions in reverse order to roll back previously committed changes."
+tags: [architecture, saga, distributed-transactions, microservices, reliability]
+related: [tradeoffs/saga-orchestration-vs-choreography, patterns/transactional-outbox, problems/when-to-use-microservices]
+order: 14
+updated: "2026-09-12"
+contributors: [veasna]
+---
+
+## Context
+
+In a monolithic architecture, maintaining consistency is trivial: wrap multiple SQL updates in `BEGIN TRANSACTION ... COMMIT`. Either every update succeeds, or the database engine rolls them all back.
+
+In a microservice architecture, each service owns its private database. A single business transaction (e.g. "Customer places an order") spans 4 different microservices and 4 separate databases:
+1. **Order Service:** Creates the order record in `orders_db`.
+2. **Payment Service:** Charges the user's credit card via Stripe.
+3. **Inventory Service:** Decrements warehouse stock in `inventory_db`.
+4. **Notification Service:** Dispatches email and SMS receipts.
+
+Traditional distributed transactions (Two-Phase Commit / 2PC, XA transactions) hold network locks across all participating databases until every node agrees to commit. In modern cloud environments, 2PC is a disaster: it kills throughput, creates global deadlocks, and fails if any single network link hiccups.
+
+The **Saga Pattern** solves this without 2PC locks. A Saga is a sequence of *local transactions*. If any local transaction fails, the saga runs a sequence of *compensating transactions* that undo the changes made by earlier steps.
+
+## Symptoms
+
+- An order is saved in the database, but the payment gateway fails; the customer is not charged, but inventory remains locked forever.
+- A user's credit card is charged, but the inventory service runs out of stock; the customer loses money and receives no product.
+- Implementing Two-Phase Commit (XA) across microservices causes massive database lock contention, degrading API throughput from 2,000 req/sec to 15 req/sec.
+- Data inconsistency between services requires developers to run manual SQL cleanup scripts every morning.
+
+<Callout type="warning" title="Compensating transactions are not automatic database rollbacks">
+Because local transactions commit immediately, changes are visible to other users before the entire saga completes. A compensating transaction must be explicitly coded to reverse the business effect (e.g. issuing a refund rather than an atomic rollback).
+</Callout>
+
+## Diagnose
+
+1. **Map multi-service write flows:** List every business workflow that mutates data across more than one database.
+2. **Audit partial failure handling:** What happens today if step 3 of your checkout flow throws an HTTP 500? Does step 1 get reverted, or does it leave orphaned records?
+3. **Evaluate lock duration:** Are services attempting to use distributed locks or long-running database connections to span network boundaries?
+4. **Identify reversible vs irreversible actions:** Which steps can be undone (e.g., refunding a charge, restocking an item) and which cannot (e.g., sending an email)?
+
+## Options
+
+1. **Monolithic consolidation:** Keep multi-table writes inside a single PostgreSQL database using standard ACID transactions. (Simplest option; avoids the need for a Saga).
+2. **Choreographed Saga (Event-driven):** Each service completes a local transaction and emits an event (e.g. `OrderCreated`). Other services listen and execute their local transactions independently. (Decentralized, but hard to trace when flows have 5+ steps).
+3. **Orchestrated Saga (Command-driven):** A central coordinator service explicitly directs each service what to do via commands, tracking the state machine in a durable log. (Clear, traceable, easy to debug).
+
+## Trade-offs
+
+| Strategy | ACID Guarantees | Throughput | Failure Recovery | Architecture Complexity |
+| :--- | :--- | :--- | :--- | :--- |
+| **Monolith ACID** | Full ACID (Immediate) | High (single DB) | Automatic (`ROLLBACK`) | Lowest |
+| **Two-Phase Commit (2PC)** | Full ACID | Very Low (holds locks) | Brittle (coordinator crash) | Extremely High |
+| **Choreographed Saga** | Eventual Consistency | Very High | Reactive events | Moderate (traceability debt) |
+| **Orchestrated Saga** | Eventual Consistency | High | Central state machine | Moderate (central orchestrator) |
+
+## Decision
+
+- **Use Orchestrated Sagas for critical, multi-step business transactions:** When a workflow involves 3 or more services with complex failure rollbacks (e.g. order checkout, loan approval), use a state machine orchestrator.
+- **Ensure every forward step has an idempotent compensating action:**
+  - Forward: `ReserveCredit()` -> Compensating: `ReleaseCredit()`
+  - Forward: `ChargePayment()` -> Compensating: `RefundPayment()`
+  - Forward: `DeductInventory()` -> Compensating: `RestockInventory()`
+- **Order steps from pivot point forward:** Place irreversible actions (like sending confirmation emails or generating flight tickets) *after* all reversible steps have succeeded. The step that guarantees the saga will complete is called the **pivot transaction**.
+- **Make compensating actions idempotent and retryable:** Compensating actions can also fail due to network timeouts. The saga orchestrator must retry compensating actions until they succeed.
+
+## Implementation
+
+### Orchestrated Order Checkout Saga Coordinator in TypeScript:
+
+```typescript
+export interface SagaContext {
+  orderId: string;
+  customerId: string;
+  amountCents: number;
+  items: Array<{ productId: string; qty: number }>;
+}
+
+export class OrderSagaOrchestrator {
+  constructor(
+    private readonly paymentClient: any,
+    private readonly inventoryClient: any,
+    private readonly orderClient: any
+  ) {}
+
+  async execute(ctx: SagaContext): Promise<{ success: boolean; error?: string }> {
+    const executedSteps: string[] = [];
+
+    try {
+      // Step 1: Create Order in PENDING status
+      await this.orderClient.createPendingOrder(ctx.orderId, ctx.customerId, ctx.amountCents);
+      executedSteps.push('ORDER_CREATED');
+
+      // Step 2: Reserve Inventory
+      await this.inventoryClient.reserveStock(ctx.orderId, ctx.items);
+      executedSteps.push('INVENTORY_RESERVED');
+
+      // Step 3: Process Payment (Pivot Transaction)
+      await this.paymentClient.processCharge(ctx.orderId, ctx.customerId, ctx.amountCents);
+      executedSteps.push('PAYMENT_CHARGED');
+
+      // Step 4: Mark Order as CONFIRMED
+      await this.orderClient.confirmOrder(ctx.orderId);
+
+      return { success: true };
+    } catch (err) {
+      console.error(`[Saga] Failure during order ${ctx.orderId}: ${(err as Error).message}. Starting compensation.`);
+      await this.compensate(ctx, executedSteps);
+      return { success: false, error: (err as Error).message };
+    }
+  }
+
+  private async compensate(ctx: SagaContext, executedSteps: string[]) {
+    // Execute compensating transactions in reverse order
+    for (const step of executedSteps.reverse()) {
+      try {
+        if (step === 'PAYMENT_CHARGED') {
+          await this.paymentClient.refundCharge(ctx.orderId);
+        } else if (step === 'INVENTORY_RESERVED') {
+          await this.inventoryClient.releaseStock(ctx.orderId, ctx.items);
+        } else if (step === 'ORDER_CREATED') {
+          await this.orderClient.cancelOrder(ctx.orderId, 'Saga execution failed');
+        }
+      } catch (compensationErr) {
+        // Compensations must be retried or escalated to alert queue
+        console.error(`[Saga Alert] Failed compensating step ${step} for order ${ctx.orderId}:`, compensationErr);
+      }
+    }
+  }
+}
+```
+
+## Verification
+
+1. **Failure compensation test:** Inject a failure into the payment step (Step 3). Verify that `releaseStock` is called on the inventory service and `cancelOrder` is called on the order service.
+2. **Idempotency verification:** Execute the same compensating step twice with identical `orderId`. Verify that neither the database nor the payment gateway throws errors or applies duplicate refunds.
+3. **Database lock measurement:** Run load testing on the saga flow. Verify that database transaction durations remain under 10 ms because each step commits locally without holding cross-network locks.
+4. **Eventual consistency window:** Measure the time between the first local commit and the final confirmation. Confirm that UIs display intermediate states (`Processing...`) gracefully.
+
+## Why
+
+In distributed systems, the CAP theorem and network realities make distributed ACID transactions impractical. Holding locks across network hops guarantees that when network partitions or node crashes occur, the entire system grinds to a halt.
+
+The Saga Pattern trades immediate consistency for high availability and scalability. By breaking a global transaction into a chain of self-contained local transactions coupled with automated rollbacks, it allows each microservice to maintain autonomy, high performance, and fault isolation.
+
+## When Not To Use
+
+- **Single database architectures:** If all tables live in the same PostgreSQL or MySQL instance, always use native ACID transactions (`BEGIN ... COMMIT`). Sagas add unnecessary complexity.
+- **Transactions with non-compensable early steps:** If step 1 is sending an external SMS or non-reversible wire transfer, you cannot compensate with a rollback if step 2 fails.
+
+## Common Mistakes
+
+- **Assuming compensations cannot fail:** If a refund call fails due to a network glitch, the saga coordinator must not abandon it. Compensating actions must be retried with exponential backoff until they succeed.
+- **Lack of intermediate states:** Showing an order as "Completed" before payment clears leads to fulfillment leaks. Use states like `PENDING_PAYMENT`, `CANCELLED`, and `COMPLETED`.
+- **Non-idempotent compensations:** If a retry causes a compensation to run twice, a customer might be refunded double the order price.

@@ -1,0 +1,178 @@
+---
+title: "Laravel"
+question: "How do I implement HTTP timeouts, atomic locks, Redis caching, and rate limiters in Laravel?"
+summary: "HTTP client timeouts and retries, idempotency with a unique key, Cache::remember and Cache::flexible, named rate limiters and queued jobs, using what Laravel ships with."
+tags: [laravel, php, implementation, queues]
+related: [patterns/retry, patterns/idempotency, patterns/caching, patterns/rate-limiting]
+order: 3
+updated: "2026-09-11"
+---
+
+Production patterns for Laravel 11+ on PHP 8.3. Uses built-in framework primitives: HTTP client deadlines, Redis atomic locks for idempotency, tiered caching with Cache::flexible, named rate limiters, and queue worker retries.
+
+## Timeouts and retries
+
+The HTTP client takes a timeout, a retry count, a delay and a filter for which failures are worth retrying:
+
+```php
+use Illuminate\Http\Client\ConnectionException;
+use Illuminate\Http\Client\RequestException;
+use Illuminate\Support\Facades\Http;
+
+$rates = Http::timeout(2)
+    ->retry(
+        3,
+        fn (int $attempt) => random_int(0, 100 * 2 ** $attempt),   // full jitter, in milliseconds
+        fn (Exception $e) => $e instanceof ConnectionException
+            || ($e instanceof RequestException && in_array($e->response->status(), [429, 502, 503, 504]))
+    )
+    ->get('https://api.example.com/rates')
+    ->json();
+```
+
+[Retry](../../patterns/retry) explains why 4xx responses other than 429 are left alone.
+
+## Idempotency keys
+
+Insert the key and create the order in one transaction. A unique index on `idempotency_keys.key` turns a concurrent duplicate into a `UniqueConstraintViolationException`, and the handler answers with the stored response. See [Idempotency](../../patterns/idempotency).
+
+```php
+use App\Models\Order;
+use Illuminate\Database\UniqueConstraintViolationException;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
+
+Route::post('/orders', function (Request $request) {
+    $key = $request->header('Idempotency-Key') ?? abort(400, 'Idempotency-Key header is required');
+    $data = $request->validate([
+        'customer_id' => ['required', 'integer'],
+        'total_cents' => ['required', 'integer', 'min:0'],
+    ]);
+
+    try {
+        $order = DB::transaction(function () use ($key, $data) {
+            DB::table('idempotency_keys')->insert(['key' => $key, 'created_at' => now()]);
+            $order = Order::create($data);
+            DB::table('idempotency_keys')->where('key', $key)->update(['response' => $order->toJson()]);
+
+            return $order;
+        });
+
+        return response()->json($order, 201);
+    } catch (UniqueConstraintViolationException) {
+        $saved = DB::table('idempotency_keys')->where('key', $key)->value('response');
+
+        return $saved
+            ? response()->json(json_decode($saved), 200)
+            : response()->json(['error' => 'The original request is still in progress'], 409);
+    }
+});
+```
+
+## Caching
+
+`Cache::remember` is cache-aside with a TTL. `Cache::flexible` (Laravel 11.23 and later) serves a stale value while it refreshes in the background, which avoids stampedes on hot keys:
+
+```php
+use Illuminate\Support\Facades\Cache;
+
+$product = Cache::remember("product:v1:{$id}", now()->addMinute(), fn () => Product::findOrFail($id));
+
+// Fresh for 60 s; after that, serve the stale value for up to 300 s while it refreshes.
+$stats = Cache::flexible('dashboard:stats', [60, 300], fn () => Stats::compute());
+```
+
+Invalidate after the transaction commits, not before, or a concurrent read can put the old value straight back:
+
+```php
+use Illuminate\Support\Facades\DB;
+
+class Product extends Model
+{
+    protected static function booted(): void
+    {
+        static::saved(fn (Product $product) =>
+            DB::afterCommit(fn () => Cache::forget("product:v1:{$product->id}"))
+        );
+    }
+}
+```
+
+## Rate limiting
+
+Named limiters live in a service provider and attach to routes with the `throttle` middleware. Laravel answers with 429 and a `Retry-After` header on its own.
+
+```php
+// app/Providers/AppServiceProvider.php
+use Illuminate\Cache\RateLimiting\Limit;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\RateLimiter;
+
+public function boot(): void
+{
+    RateLimiter::for('api', fn (Request $request) =>
+        Limit::perMinute(100)->by($request->user()?->id ?: $request->ip())
+    );
+
+    // Login: limit per account and per address, so neither brute force nor spraying gets through.
+    RateLimiter::for('login', fn (Request $request) => [
+        Limit::perMinute(5)->by(strtolower((string) $request->input('email'))),
+        Limit::perMinute(20)->by($request->ip()),
+    ]);
+}
+```
+
+```php
+// routes/api.php and routes/web.php
+Route::middleware('throttle:api')->group(function () {
+    // ...
+});
+
+Route::post('/login', LoginController::class)->middleware('throttle:login');
+```
+
+Behind a load balancer, configure trusted proxies so `$request->ip()` is the client's address. See [Rate limiting](../../patterns/rate-limiting).
+
+## Queued jobs
+
+Jobs carry their own retry policy. `ShouldBeUnique` stops duplicates being queued, `afterCommit()` waits for the order's transaction, and the handler still checks before acting because a job can run twice after a worker crash:
+
+```php
+use Illuminate\Contracts\Queue\ShouldBeUnique;
+use Illuminate\Contracts\Queue\ShouldQueue;
+use Illuminate\Foundation\Queue\Queueable;
+use Illuminate\Support\Facades\Mail;
+
+class SendReceipt implements ShouldQueue, ShouldBeUnique
+{
+    use Queueable;
+
+    public int $tries = 5;
+
+    public function __construct(public int $orderId) {}
+
+    public function uniqueId(): string
+    {
+        return (string) $this->orderId;
+    }
+
+    public function backoff(): array
+    {
+        return [10, 60, 300];   // seconds between attempts
+    }
+
+    public function handle(): void
+    {
+        $order = Order::findOrFail($this->orderId);
+        if ($order->receipt_sent_at) {
+            return;             // already sent: jobs can run more than once
+        }
+
+        Mail::to($order->customer)->send(new ReceiptMail($order));
+        $order->update(['receipt_sent_at' => now()]);
+    }
+}
+
+// Dispatch only once the surrounding transaction has committed.
+SendReceipt::dispatch($order->id)->afterCommit();
+```

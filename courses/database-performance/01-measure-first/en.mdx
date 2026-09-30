@@ -1,0 +1,92 @@
+---
+title: "Measure before you fix"
+summary: "Find the few queries that take most of the database's time, so you fix the right thing first."
+minutes: 10
+related: [problems/database-is-slow]
+updated: "2026-09-29"
+contributors: [Veasna-Pen]
+---
+
+## The problem
+
+Users say the app "feels slow". Someone suggests a bigger database server. Someone else wants to rewrite the orders page. Nobody knows **which** query is slow, or whether the database is the problem at all.
+
+Guessing is expensive. You need to see where the time actually goes.
+
+## The idea
+
+A database usually spends most of its time on a **few queries**. Fixing the top one or two often fixes the whole app.
+
+To find them, look at **total time**, not just the slowest single query:
+
+> total time = average time per call × number of calls
+
+A 2 ms query called 50,000 times a minute costs more than a 3-second report run twice a day.
+
+PostgreSQL records this for you in the `pg_stat_statements` extension. (In MySQL, use the slow query log or `performance_schema`.)
+
+Once you have a suspect, `EXPLAIN ANALYZE` runs that one query and shows **how** the database executed it and where the time went. You will read those plans in the next lesson.
+
+## Example
+
+Turn on the extension once (it needs `shared_preload_libraries = 'pg_stat_statements'` in the server config):
+
+```sql
+CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
+```
+
+Then ask for the queries that used the most total time:
+
+```sql
+SELECT calls,
+       round(mean_exec_time::numeric, 1) AS avg_ms,
+       round(total_exec_time::numeric)   AS total_ms,
+       left(query, 60)                   AS query
+FROM pg_stat_statements
+ORDER BY total_exec_time DESC
+LIMIT 5;
+```
+
+A typical result:
+
+| calls | avg_ms | total_ms | query |
+| --- | --- | --- | --- |
+| 412,000 | 38.2 | 15,738,400 | `SELECT * FROM orders WHERE customer_id = $1 ORDER BY…` |
+| 1,900 | 410.5 | 779,950 | `SELECT count(*) FROM events WHERE…` |
+| 88,000 | 1.1 | 96,800 | `SELECT * FROM users WHERE id = $1` |
+
+The first query takes **95%** of the total time. That is the one to fix, even though the second one is slower per call.
+
+## Try it
+
+1. Enable `pg_stat_statements` on a development or staging database.
+2. Use the app for a few minutes, or run your test suite against it.
+3. Run the query above and write down the top three by `total_ms`.
+4. For the first one, note `calls` and `avg_ms`. Is it slow each time, or just called very often? The fix is different for each.
+
+## Check yourself
+
+**1. Query A takes 900 ms and runs 10 times an hour. Query B takes 15 ms and runs 20,000 times an hour. Which do you look at first?**
+
+<Answer>
+Query B. It uses 15 × 20,000 = 300,000 ms an hour, against 9,000 ms for query A. Total time decides what the database spends its effort on.
+</Answer>
+
+**2. The top query is fast (1 ms) but called 2 million times an hour. What kind of fix do you look for?**
+
+<Answer>
+A way to call it less: batch the calls, remove an N+1 loop, or cache the result. Making a 1 ms query faster will not help much.
+</Answer>
+
+**3. Why not just buy a bigger database server?**
+
+<Answer>
+It costs money every month and often buys only a small, temporary gain. If one query takes 95% of the time because of a missing index, a larger server stays busy with the same wasted work.
+</Answer>
+
+## Key takeaways
+
+- Don't guess. **Measure** where the database spends its time.
+- Rank queries by **total time** (average × calls), not by the slowest single call.
+- A slow query needs a **faster plan**; a hot query needs **fewer calls**.
+- `pg_stat_statements` finds the suspect; `EXPLAIN ANALYZE` explains it.

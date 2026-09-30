@@ -1,0 +1,164 @@
+---
+title: "Edge Computing vs Centralized Cloud"
+question: "តើនៅពេលណាដែលកូដកម្មវិធីគួរដំណើរការនៅ CDN Edge Locations ហើយនៅពេលណាដែលគួរដំណើរការក្នុង Centralized Cloud Region?"
+summary: "Edge Computing (Cloudflare Workers, Fastly Compute, Vercel Edge) ដំណើរការកូដក្នុង ៣០០+ ទីតាំងជុំវិញពិភពលោកក្នុងពេល < 5 ms ដែលល្អឥតខ្ចោះសម្រាប់ Geolocation Routing, Auth Token Gatekeeping, និងការបង្ហាញទំព័រតាមបុគ្គល។ ចំណែក Centralized Cloud (AWS us-east-1 VPC) ជាកន្លែងសម្រាប់ Relational Database ធំៗ, ការងារ Batch យូរៗ, និង Business Logic ស្មុគស្មាញដែលត្រូវនៅជិតទិន្នន័យ។"
+tags: [architecture, cloud, edge, cdn, networking, serverless]
+related: [tradeoffs/serverless-vs-containers, patterns/api-gateway, tradeoffs/client-side-vs-server-side-rendering]
+order: 20
+updated: "2026-09-12"
+contributors: [veasna]
+translation: draft
+---
+
+## Context
+
+កាលពីមុន ស្ថាបត្យកម្ម Web ទាំងអស់ត្រូវបានប្រមូលផ្តុំនៅកន្លែងតែមួយ (Centralized)៖ រាល់ Application Servers, Message Queues, និង Databases ទាំងអស់ត្រូវបានដាក់ពង្រាយក្នុង Cloud Region តែមួយគត់ (ដូចជា AWS `us-east-1` ក្នុងរដ្ឋ Virginia)។ អ្នកប្រើប្រាស់នៅសិង្ហបុរី ឬអឺរ៉ុប ត្រូវបញ្ជូនទិន្នន័យឆ្លងកាត់ខ្សែកាបបាតសមុទ្រ ដែលចំណាយពេល Latency ធ្វើដំណើរទៅមកពី ១៥០ ទៅ ២៥០ មិល្លីវិនាទីលើគ្រប់សំណើទាំងអស់។
+
+ជាមួយនឹងបច្ចេកវិទ្យា **Edge Computing** សម័យទំនើប (Cloudflare Workers, Fastly Compute, Vercel Edge) កូដកម្មវិធីស្រាលៗ (ដំណើរការលើ V8 Isolates ឬ WebAssembly) ដំណើរការដោយផ្ទាល់នៅក្នុង Data Centers របស់ CDN ជាង ៣០០ កន្លែងទូទាំងពិភពលោក ដែលស្ថិតនៅចម្ងាយត្រឹមតែ ១០ ទៅ ៥០ ms ពី ៩៥% នៃប្រជាជនលើផែនដី។
+
+ទោះជាយ៉ាងណា ការរុញ Business Logic ទៅកាន់ Edge បង្កើតនូវទំនាស់ស្ថាបត្យកម្មដ៏ធំមួយ៖ ប្រសិនបើកូដ Edge របស់អ្នកនៅស៊ីដនី ត្រូវ Query Database PostgreSQL ដែលស្ថិតនៅ Virginia នោះអ្នកមិនបានកាត់បន្ថយ Latency ឡើយ—អ្នកគ្រាន់តែប្តូរការពន្យារពេល ២០០ ms ពីចន្លោះ User-to-Server មកជាចន្លោះ Server-to-Database វិញប៉ុណ្ណោះ។
+
+## Symptoms
+
+- **បញ្ហានៃ Centralized Cloud៖** អ្នកប្រើប្រាស់ទូទាំងពិភពលោកជួបប្រទះភាពយឺតយ៉ាវ (៣០០+ ms) សូម្បីតែលើទិន្នន័យ Static ឬ Cached ព្រោះរាល់សំណើទាំងអស់ត្រូវហោះកាត់មហាសមុទ្រទៅកាន់ Cloud Region តែមួយ។
+- **បញ្ហានៃ Edge Architecture (Edge Latency Paradox)៖** Developer បង្កើត Edge Function ដោយរំពឹងថានឹងឆ្លើយតបក្នុងពេល ១០ ms ប៉ុន្តែ Edge Function នោះដំណើរការ SQL Query ចំនួន ៥ បន្តបន្ទាប់គ្នាត្រឡប់ទៅកាន់ `us-east-1` ធ្វើឱ្យរយៈពេលឆ្លើយតបសរុបកើនឡើងដល់លើសពី ១,២០០ ms ដោយសារការហោះកាត់ទ្វីបទៅមក ៥ ដង។
+
+<Callout type="warning" title="Compute នៅជិតមនុស្ស តែឆ្ងាយពីទិន្នន័យ បង្កើតជា 'Edge Latency Paradox'">
+ការដំណើរការកូដនៅជិតអ្នកប្រើប្រាស់គឺគ្មានប្រយោជន៍អ្វីឡើយ ប្រសិនបើកូដនោះត្រូវហោះកាត់ពិភពលោកភ្លាមៗដើម្បីទាញយកទិន្នន័យពី Database។ ត្រូវរុញកូដទៅកាន់ Edge លុះត្រាតែទិន្នន័យមានស្រាប់នៅទីនោះ (Cache/KV) ឬការងារនោះមិនត្រូវការ Database ទាល់តែសោះ។
+</Callout>
+
+## Diagnose
+
+1. **ពិនិត្យទីតាំងភូមិសាស្ត្ររបស់អ្នកប្រើប្រាស់៖** តើអ្នកប្រើប្រាស់ ៩០% ស្ថិតក្នុងតំបន់អាមេរិកខាងជើង (ដែល Centralized Cloud ដំណើរការល្អ) ឬតើពួកគេរាយប៉ាយទូទាំងអាស៊ី អឺរ៉ុប និងអាមេរិក?
+2. **ពិនិត្យមើលការពឹងផ្អែកលើ Relational Database៖** តើ Route នោះតម្រូវឱ្យទាក់ទងជាមួយ PostgreSQL/MySQL ក្នុង Centralized VPC ដែរឬទេ?
+3. **ពិនិត្យភាពឆបគ្នានៃ Runtime៖** តើកូដរបស់អ្នកពឹងផ្អែកលើ Node.js C++ Addons ឬបណ្ណាល័យធ្ងន់ៗដែលមិនអាចដំណើរការលើ Edge V8 Isolate បានមែនទេ?
+4. **វាស់វែងរយៈពេលដំណើរការកូដ៖** តើការងារនោះដំណើរការចប់ក្នុងពេលក្រោម ៣០ ms ឬជាការងារដំណើរការកាត់តរូបភាពធ្ងន់ៗរយៈពេល ៥ វិនាទី?
+
+## Options
+
+1. **Centralized Cloud Region (AWS / GCP)៖** កូដ និងទិន្នន័យទាំងអស់ស្ថិតក្នុង VPC តែមួយ។ (ស្ថាបត្យកម្មសាមញ្ញ, គ្មានបញ្ហា Sync ទិន្នន័យ, Latency ខ្ពស់ឆ្លងទ្វីប)។
+2. **Edge Computing (Cloudflare Workers / Fastly)៖** ដំណើរការ V8 Isolates នៅ ៣០០+ PoPs ជុំវិញពិភពលោក។ Startup ក្រោម 5 ms, មាន Edge KV Storage, បញ្ជូន Route ស្វ័យប្រវត្តិ។
+3. **Multi-Region Centralized Cloud៖** ចម្លងប្រព័ន្ធទាំងមូលទៅដាក់ក្នុង ៣ Regions ធំៗ (US, EU, APAC) ជាមួយ Cross-region Read Replicas។
+4. **Hybrid Edge-Gateway Architecture (យុទ្ធសាស្ត្រណែនាំ)៖** Edge ទទួលបន្ទុក SSL Termination, Bot Protection, Geolocation Routing, និង Cached Reads; រីឯ Centralized Cloud ទទួលបន្ទុកការសរសេរ (Writes) និង Transactional Logic ធ្ងន់ៗ។
+
+## Trade-offs
+
+| លក្ខណៈវិនិច្ឆ័យ | Edge Computing | Centralized Cloud Region |
+| :--- | :--- | :--- |
+| **ចម្ងាយរូបវន្តទៅកាន់អ្នកប្រើប្រាស់** | **កៀកបំផុត (១០ ដល់ ៣០ ms ទូទាំងសកល)** | ឆ្ងាយ (១៥០ ដល់ ២៥០ ms ឆ្លងទ្វីប) |
+| **Cold Start Latency** | **ក្រោម ៥ ms (V8 Isolate)** | ៥០០ ដល់ ៣,០០០ ms (Docker/VM Boot) |
+| **ការភ្ជាប់ Relational Database** | អន់ខ្លាំង (Latency ខ្ពស់ទៅកាន់ DB) | **លឿនបំផុត (< ០.៥ ms ក្នុង VPC)** |
+| **សមត្ថភាព Runtime** | មានកម្រិត (V8, WASM, កម្រិត CPU តឹងរ៉ឹង) | **ពេញលេញ (Docker, Linux, គ្រប់ Binary)** |
+| **ថ្លៃដើមពេល Scale** | ថោកតាមសំណើ, ថ្លៃបើស៊ី CPU ច្រើន | សន្សំសំចៃសម្រាប់បន្ទុកការងារធ្ងន់ៗថេរ |
+| **ការធ្វើសមកាលកម្មទិន្នន័យ** | Eventual Consistency (Edge KV/D1) | **Strong ACID Consistency (DB តែមួយ)** |
+
+## Decision
+
+- **ដាក់ពង្រាយកូដទៅកាន់ Edge សម្រាប់៖**
+  - Dynamic Request Routing និង A/B Testing (ពិនិត្យ Cookie/Header រួចបញ្ជូនបន្ត)។
+  - Geolocation Detection និងការប្តូរភាសា (ឧ. បង្វែរទៅ `/fr` ឬ `/de` ដោយស្វ័យប្រវត្តិតាម IP Header)។
+  - ការផ្ទៀងផ្ទាត់ Authentication Token (ឆែកហត្ថលេខា JWT ក្នុងពេល ០ ms នៅមាត់ទ្វារ Edge មុនពេលសំណើចូលដល់ Origin)។
+  - Static HTML Rendering ជាមួយ Personalization តាមរយៈ Edge-cached KV Store។
+  - ការទប់ស្កាត់ Bots, DDoS Mitigation, និង Rate Limiting នៅមាត់ទ្វារព្រំដែន។
+- **រក្សាទុកក្នុង Centralized Cloud សម្រាប់៖**
+  - ការសរសេរទិន្នន័យ Transactional ស្នូល (Checkout, ការកាត់ស្តុក, បញ្ជីធនាគារ)។
+  - Domain Logic ស្មុគស្មាញដែលត្រូវការ SQL Joins ច្រើនតារាង និង ACID Transactions។
+  - ការងារ Compute ធ្ងន់ៗ៖ ការបម្លែងវីដេអូ, ការបង្កើត PDF, Machine Learning Inference, និងការបូកសរុបរបាយការណ៍។
+  - Background Workers, WebSockets, និង Queue Consumers ដែលរត់ជាប់ជាប្រចាំ។
+
+## Implementation
+
+### 1. Edge Worker: Geolocation Routing និង JWT Gatekeeper (Cloudflare Worker)៖
+
+```typescript
+// Cloudflare Worker ដំណើរការនៅ ៣០០+ Edge PoPs ក្នុងពេល < 5ms
+export default {
+  async fetch(request: Request, env: any): Promise<Response> {
+    const url = new URL(request.url);
+
+    // ១. Edge Geolocation: កំណត់ប្រទេសភ្លាមៗក្នុងពេល ០ ms ពី TCP Connection
+    const country = request.headers.get('cf-ipcountry') || 'US';
+
+    // ២. Edge Security Gatekeeper: ផ្ទៀងផ្ទាត់ JWT នៅមាត់ទ្វារព្រំដែន
+    const authHeader = request.headers.get('Authorization');
+    if (url.pathname.startsWith('/api/secure/')) {
+      if (!authHeader?.startsWith('Bearer ')) {
+        return new Response(JSON.stringify({ error: 'បដិសេធនៅ Edge: គ្មានសិទ្ធិ' }), {
+          status: 401,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+    }
+
+    // ៣. Edge Personalization: បង្វែរផ្លូវតាមភាសាប្រទេស
+    if (url.pathname === '/') {
+      if (country === 'FR') return Response.redirect(`${url.origin}/fr`, 302);
+      if (country === 'DE') return Response.redirect(`${url.origin}/de`, 302);
+    }
+
+    // ៤. បញ្ជូនសំណើស្អាតស្អំទៅកាន់ Centralized Cloud Origin
+    const modifiedRequest = new Request(request, {
+      headers: {
+        ...Object.fromEntries(request.headers),
+        'x-user-country': country,
+      },
+    });
+
+    return await fetch(modifiedRequest);
+  },
+};
+```
+
+### 2. Centralized Cloud API: Business Logic ស្នូលក្នុង AWS us-east-1៖
+
+```typescript
+import express from 'express';
+import { Pool } from 'pg';
+
+const app = express();
+// ការតភ្ជាប់ Database ក្នុង Private VPC លឿនបំផុត (< 0.5 ms)
+const db = new Pool({ connectionString: process.env.DATABASE_URL });
+
+app.post('/api/secure/checkout', async (req, res) => {
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+    // ការសរសេរ Transaction ច្រើនតារាងដែលទាមទារ ACID Locks តឹងរ៉ឹង
+    await client.query('UPDATE accounts SET balance = balance - $1 WHERE id = $2', [100, req.body.userId]);
+    await client.query('INSERT INTO orders (user_id, amount) VALUES ($1, $2)', [req.body.userId, 100]);
+    await client.query('COMMIT');
+
+    return res.json({ success: true });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    return res.status(500).json({ error: (err as Error).message });
+  } finally {
+    client.release();
+  }
+});
+```
+
+## Verification
+
+1. **ការវាស់ស្ទង់ Edge Latency៖** ធ្វើតេស្ត Ping ទៅកាន់ Edge Endpoint ពីទីក្រុងចំនួន ១០ ជុំវិញពិភពលោក (តូក្យូ, ឡុងដ៍, ស៊ីដនី, ញូវយ៉ក)។ ផ្ទៀងផ្ទាត់ថា Time-to-first-byte (TTFB) សម្រាប់ Route ដែលបាន Cache គឺ **< 30 ms** ទូទាំងពិភពលោក។
+2. **ការកាត់បន្ថយបន្ទុក Origin៖** ពិនិត្យមើល Analytics លើ Origin Server។ ផ្ទៀងផ្ទាត់ថាការវាយប្រហារពី Bots, ការ Redirect, និងសំណើដែលគ្មានសិទ្ធិត្រូវបានទប់ស្កាត់នៅ Edge ដែលជួយកាត់បន្ថយបន្ទុកលើ Origin បានពី ៤០ ទៅ ៦០%។
+3. **ផ្ទៀងផ្ទាត់ថាមិនមានការហោះឆ្លងទ្វីបស្ទួនៗ៖** ធានាថាគ្មាន Edge Worker ណាដំណើរការ SQL Query បន្តបន្ទាប់គ្នាឆ្លងកាត់មហាសមុទ្រឡើយ។ រយៈពេលដំណើរការរបស់ Edge ត្រូវតែនៅក្រោម ១៥ ms ជានិច្ច។
+
+## Why
+
+ច្បាប់រូបវិទ្យាកំណត់ថាសញ្ញាឌីជីថលមិនអាចធ្វើដំណើរលឿនជាងពន្លឺបានឡើយ។ កញ្ចប់ទិន្នន័យត្រូវចំណាយពេលប្រហែល ១៥០ ms ដើម្បីធ្វើដំណើរទៅមករវាងសិង្ហបុរី និងអាមេរិក។
+- បើអ្នកដំណើរការគ្រប់យ៉ាងក្នុង **Centralized Cloud** អ្នកប្រើប្រាស់នៅឆ្ងាយត្រូវរងចាំ Latency រាល់ពេលចុចម្តងៗ។
+- បើអ្នកព្យាយាមរុញ **Database ទាំងមូលទៅកាន់ Edge** អ្នកនឹងធ្លាក់ចូលក្នុងមហន្តរាយនៃ Distributed Consensus និង Replication Lag។
+
+ស្ថាបត្យកម្មសម័យទំនើបជ្រើសរើស **Hybrid Architecture**៖ ដំណើរការកូដ Edge សម្រាប់ការត្រួតពិនិត្យ, សុវត្ថិភាព, Routing, និង Caching ឱ្យនៅកៀកនឹងមេដៃរបស់អ្នកប្រើប្រាស់ ខណៈដែលដំណើរការ State និង Transaction ស្នូលនៅក្នុង Cloud Region កណ្តាលដែលមានប្រសិទ្ធភាពខ្ពស់។
+
+## When Not To Use
+
+- **Edge សម្រាប់កិច្ចការគណនាធ្ងន់ៗ៖** ការដំណើរការ Script កែសម្រួលរូបភាព ១០ វិនាទីលើ Cloudflare Workers នឹងបណ្តាលឱ្យដាច់ Timeout ព្រោះ Workers កំណត់ CPU Time ត្រឹម ៥០ ms ប៉ុណ្ណោះ។
+- **Centralized Cloud សម្រាប់ Static Assets៖** ការបញ្ជូនឯកសារ CSS, JS, និងរូបភាពចេញពី Server តែមួយនៅអាមេរិក ជំនួសឱ្យការដាក់លើ CDN សកល នឹងធានាថាវេបសាយរបស់អ្នកនឹងដើរយឺតខ្លាំងទូទាំងពិភពលោក។
+
+## Common Mistakes
+
+- **Edge Latency Paradox៖** ដំណើរការ Query ទៅកាន់ Centralized Database ច្រើនដងចេញពី Edge Function ដែលបង្កើន Latency ឆ្លងទ្វីបទ្វេដង។
+- **ប្រើបណ្ណាល័យ Node.js ធ្ងន់ៗលើ Edge Isolates៖** ព្យាយាម Import Modules ដែលត្រូវការ Node.js `fs` ឬ C++ Addons ចូលទៅក្នុង V8 Isolate Runtime ដែលមិនគាំទ្រ។
+- **ការចងភ្ជាប់ជាប់នឹង Vendor តែមួយ (Vendor Lock-in)៖** សរសេរកូដជាប់ជាមួយ API ផ្តាច់មុខរបស់ Edge Platform ដោយគ្មាន Abstraction Layer ដែលធ្វើឱ្យពិបាកផ្លាស់ប្តូរនៅពេលក្រោយ។

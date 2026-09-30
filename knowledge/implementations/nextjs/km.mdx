@@ -1,0 +1,174 @@
+---
+title: "Next.js"
+question: "តើត្រូវការពារ Server Actions ជាមួយ Idempotency, Request Deadlines, និង Upstash Rate Limiting ក្នុង Next.js ដោយរបៀបណា?"
+summary: "Route Handler Execution Limits, Server Actions ជាមួយ Idempotency, unstable_cache, និង Upstash Redis Rate Limiting ក្នុង Next.js App Router។"
+tags: [nextjs, react, typescript, serveractions, implementation]
+related: [patterns/retry, patterns/idempotency, patterns/caching, patterns/rate-limiting]
+order: 18
+updated: "2026-09-12"
+contributors: [veasna]
+translation: draft
+---
+
+ការអនុវត្ត Patterns ជាក់ស្តែងសម្រាប់ Next.js 15+ App Router។ ផ្តោតលើ Serverless Deadlines, Atomic Idempotency ក្នុង Server Actions, ការគ្រប់គ្រង Cache ជាមួយ unstable_cache, និង Edge Rate Limiting ជាមួយ Upstash Redis។
+
+## Timeouts និង execution deadlines
+
+ក្នុង Route Handlers របស់ Next.js App Router កំណត់រយៈពេលអតិបរមានៃដំណើរការជាមួយ `maxDuration` និងកំណត់ Fetch Timeout តាមរយៈ `AbortSignal`៖
+
+```ts
+// app/api/rates/route.ts
+import { NextResponse } from 'next/server';
+
+export const maxDuration = 5; // អតិបរមា ៥ វិនាទី
+export const dynamic = 'force-dynamic';
+
+export async function GET() {
+  try {
+    const res = await fetch('https://api.example.com/rates', {
+      signal: AbortSignal.timeout(2000), // បោះបង់បើហួស ២ វិនាទី
+      next: { revalidate: 60 }
+    });
+
+    if (!res.ok) {
+      return NextResponse.json({ error: `Upstream HTTP ${res.status}` }, { status: 502 });
+    }
+
+    const data = await res.json();
+    return NextResponse.json(data);
+  } catch (err: any) {
+    if (err.name === 'TimeoutError') {
+      return NextResponse.json({ error: 'Gateway timeout កំពុងទាក់ទង rates API' }, { status: 504 });
+    }
+    return NextResponse.json({ error: 'Internal Server Error' }, { status: 500 });
+  }
+}
+```
+
+## Idempotency ក្នុង Server Actions
+
+ការពារការចុចប៊ូតុង Submit ពីរដង ឬការ Retry ស្ទួនតាមរយៈ Database Transaction ក្នុង Server Action៖
+
+```ts
+// app/actions/orders.ts
+'use server';
+
+import { prisma } from '@/lib/prisma';
+import { revalidatePath } from 'next/cache';
+
+export async function createOrderAction(formData: FormData) {
+  const idempotencyKey = formData.get('idempotencyKey') as string;
+  const customerId = formData.get('customerId') as string;
+  const totalCents = Number(formData.get('totalCents'));
+
+  if (!idempotencyKey) {
+    return { success: false, error: 'ខ្វះ Idempotency Key' };
+  }
+
+  try {
+    const result = await prisma.$transaction(async (tx) => {
+      const existing = await tx.idempotencyRecord.findUnique({
+        where: { key: idempotencyKey }
+      });
+
+      if (existing) {
+        if (existing.response) {
+          return JSON.parse(existing.response);
+        }
+        throw new Error('IN_FLIGHT');
+      }
+
+      await tx.idempotencyRecord.create({
+        data: { key: idempotencyKey }
+      });
+
+      const order = await tx.order.create({
+        data: { customerId, totalCents }
+      });
+
+      const responsePayload = { orderId: order.id, status: 'created' };
+      await tx.idempotencyRecord.update({
+        where: { key: idempotencyKey },
+        data: { response: JSON.stringify(responsePayload) }
+      });
+
+      return responsePayload;
+    });
+
+    revalidatePath('/orders');
+    return { success: true, data: result };
+  } catch (err: any) {
+    if (err.message === 'IN_FLIGHT') {
+      return { success: false, error: 'សំណើកំពុងដំណើរការនៅឡើយ' };
+    }
+    return { success: false, error: 'បរាជ័យក្នុងការបង្កើត Order' };
+  }
+}
+```
+
+## Caching ជាមួយ `unstable_cache`
+
+រក្សាទុកលទ្ធផលនៃការ Query Database ឆ្លងកាត់ Server Components៖
+
+```ts
+import { unstable_cache } from 'next/cache';
+import { prisma } from '@/lib/prisma';
+
+export const getCachedProduct = unstable_cache(
+  async (productId: string) => {
+    return await prisma.product.findUnique({
+      where: { id: productId }
+    });
+  },
+  ['product-details'],
+  {
+    revalidate: 300,   // Cache ៥ នាទី
+    tags: ['products'] // អាច Purge តាមតម្រូវការដោយប្រើ revalidateTag('products')
+  }
+);
+```
+
+## Rate limiting ជាមួយ `@upstash/ratelimit`
+
+គ្រប់គ្រងសំណើនៅលើ Edge ឬ Middleware ឆ្លងកាត់ Serverless Lambdas៖
+
+```ts
+// middleware.ts
+import { NextResponse } from 'next/server';
+import type { NextRequest } from 'next/server';
+import { Ratelimit } from '@upstash/ratelimit';
+import { Redis } from '@upstash/redis';
+
+const ratelimit = new Ratelimit({
+  redis: Redis.fromEnv(),
+  limiter: Ratelimit.slidingWindow(50, '10 s'), // ៥០ សំណើក្នុង ១០ វិនាទី
+  analytics: true,
+});
+
+export async function middleware(request: NextRequest) {
+  if (request.nextUrl.pathname.startsWith('/api/')) {
+    const ip = request.headers.get('x-forwarded-for')?.split(',')[0] ?? '127.0.0.1';
+    const { success, limit, remaining, reset } = await ratelimit.limit(ip);
+
+    if (!success) {
+      return NextResponse.json(
+        { error: 'សំណើច្រើនពេក (Too Many Requests)' },
+        {
+          status: 429,
+          headers: {
+            'X-RateLimit-Limit': limit.toString(),
+            'X-RateLimit-Remaining': remaining.toString(),
+            'X-RateLimit-Reset': reset.toString(),
+          },
+        }
+      );
+    }
+  }
+
+  return NextResponse.next();
+}
+
+export const config = {
+  matcher: '/api/:path*',
+};
+```

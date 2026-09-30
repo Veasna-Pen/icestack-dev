@@ -1,0 +1,179 @@
+---
+title: "Feature Flags"
+question: "How do I decouple software deployment from feature release, test in production, and canary rollout changes?"
+summary: "Wrap new features or architectural changes in dynamic runtime conditional toggles. Deploy inactive code to production safely, test with internal users, roll out to percentages of traffic (canary), and instantly roll back in 0 seconds without redeploying code."
+tags: [devops, feature-flags, canary, continuous-delivery, deployment]
+related: [patterns/circuit-breaker, patterns/strangler-fig, problems/slow-first-request]
+order: 17
+updated: "2026-09-12"
+contributors: [veasna]
+---
+
+## Context
+
+In traditional development workflows, releasing a feature is inextricably tied to deploying code. If a new checkout flow has an unforeseen edge-case bug, rolling it back requires compiling code, passing CI/CD pipelines, baking container images, and executing a rolling deployment—a process taking 15 to 45 minutes during an active outage.
+
+Furthermore, long-lived feature branches sit unmerged for weeks to avoid deploying half-finished code to production, creating massive "merge hell" and painful code conflicts.
+
+**Feature Flags (Feature Toggles)** decouple **deployment** (shipping code to servers) from **release** (exposing behavior to users). By wrapping new code paths in conditional checks evaluated at runtime against user context (e.g. user ID, email domain, percentage cohort), engineers can merge code into `main` multiple times a day (Trunk-Based Development) while keeping the feature dark until ready.
+
+## Symptoms
+
+- Git feature branches remain unmerged for weeks or months, causing catastrophic merge conflicts when attempting to integrate.
+- Releases require late-night "big bang" maintenance windows because rollback requires redeploying older Docker images.
+- Product managers cannot perform gradual canary rollouts (e.g., exposing a new payment UI to 5% of users first to monitor error rates).
+- Beta testing requires maintaining completely separate staging environments that never accurately mirror production data and scale.
+
+<Callout type="warning" title="Stale feature flags become dangerous technical debt">
+If flags are never deleted after reaching 100% rollout, your codebase becomes littered with nested `if/else` conditions that multiply test permutations and confuse future maintainers.
+</Callout>
+
+## Diagnose
+
+1. **Calculate branch lifespan:** What is the average age of open pull requests in your repository? Are branches open longer than 3 days?
+2. **Measure rollback MTTR:** If a bug is discovered in production right now, how many minutes does it take to revert the deployment?
+3. **Audit staging parity:** Do bugs frequently slip into production because staging does not have realistic production data or third-party integrations?
+4. **Evaluate user targeting capability:** Can your team enable a new feature for internal `@mycompany.com` employees without showing it to external customers?
+
+## Options
+
+1. **Environment variables / ConfigMaps:** Simple boolean flags set in `.env` or Kubernetes ConfigMaps. (Requires pod restarts to update, lacks user-level targeting).
+2. **Database-backed flag table:** Store flag keys and status in PostgreSQL or Redis. (Enables dynamic updates, but direct DB reads add latency to every HTTP request).
+3. **In-memory cached flag client with polling/streaming (LaunchDarkly, Unleash, Flipt):** Flag rules are evaluated locally in memory in < 1 microsecond. Updates are streamed or polled in the background via Server-Sent Events.
+4. **Percentage-based deterministic hashing:** Hash the user's ID with the flag key (`crc32(userId + flagKey) % 100 < percentage`) to ensure consistent user cohort assignments without tracking state.
+
+## Trade-offs
+
+| Implementation | Update Latency | User Targeting | Evaluation Speed | Operational Overhead |
+| :--- | :--- | :--- | :--- | :--- |
+| **Env Variables** | Slow (requires restart) | None (all or nothing) | Instant (process memory) | Lowest |
+| **Database Table** | Instant | Supported | Slow (adds DB query per call) | Low |
+| **Edge / In-Memory SDK** | Instant (< 2 seconds) | Rich (cohorts, percentages) | Ultra-fast (< 1 µs) | Moderate |
+| **Client-Side Storage** | Slow (client refresh) | Local only | Instant | Low |
+
+## Decision
+
+- **Evaluate flags locally in memory:** Never execute a database query or remote HTTP call during request execution to check a flag. Keep flag rules cached in memory and sync in the background.
+- **Use deterministic hashing for percentage rollouts:** Always hash `userId + flagKey` modulo 100. This guarantees that user #1234 stays in the 10% canary bucket across multiple requests and device switches without needing sticky sessions.
+- **Enforce a strict Flag Lifecycle:** Treat feature flags as temporary scaffolding. Schedule a cleanup PR to remove the flag and dead `if/else` code within 2 weeks of reaching 100% rollout.
+- **Use kill switches for high-risk dependencies:** Wrap high-load or experimental integrations (e.g. a new AI recommendation engine or third-party fraud check) in an operational kill switch to instantly disable it if latency spikes.
+
+## Implementation
+
+### Production-grade In-Memory Feature Flag Evaluator in TypeScript:
+
+```typescript
+import { createHash } from 'crypto';
+
+export interface UserContext {
+  id: string;
+  email?: string;
+  country?: string;
+}
+
+export interface FeatureFlagConfig {
+  enabled: boolean;
+  percentage?: number; // 0 to 100
+  allowedEmails?: string[];
+  allowedCountries?: string[];
+}
+
+export class FeatureFlagManager {
+  private flags = new Map<string, FeatureFlagConfig>();
+
+  // Update flags dynamically in background without restarting app
+  updateFlags(newConfigs: Record<string, FeatureFlagConfig>) {
+    for (const [key, val] of Object.entries(newConfigs)) {
+      this.flags.set(key, val);
+    }
+  }
+
+  /**
+   * Evaluates whether a flag is active for a given user in < 1 microsecond.
+   */
+  isEnabled(flagKey: string, user?: UserContext): boolean {
+    const flag = this.flags.get(flagKey);
+    if (!flag || !flag.enabled) return false;
+
+    // 1. Target specific user email domains (e.g. internal dogfooding)
+    if (user?.email && flag.allowedEmails) {
+      if (flag.allowedEmails.some((allowed) => user.email!.endsWith(allowed))) {
+        return true;
+      }
+    }
+
+    // 2. Target specific geographical regions
+    if (user?.country && flag.allowedCountries) {
+      if (!flag.allowedCountries.includes(user.country)) {
+        return false;
+      }
+    }
+
+    // 3. Percentage-based rollout with deterministic hashing
+    if (flag.percentage !== undefined && user?.id) {
+      const hash = createHash('md5').update(`${flagKey}:${user.id}`).digest('hex');
+      const hashInt = parseInt(hash.substring(0, 8), 16);
+      const userBucket = hashInt % 100; // 0 to 99
+      return userBucket < flag.percentage;
+    }
+
+    // Global toggle fallback
+    return flag.enabled;
+  }
+}
+```
+
+### Usage in an Express route:
+
+```typescript
+export const flagManager = new FeatureFlagManager();
+
+// Seed flags (or update via Redis PubSub / SSE)
+flagManager.updateFlags({
+  'new-checkout-v2': {
+    enabled: true,
+    percentage: 10, // 10% canary release
+    allowedEmails: ['@mycompany.com'], // Always enabled for internal staff
+  },
+});
+
+export async function handleCheckout(req: any, res: any) {
+  const user: UserContext = {
+    id: req.user.id,
+    email: req.user.email,
+    country: req.user.country,
+  };
+
+  if (flagManager.isEnabled('new-checkout-v2', user)) {
+    // New optimized payment service
+    return await renderModernCheckout(req, res);
+  }
+
+  // Battle-tested legacy fallback
+  return await renderLegacyCheckout(req, res);
+}
+```
+
+## Verification
+
+1. **Deterministic canary verification:** Test the same `userId` 100 times. Verify that `isEnabled()` returns the exact same boolean every single time.
+2. **Cohort distribution test:** Evaluate 10,000 generated user IDs with `percentage: 10`. Verify that between 950 and 1,050 users (approx. 10% ± 0.5%) evaluate to `true`.
+3. **Internal whitelist test:** Verify that a user with `user@mycompany.com` evaluates to `true` even if `percentage: 0`.
+4. **Instant kill-switch benchmark:** Flip a flag to `enabled: false`. Verify that subsequent requests execute the legacy code path in < 1 second without restarting or redeploying the web service.
+
+## Why
+
+The safest way to deliver software is in small, frequent increments. But shipping increments directly to all users creates unacceptable business risk.
+
+Feature Flags decouple the technical act of deploying code from the business decision of releasing functionality. They eliminate the fear of deploying to production, turn multi-week release cycles into continuous delivery, and provide engineering teams with a literal 0-second kill switch when production anomalies occur.
+
+## When Not To Use
+
+- **Core database structural migrations:** You cannot easily feature-flag dropping a non-null SQL column. Database migrations require multi-phase expand/contract patterns instead.
+- **Trivial UI styling changes:** Wrapping a minor button color change in a feature flag adds unnecessary plumbing and clutter.
+
+## Common Mistakes
+
+- **Zombie flags:** Leaving flags in the codebase for months after reaching 100% rollout, creating confusing spaghetti code and unmaintained execution branches.
+- **Remote network calls inside request path:** Making an HTTP request to a third-party flag service on every inbound API call adds 50 ms of latency and creates a critical single point of failure.
+- **Untested permutations:** Failing to test both the `flag=true` and `flag=false` execution paths in automated CI suites before deploying.

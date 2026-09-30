@@ -1,0 +1,91 @@
+---
+title: "Too many small queries: N+1"
+summary: "Recognise the loop that turns one page into hundreds of queries, and replace it with one or two."
+minutes: 12
+related: [problems/n-plus-one-queries]
+updated: "2026-09-29"
+contributors: [Veasna-Pen]
+---
+
+## The problem
+
+An API endpoint lists the 50 most recent orders with the customer's name. It took 15 ms on your laptop with 3 test orders. In production it takes **1,400 ms**. Every query in the logs is fast. So where does the time go?
+
+The logs show **51 queries** for a single request.
+
+## The idea
+
+This is the **N+1 query problem**: **1** query loads a list, then **N** more queries load something for each item in the list, one at a time.
+
+```text
+SELECT * FROM orders ORDER BY created_at DESC LIMIT 50;   -- 1 query
+SELECT * FROM customers WHERE id = 7;                     -- then one per order...
+SELECT * FROM customers WHERE id = 12;
+...                                                       -- 50 times
+```
+
+Each query is fast, but each one is a **round trip** over the network, often 1 to 2 ms before the database even starts. Fifty round trips add up, and the cost grows with the size of the list.
+
+It usually hides inside a loop, or inside an ORM that loads a relation **lazily**: the first time you touch `order.customer`, it runs a query.
+
+The fix is to load the related data **for the whole list at once**:
+
+- **Eager loading**: tell the ORM to fetch the relation with the list (`include`, `with`, `relations`).
+- **One batch query**: collect the IDs and run a single `WHERE id IN (...)`.
+
+## Example
+
+The N+1 version, in TypeScript with Prisma:
+
+```ts
+const orders = await prisma.order.findMany({ take: 50, orderBy: { createdAt: 'desc' } });
+for (const order of orders) {
+  order.customer = await prisma.customer.findUnique({ where: { id: order.customerId } }); // runs 50 times
+}
+```
+
+The fixed version asks for the customers together with the orders:
+
+```ts
+const orders = await prisma.order.findMany({
+  take: 50,
+  orderBy: { createdAt: 'desc' },
+  include: { customer: true } // one extra query for all 50 customers
+});
+```
+
+**51 queries become 2**, and the endpoint drops from 1,400 ms to about 30 ms. Other ORMs have the same switch: `with('customer')` in Laravel, `select_related` / `prefetch_related` in Django, `relations` in TypeORM.
+
+## Try it
+
+1. Turn on query logging in development, for example `DEBUG="prisma:query"`, `DB::enableQueryLog()` in Laravel, or `log_statement = 'all'` in PostgreSQL.
+2. Call a list endpoint once and count the queries.
+3. If the count grows with the number of items, find the loop or the lazy relation that causes it.
+4. Switch it to eager loading and count again. The number should no longer depend on the list size.
+
+## Check yourself
+
+**1. A page shows 20 posts, each with its author and its tags. With lazy loading, how many queries run?**
+
+<Answer>
+1 for the posts, plus 20 for authors and 20 for tags: 41 in total. With eager loading of both relations it becomes about 3.
+</Answer>
+
+**2. Every query in the log takes under 1 ms, yet the request takes a second. Why can N+1 still be the cause?**
+
+<Answer>
+The time is in the round trips and per-query overhead, not in the query itself. Hundreds of 1 to 2 ms round trips add up to a second, and they all hold a database connection while they run.
+</Answer>
+
+**3. How can you catch N+1 before it reaches production?**
+
+<Answer>
+Count queries per request in development or in tests, and fail a test when an endpoint's query count grows with the size of the data. Testing with realistic amounts of data also makes it visible.
+</Answer>
+
+## Key takeaways
+
+- **N+1** is one query for a list, then one more for every item.
+- Each query is fast; the **number of round trips** is what hurts.
+- Fix it with **eager loading** or one `WHERE id IN (...)` batch query.
+- Watch the **query count per request**, not just the slowest query.

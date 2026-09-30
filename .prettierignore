@@ -1,0 +1,10 @@
+node_modules
+dist
+package-lock.json
+
+# Content is authored by contributors. Prettier's MDX support targets MDX 1 and can rewrite MDX 3 syntax.
+knowledge
+courses
+
+# Tailwind config and the pre-paint theme script are inline; keep them hand-formatted.
+index.html

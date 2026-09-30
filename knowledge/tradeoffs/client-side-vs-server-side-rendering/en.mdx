@@ -1,0 +1,154 @@
+---
+title: "CSR vs SSR"
+question: "When should web applications use Client-Side Rendering (SPAs) versus Server-Side Rendering (SSR / SSG)?"
+summary: "Client-Side Rendering (React/Vue SPAs) offloads rendering to user browsers, offering instant screen transitions and zero server rendering CPU for private web apps. Server-Side Rendering (Next.js/Nuxt) renders HTML on the server, delivering optimal SEO, social previews, and instant First Contentful Paint (FCP) for public web applications."
+tags: [frontend, architecture, ssr, csr, react, performance, web]
+related: [tradeoffs/serverless-vs-containers, patterns/caching, problems/slow-first-request]
+order: 16
+updated: "2026-09-12"
+contributors: [veasna]
+---
+
+## Context
+
+In modern web development, rendering user interfaces can happen in two primary locations:
+1. **Client-Side Rendering (CSR / SPA):** The server returns a bare HTML shell (`<div id="root"></div>`) and a large JavaScript bundle. The user's browser downloads the JS, parses it, executes it, fetches JSON from the API, and renders DOM elements locally in browser memory.
+2. **Server-Side Rendering (SSR / Streaming SSR):** The server fetches the data and renders the complete HTML string containing actual content before sending it over the network. The user sees text and images immediately upon receipt, followed by "hydration" where client JavaScript attaches event listeners.
+3. **Static Site Generation (SSG):** HTML is pre-rendered once at build time and cached globally on a CDN edge.
+
+Picking the wrong rendering strategy results in either invisible content for search engines and slow mobile initial loads (CSR misapplied to public marketing/e-commerce) or excessive server compute bills and complex hydration bugs (SSR misapplied to private SaaS dashboards).
+
+## Symptoms
+
+- **CSR Failure Mode:** Google, Facebook, and Twitter crawlers index empty pages or fail to generate social share previews; mobile users on 3G cellular connections stare at a blank white screen for 4 seconds while downloading a 3 MB JavaScript bundle.
+- **SSR Failure Mode:** The backend server CPU saturates rendering React component trees under load; users experience "rage clicks" because buttons are visible but unclickable while waiting for hydration; server hosting costs explode.
+
+<Callout type="warning" title="Public content requires SSR or SSG; private dashboards thrive on CSR">
+If content must rank on Google Search or show rich link previews on messaging apps, pure CSR is a fatal business mistake. If content is behind a login screen, SSR adds unnecessary server rendering CPU and hydration complexity.
+</Callout>
+
+## Diagnose
+
+1. **Audit SEO and crawler requirements:** Does organic search traffic directly drive company revenue (e.g. e-commerce, blogs, public documentation)?
+2. **Measure First Contentful Paint (FCP):** Open Chrome DevTools Lighthouse on a 4G mobile profile. Does FCP exceed 2.5 seconds due to large JavaScript bundle execution?
+3. **Evaluate authentication gate:** Is 100% of the UI hidden behind an email/password login screen (e.g. Jira, Figma, internal admin tools)?
+4. **Inspect server compute budget:** Can your backend afford rendering 10,000 React HTML component trees per second, or should compute be offloaded to client laptops and phones?
+
+## Options
+
+1. **Pure Client-Side SPA (Vite + React / Vue / Svelte):** Static HTML hosted on S3/Cloudflare Pages. Zero server runtime cost. (Fast post-load navigation, poor SEO/initial load).
+2. **Server-Side Rendering (Next.js / Nuxt / Remix):** Dynamic HTML rendered per request on Node.js/Edge runtimes. (Instant initial paint, great SEO, higher server load).
+3. **Static Site Generation (SSG / Astro / Next.js export):** Pre-rendered HTML cached on CDN edge. (Fastest possible initial load, zero server CPU, difficult for dynamic real-time user data).
+4. **Hybrid / Island Architecture (Astro):** Server-rendered static HTML with isolated, hydrated interactive "islands" only where needed.
+
+## Trade-offs
+
+| Dimension | Client-Side Rendering (CSR) | Server-Side Rendering (SSR) | Static Site Generation (SSG) |
+| :--- | :--- | :--- | :--- |
+| **First Contentful Paint (FCP)** | Slow (waits for JS download) | **Fast (immediate HTML paint)** | **Fastest (pre-cached HTML)** |
+| **SEO & Social Previews** | Poor / Unreliable | **Perfect (full HTML delivered)** | **Perfect** |
+| **Subsequent Page Transitions** | **Instant (client-side router)** | Fast (prefetches JSON) | Fast |
+| **Server Compute Cost** | **Zero (static files on CDN)** | High (Node.js renders per req) | Zero |
+| **Build Time** | Fast (single bundle) | Fast | Slow (scales with page count) |
+| **Data Freshness** | Always real-time | Always real-time | Stale until rebuild/ISR |
+
+## Decision
+
+- **Use Server-Side Rendering (SSR) or SSG for:**
+  - E-commerce stores (product listings, category pages, reviews).
+  - Marketing landing pages, corporate blogs, documentation portals.
+  - Social media platforms and news publications where link previews on Twitter, LinkedIn, and WhatsApp are vital.
+- **Use Client-Side Rendering (CSR / SPA) for:**
+  - Authenticated SaaS dashboards (Stripe Dashboard, Jira, Google Analytics).
+  - High-interaction web applications (Canva, Figma, video editors, web spreadsheets).
+  - Internal employee portals where SEO is completely irrelevant and hosting on free static object storage saves money.
+- **Adopt Incremental Static Regeneration (ISR):** For large e-commerce sites (100,000 products), use SSG with ISR to statically cache product pages and regenerate them in the background only when requested after TTL expires.
+
+## Implementation
+
+### 1. Modern SSR Route with Next.js App Router (Streaming HTML):
+
+```tsx
+// app/products/[id]/page.tsx - Server Component
+import { Suspense } from 'react';
+
+// Runs entirely on the server! Database secrets and tokens never leak to client
+async function ProductDetails({ id }: { id: string }) {
+  const res = await fetch(`https://api.internal/products/${id}`, { next: { revalidate: 60 } });
+  const product = await res.json();
+
+  return (
+    <div className="product-card">
+      <h1>{product.title}</h1>
+      <p className="price">${(product.priceCents / 100).toFixed(2)}</p>
+      <p>{product.description}</p>
+    </div>
+  );
+}
+
+export default async function Page({ params }: { params: { id: string } }) {
+  return (
+    <main>
+      {/* Search engines immediately receive product HTML; client hydrates interactive cart */}
+      <Suspense fallback={<p>Loading product details...</p>}>
+        <ProductDetails id={params.id} />
+      </Suspense>
+    </main>
+  );
+}
+```
+
+### 2. Client-Side SPA (Vite + React) with Client-Side Fetching:
+
+```tsx
+// Pure CSR: Fast, zero-server-cost dashboard widget
+import { useEffect, useState } from 'react';
+
+export function UserDashboard() {
+  const [stats, setStats] = useState<any>(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    fetch('/api/user/stats')
+      .then((res) => res.json())
+      .then((data) => {
+        setStats(data);
+        setLoading(false);
+      });
+  }, []);
+
+  if (loading) return <div>Loading dashboard...</div>;
+
+  return (
+    <div className="dashboard-grid">
+      <h2>Welcome back, {stats.name}!</h2>
+      <p>Active projects: {stats.activeProjects}</p>
+    </div>
+  );
+}
+```
+
+## Verification
+
+1. **Search engine preview test:** Fetch your public URL using `curl -A "Googlebot" https://mywebsite.com/product/123`. Verify that product title, price, and meta description are present in the raw HTTP response.
+2. **Social share card verification:** Test public links on the Twitter Card Validator or Facebook Sharing Debugger. Confirm that OpenGraph images and descriptions render instantly.
+3. **Core Web Vitals audit:** Measure Largest Contentful Paint (LCP) and First Input Delay (FID) on mobile devices using Google PageSpeed Insights. SSR/SSG should score > 90.
+
+## Why
+
+Web browsers are document viewers that learned how to execute applications.
+- **SSR treats the web as documents first:** It prioritizes the initial transfer of text and media, ensuring that human eyes and web crawlers consume information without waiting for complex JavaScript runtimes to initialize.
+- **CSR treats the web as an application runtime:** It trades the initial download cost for instantaneous, desktop-like interactivity once the application shell has loaded.
+
+Aligning rendering architecture with the public versus private nature of your content is the single most critical decision in modern web performance.
+
+## When Not To Use
+
+- **SSR for an offline-first mobile web app:** If your app must function without internet connectivity using Service Workers, SSR server dependencies will break offline capability; use a client-side PWA.
+- **CSR for news publications:** Delivering news articles as blank HTML shells that require 3 MB of JavaScript to read will destroy organic search ranking and bounce mobile readers.
+
+## Common Mistakes
+
+- **Hydration mismatches in SSR:** Rendering dates using client timezones (`new Date().toLocaleTimeString()`) causing the server HTML and client DOM to differ, triggering React hydration warnings.
+- **Massive client bundles in CSR:** Failing to use code-splitting (`React.lazy()` / dynamic imports), forcing users on mobile devices to download 5 MB of administrative code to view a single screen.
+- **Running SSR without edge caching:** Re-rendering identical public pages on every single HTTP request on an expensive Node.js server instead of caching the HTML response on a CDN edge.

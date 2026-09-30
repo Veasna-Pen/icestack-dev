@@ -1,0 +1,207 @@
+---
+title: "Actix-web (Rust)"
+question: "How do I implement timeouts, connection pooling, idempotency, and rate limiting in Actix-web?"
+summary: "Tokio timeouts, SQLx connection pooling, atomic idempotency transactions, and actix-governor rate limiting in high-throughput Rust."
+tags: [actix-web, rust, tokio, sqlx, implementation]
+related: [patterns/retry, patterns/idempotency, patterns/caching, patterns/rate-limiting]
+order: 19
+updated: "2026-09-12"
+contributors: [veasna]
+---
+
+Production resilience patterns for Actix-web 4+ and Rust 1.78+. Focuses on zero-cost async abstractions using Tokio, SQLx connection pool management, atomic transaction idempotency, and high-throughput governor rate limiting.
+
+## Timeouts first
+
+In Actix-web, wrap outbound network futures with Tokio's cancel-safe `tokio::time::timeout`:
+
+```rust
+use actix_web::{get, web, HttpResponse, Responder};
+use std::time::Duration;
+
+#[get("/rates")]
+async fn get_rates(client: web::Data<reqwest::Client>) -> impl Responder {
+    let request_fut = client
+        .get("https://api.example.com/rates")
+        .send();
+
+    // Enforce 2-second timeout on outbound HTTP call
+    match tokio::time::timeout(Duration::from_secs(2), request_fut).await {
+        Ok(Ok(response)) => {
+            if response.status().is_success() {
+                match response.text().await {
+                    Ok(body) => HttpResponse::Ok().content_type("application/json").body(body),
+                    Err(_) => HttpResponse::BadGateway().json(serde_json::json!({"error": "Failed reading body"})),
+                }
+            } else {
+                HttpResponse::BadGateway().json(serde_json::json!({"error": "Upstream error"}))
+            }
+        }
+        Ok(Err(_)) => HttpResponse::BadGateway().json(serde_json::json!({"error": "Connection failed"})),
+        Err(_) => HttpResponse::GatewayTimeout().json(serde_json::json!({"error": "Rates service timed out"})),
+    }
+}
+```
+
+## Database connection pool (SQLx PgPool)
+
+Configure connection limits, idle timeouts, and statement timeouts on the PostgreSQL pool:
+
+```rust
+use sqlx::postgres::PgPoolOptions;
+use sqlx::PgPool;
+use std::time::Duration;
+
+pub async fn create_db_pool(database_url: &str) -> Result<PgPool, sqlx::Error> {
+    PgPoolOptions::new()
+        .max_connections(30)
+        .min_connections(5)
+        .acquire_timeout(Duration::from_secs(3))
+        .idle_timeout(Duration::from_secs(600))
+        .max_lifetime(Duration::from_secs(1800))
+        .after_connect(|conn, _meta| {
+            Box::pin(async move {
+                // Set statement timeout for every new connection
+                sqlx::query("SET statement_timeout = '5000ms'")
+                    .execute(conn)
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect(database_url)
+        .await
+}
+```
+
+## Idempotency keys with SQLx transactions
+
+Use an atomic SQL transaction with row-level locks or conflict targets:
+
+```rust
+use actix_web::{post, web, HttpRequest, HttpResponse, Responder};
+use sqlx::PgPool;
+use serde::{Deserialize, Serialize};
+
+#[derive(Deserialize)]
+struct OrderPayload {
+    customer_id: String,
+    total_cents: i64,
+}
+
+#[derive(Serialize)]
+struct OrderResponse {
+    order_id: i64,
+    status: &'static str,
+}
+
+#[post("/orders")]
+async fn create_order(
+    req: HttpRequest,
+    pool: web::Data<PgPool>,
+    body: web::Json<OrderPayload>,
+) -> impl Responder {
+    let key = match req.headers().get("Idempotency-Key").and_then(|h| h.to_str().ok()) {
+        Some(k) if !k.trim().is_empty() => k,
+        _ => return HttpResponse::BadRequest().json(serde_json::json!({"error": "Missing Idempotency-Key"})),
+    };
+
+    let mut tx = match pool.begin().await {
+        Ok(t) => t,
+        Err(_) => return HttpResponse::InternalServerError().finish(),
+    };
+
+    // Attempt to claim key
+    let claim_res = sqlx::query!(
+        r#"INSERT INTO idempotency_keys (key) VALUES ($1) ON CONFLICT DO NOTHING RETURNING key"#,
+        key
+    )
+    .fetch_optional(&mut *tx)
+    .await;
+
+    match claim_res {
+        Ok(None) => {
+            // Key already exists, fetch previous result
+            let existing = sqlx::query!(
+                r#"SELECT response FROM idempotency_keys WHERE key = $1"#,
+                key
+            )
+            .fetch_one(&mut *tx)
+            .await;
+
+            let _ = tx.rollback().await;
+            if let Ok(record) = existing {
+                if let Some(resp) = record.response {
+                    return HttpResponse::Ok().content_type("application/json").body(resp);
+                }
+            }
+            HttpResponse::Conflict().json(serde_json::json!({"error": "Request already in progress"}))
+        }
+        Ok(Some(_)) => {
+            // Insert order
+            let order_record = sqlx::query!(
+                r#"INSERT INTO orders (customer_id, total_cents) VALUES ($1, $2) RETURNING id"#,
+                body.customer_id,
+                body.total_cents
+            )
+            .fetch_one(&mut *tx)
+            .await;
+
+            let order = match order_record {
+                Ok(r) => r,
+                Err(_) => {
+                    let _ = tx.rollback().await;
+                    return HttpResponse::InternalServerError().finish();
+                }
+            };
+
+            let response_data = serde_json::to_string(&OrderResponse {
+                order_id: order.id,
+                status: "created",
+            }).unwrap();
+
+            let _ = sqlx::query!(
+                r#"UPDATE idempotency_keys SET response = $1 WHERE key = $2"#,
+                response_data,
+                key
+            )
+            .execute(&mut *tx)
+            .await;
+
+            if tx.commit().await.is_ok() {
+                HttpResponse::Created().content_type("application/json").body(response_data)
+            } else {
+                HttpResponse::InternalServerError().finish()
+            }
+        }
+        Err(_) => HttpResponse::InternalServerError().finish(),
+    }
+}
+```
+
+## Rate limiting with `actix-governor`
+
+Protect routes against Denial of Service using in-memory token-bucket limiters:
+
+```rust
+use actix_governor::{Governor, GovernorConfigBuilder};
+use actix_web::{web, App, HttpServer};
+
+#[actix_web::main]
+async fn main() -> std::io::Result<()> {
+    // Allow burst of 20 requests, refilling 10 tokens per second
+    let governor_conf = GovernorConfigBuilder::default()
+        .per_millisecond(100)
+        .burst_size(20)
+        .finish()
+        .unwrap();
+
+    HttpServer::new(move || {
+        App::new()
+            .wrap(Governor::new(&governor_conf))
+            .service(get_rates)
+    })
+    .bind(("0.0.0.0", 8080))?
+    .run()
+    .await
+}
+```

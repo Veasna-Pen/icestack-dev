@@ -1,10 +1,8 @@
 import { COURSE_INDEX } from 'virtual:course-index';
 import type { Course, Language, Lesson, LessonIdentity, MdxLoader, Resolved } from '../types';
-import { DEFAULT_LESSON_MINUTES, isCourseLevel } from '../constants/courses';
+import { COURSE_PATH_PATTERN, DEFAULT_LESSON_MINUTES, isCourseLevel } from '../constants/courses';
 import { asDate, asNumber, asString, asStrings, asTranslation } from '../utils/frontmatter';
 import { resolveRef } from './knowledgeService';
-
-const PATH_PATTERN = /^courses\/([a-z0-9-]+)\/(?:(\d+)-([a-z0-9-]+)\/)?(en|km)\.mdx$/;
 
 // Keep this lazy glob the only import of these files; metadata comes from `virtual:course-index`.
 const loaders = import.meta.glob('/courses/**/*.mdx') as Record<string, MdxLoader>;
@@ -19,7 +17,7 @@ const warn = (message: string): void => {
 };
 
 for (const { sourcePath, frontmatter: fm } of COURSE_INDEX) {
-  const match = sourcePath.match(PATH_PATTERN);
+  const match = sourcePath.match(COURSE_PATH_PATTERN);
   const load = loaders['/' + sourcePath];
   if (!match || !load) {
     warn(

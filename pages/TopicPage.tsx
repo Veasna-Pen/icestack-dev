@@ -13,7 +13,8 @@ import TranslationNotice from '../components/layout/TranslationNotice';
 import type { AiContext, CollectionId } from '../types';
 import { resolveTopic, listTopics, getRelatedTopics, topicRef } from '../services/knowledgeService';
 import { useLanguageParam } from '../hooks/useLanguage';
-import { pageTitle, useDocumentTitle } from '../hooks/useDocumentTitle';
+import { pageTitle } from '../utils/seo';
+import { usePageMeta } from '../hooks/usePageMeta';
 import { useMdxContent } from '../hooks/useMdxContent';
 import { useOutline } from '../hooks/useOutline';
 import { collectionUrl, topicUrl } from '../utils/routes';
@@ -47,7 +48,13 @@ const TopicPage: React.FC<TopicPageProps> = ({
   // Keyed on the loaded component: headings exist only once the page's chunk has rendered.
   const { entries, activeId } = useOutline(contentRef, Content);
 
-  useDocumentTitle(topic && pageTitle(topic.title));
+  usePageMeta(
+    topic && {
+      title: pageTitle(topic.title),
+      description: topic.summary || topic.question,
+      path: topicUrl(topic.lang, topic)
+    }
+  );
 
   useEffect(() => {
     if (topic) onContextChange({ kind: 'topic', title: topic.title, collection });

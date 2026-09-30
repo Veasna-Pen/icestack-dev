@@ -5,7 +5,9 @@ import CourseCard from '../components/courses/CourseCard';
 import LessonFormat from '../components/courses/LessonFormat';
 import { listCourses } from '../services/courseService';
 import { useLanguageParam } from '../hooks/useLanguage';
-import { pageTitle, useDocumentTitle } from '../hooks/useDocumentTitle';
+import { pageTitle } from '../utils/seo';
+import { usePageMeta } from '../hooks/usePageMeta';
+import { coursesUrl } from '../utils/routes';
 import { useT } from '../hooks/useT';
 import { LESSON_TEMPLATE_URL } from '../utils/site';
 import { buttonSecondary, container, gridGap, pageY, radius, sectionGap } from '../utils/ui';
@@ -14,7 +16,7 @@ const CoursesPage: React.FC = () => {
   const lang = useLanguageParam();
   const t = useT(lang);
 
-  useDocumentTitle(pageTitle(t('nav.courses')));
+  usePageMeta({ title: pageTitle(t('nav.courses')), description: t('courses.lead'), path: coursesUrl(lang) });
 
   return (
     <main className={`${container} ${pageY}`}>

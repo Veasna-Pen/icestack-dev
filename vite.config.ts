@@ -8,6 +8,7 @@ import remarkMdxFrontmatter from 'remark-mdx-frontmatter';
 import rehypeShiki from '@shikijs/rehype';
 import { fenceLanguages } from './build/fenceLanguages';
 import { courseIndexPlugin, knowledgeIndexPlugin } from './build/contentIndexPlugin';
+import { seoPlugin } from './build/seoPlugin';
 import { CODE_THEME, PLAIN_LANGUAGE } from './constants/code';
 import { dropThemeBackground } from './utils/code';
 
@@ -41,7 +42,8 @@ export default defineConfig({
     },
     react(),
     knowledgeIndexPlugin(),
-    courseIndexPlugin()
+    courseIndexPlugin(),
+    seoPlugin()
   ],
   resolve: {
     alias: {

@@ -6,7 +6,9 @@ import RoadmapStageList from '../components/roadmaps/RoadmapStageList';
 import type { RoadmapId } from '../types';
 import { ROADMAPS, getRoadmap } from '../constants/roadmaps';
 import { useLanguageParam } from '../hooks/useLanguage';
-import { pageTitle, useDocumentTitle } from '../hooks/useDocumentTitle';
+import { pageTitle } from '../utils/seo';
+import { usePageMeta } from '../hooks/usePageMeta';
+import { roadmapUrl } from '../utils/routes';
 import { useRoadmapProgress } from '../hooks/useRoadmapProgress';
 import { useT } from '../hooks/useT';
 import { roadmapKey } from '../utils/i18n';
@@ -22,7 +24,11 @@ const RoadmapPage: React.FC<RoadmapPageProps> = ({ roadmapId }) => {
   const roadmap = getRoadmap(roadmapId);
   const { done, toggle } = useRoadmapProgress(roadmapId);
 
-  useDocumentTitle(pageTitle(t(roadmapKey(roadmapId, 'label'))));
+  usePageMeta({
+    title: pageTitle(t(roadmapKey(roadmapId, 'label'))),
+    description: t(roadmapKey(roadmapId, 'summary')),
+    path: roadmapUrl(lang, roadmapId)
+  });
 
   return (
     <main className={`${container} ${pageY}`}>

@@ -13,7 +13,8 @@ import type { AiContext, Topic } from '../types';
 import { listLessons, resolveCourse, resolveLesson } from '../services/courseService';
 import { resolveRef } from '../services/knowledgeService';
 import { useCourseProgress } from '../hooks/useCourseProgress';
-import { pageTitle, useDocumentTitle } from '../hooks/useDocumentTitle';
+import { pageTitle } from '../utils/seo';
+import { usePageMeta } from '../hooks/usePageMeta';
 import { useLanguageParam } from '../hooks/useLanguage';
 import { useMdxContent } from '../hooks/useMdxContent';
 import { scrollToHashSoon } from '../utils/dom';
@@ -41,7 +42,14 @@ const LessonPage: React.FC<LessonPageProps> = ({ isSidebarOpen, onCloseSidebar, 
   );
   const Content = useMdxContent(lesson?.load);
 
-  useDocumentTitle(lesson && course && pageTitle(`${lesson.title} · ${course.title}`));
+  usePageMeta(
+    lesson &&
+      course && {
+        title: pageTitle(`${lesson.title} · ${course.title}`),
+        description: lesson.summary,
+        path: lessonUrl(lesson.lang, lesson)
+      }
+  );
 
   useEffect(() => {
     if (lesson && course) onContextChange({ kind: 'lesson', title: lesson.title, collection: course.title });

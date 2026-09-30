@@ -1,9 +1,7 @@
 import { KNOWLEDGE_INDEX } from 'virtual:knowledge-index';
 import type { CollectionId, Language, ResolvedTopic, Topic, TopicIdentity, TopicLoader } from '../types';
-import { COLLECTION_IDS, isCollectionId } from '../constants/collections';
+import { COLLECTION_IDS, KNOWLEDGE_PATH_PATTERN, isCollectionId } from '../constants/collections';
 import { asDate, asNumber, asString, asStrings, asTranslation } from '../utils/frontmatter';
-
-const PATH_PATTERN = /^knowledge\/([^/]+)\/([^/]+)\/(en|km)\.mdx$/;
 
 // Keep this lazy glob the only import of `.mdx` files: an eager one merges every page into the entry chunk.
 const loaders = import.meta.glob('/knowledge/**/*.mdx') as Record<string, TopicLoader>;
@@ -11,7 +9,7 @@ const loaders = import.meta.glob('/knowledge/**/*.mdx') as Record<string, TopicL
 const topicsByRef = new Map<string, Partial<Record<Language, Topic>>>();
 
 for (const { sourcePath, frontmatter: fm } of KNOWLEDGE_INDEX) {
-  const match = sourcePath.match(PATH_PATTERN);
+  const match = sourcePath.match(KNOWLEDGE_PATH_PATTERN);
   const load = loaders['/' + sourcePath];
   if (!match || !isCollectionId(match[1]) || !load) {
     if (import.meta.env.DEV) {

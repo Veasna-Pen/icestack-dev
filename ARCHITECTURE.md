@@ -61,10 +61,14 @@ npm run build
 
 CI runs all three on every pull request. There is no test runner yet.
 
+## SEO
+
+The site renders in the browser, so the build writes the head each page needs for crawlers and link previews. After the bundle is written, `build/seoPlugin.ts` takes the page list from `build/sitePages.ts` (every route in both languages, from frontmatter and the locale files) and writes `dist/<route>.html` with its own title, description, canonical URL, hreflang alternates, Open Graph tags and JSON-LD, plus `sitemap.xml` and `robots.txt`. A Khmer URL whose page has no `km.mdx` is canonical to the English page and is not in the sitemap. In the browser, `hooks/usePageMeta.ts` updates the same tags on every navigation. The domain is `SITE_URL` in `constants/site.ts`: `https://icestack.dev`, without www. `vercel.json` redirects `www.icestack.dev` to it permanently (308, path kept), so search engines see one copy of each page.
+
 ## Deployment
 
 The site is hosted on Vercel and deployed from GitHub Actions, not from Vercel's own Git integration (`vercel.json` turns that off, so nothing deploys twice). In `.github/workflows/ci.yml`, the `deploy` job runs only after `check` passes: a push to `main` deploys to production, and a pull request from a branch in this repository gets a preview deployment whose URL appears on the PR. Pull requests from forks are checked but not deployed, because they have no access to secrets.
 
-`vercel.json` rewrites every path except `/assets/*` to `index.html` (client-side routing; a missing chunk stays a 404 instead of returning HTML) and caches the hashed files in `/assets/` for a year.
+`vercel.json` turns on `cleanUrls`, so each pre-rendered `<route>.html` (see SEO) is served at its extensionless URL, rewrites every other path except `/assets/*` to `index.html` (client-side routing; a missing chunk stays a 404 instead of returning HTML) and caches the hashed files in `/assets/` for a year.
 
 The workflow needs three repository secrets: `VERCEL_TOKEN` (a token from Vercel's account settings), `VERCEL_ORG_ID` and `VERCEL_PROJECT_ID` (from `.vercel/project.json` after running `vercel link` once locally; `.vercel/` is gitignored).

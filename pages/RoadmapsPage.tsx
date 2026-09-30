@@ -4,7 +4,9 @@ import PageHeader from '../components/layout/PageHeader';
 import RoadmapCard from '../components/roadmaps/RoadmapCard';
 import { ROADMAPS } from '../constants/roadmaps';
 import { useLanguageParam } from '../hooks/useLanguage';
-import { pageTitle, useDocumentTitle } from '../hooks/useDocumentTitle';
+import { pageTitle } from '../utils/seo';
+import { usePageMeta } from '../hooks/usePageMeta';
+import { roadmapsUrl } from '../utils/routes';
 import { useT } from '../hooks/useT';
 import { container, gridGap, pageY, radius } from '../utils/ui';
 
@@ -12,7 +14,7 @@ const RoadmapsPage: React.FC = () => {
   const lang = useLanguageParam();
   const t = useT(lang);
 
-  useDocumentTitle(pageTitle(t('nav.roadmaps')));
+  usePageMeta({ title: pageTitle(t('nav.roadmaps')), description: t('roadmaps.lead'), path: roadmapsUrl(lang) });
 
   return (
     <main className={`${container} ${pageY}`}>

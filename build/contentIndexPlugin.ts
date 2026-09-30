@@ -17,11 +17,10 @@ interface ContentIndexOptions {
   exportName: string;
 }
 
-/** An unquoted YAML date serialises to `YYYY-MM-DD`, as the app expects. */
 const serialisable = (_key: string, value: unknown): unknown =>
   value instanceof Date ? value.toISOString().slice(0, 10) : value;
 
-const readEntries = (contentDir: string, root: string): ContentEntry[] =>
+export const readEntries = (contentDir: string, root: string): ContentEntry[] =>
   listMdxFiles(contentDir)
     .map(full => {
       const match = fs.readFileSync(full, 'utf8').match(FRONTMATTER);
@@ -32,10 +31,6 @@ const readEntries = (contentDir: string, root: string): ContentEntry[] =>
     })
     .sort((a, b) => a.sourcePath.localeCompare(b.sourcePath));
 
-/**
- * Serves every page's frontmatter as a virtual module, so the lazy globs in the services stay the
- * only `.mdx` imports. An eager glob of the same files would merge every page into the entry chunk.
- */
 export const contentIndexPlugin = ({ virtualId, dir, exportName }: ContentIndexOptions): Plugin => {
   const resolvedId = '\0' + virtualId;
   let contentDir = '';

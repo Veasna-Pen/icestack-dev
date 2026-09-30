@@ -14,3 +14,5 @@ export const LESSON_SECTIONS: readonly LessonSectionId[] = [
 ];
 
 export const DEFAULT_LESSON_MINUTES = 10;
+
+export const COURSE_PATH_PATTERN = /^courses\/([a-z0-9-]+)\/(?:(\d+)-([a-z0-9-]+)\/)?(en|km)\.mdx$/;

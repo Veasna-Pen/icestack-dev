@@ -6,7 +6,8 @@ import LearningPathSection from '../components/home/LearningPathSection';
 import OpenSourceSection from '../components/home/OpenSourceSection';
 import RoadmapsSection from '../components/home/RoadmapsSection';
 import { useLanguageParam } from '../hooks/useLanguage';
-import { useDocumentTitle } from '../hooks/useDocumentTitle';
+import { usePageMeta } from '../hooks/usePageMeta';
+import { homeUrl } from '../utils/routes';
 import { useT } from '../hooks/useT';
 
 interface HomePageProps {
@@ -18,7 +19,7 @@ const HomePage: React.FC<HomePageProps> = ({ onOpenSearch, onOpenAi }) => {
   const lang = useLanguageParam();
   const t = useT(lang);
 
-  useDocumentTitle(t('meta.homeTitle'));
+  usePageMeta({ title: t('meta.homeTitle'), description: t('home.heroLead'), path: homeUrl(lang) });
 
   return (
     <main className="w-full">

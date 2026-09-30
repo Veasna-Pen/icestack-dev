@@ -7,10 +7,11 @@ import SectionHeader from '../components/layout/SectionHeader';
 import type { IconComponent } from '../types';
 import { PRIMARY_NAV } from '../constants/navigation';
 import { useLanguageParam } from '../hooks/useLanguage';
-import { pageTitle, useDocumentTitle } from '../hooks/useDocumentTitle';
+import { pageTitle } from '../utils/seo';
+import { usePageMeta } from '../hooks/usePageMeta';
 import { useT } from '../hooks/useT';
 import { WORKFLOW, TEMPLATE_SECTIONS, sectionKey, stageKey } from '../utils/method';
-import { navUrl, contributeUrl } from '../utils/routes';
+import { navUrl, contributeUrl, howToThinkUrl } from '../utils/routes';
 import {
   buttonPrimary,
   buttonSecondary,
@@ -47,7 +48,7 @@ const HowToThinkPage: React.FC<HowToThinkPageProps> = ({ onOpenAi }) => {
   const t = useT(lang);
   const isKm = lang === 'km';
 
-  useDocumentTitle(pageTitle(t('nav.howToThink')));
+  usePageMeta({ title: pageTitle(t('nav.howToThink')), description: t('howToThink.lead'), path: howToThinkUrl(lang) });
 
   const handToAi = t('howToThink.ai.handToAiItems', { returnObjects: true }) as string[];
   const keepForYourself = t('howToThink.ai.keepItems', { returnObjects: true }) as string[];

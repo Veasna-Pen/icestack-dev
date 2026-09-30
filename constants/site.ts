@@ -1,6 +1,6 @@
 export const SITE_NAME = 'IceStack';
 
-export const SITE_URL = 'https://icestack.dev';
+export const SITE_URL = 'https://www.icestack.dev';
 
 export const SHARE_IMAGE = { path: '/logo/logo-symbol.png', width: 1024, height: 1024 };
 

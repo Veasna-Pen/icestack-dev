@@ -8,7 +8,6 @@ import TranslationNotice from '../components/layout/TranslationNotice';
 import MdxContainer from '../components/mdx/MdxProvider';
 import { listLessons, resolveCourse } from '../services/courseService';
 import { useCourseProgress } from '../hooks/useCourseProgress';
-import { pageTitle } from '../utils/seo';
 import { usePageMeta } from '../hooks/usePageMeta';
 import { useLanguageParam } from '../hooks/useLanguage';
 import { useMdxContent } from '../hooks/useMdxContent';
@@ -26,7 +25,7 @@ const CoursePage: React.FC = () => {
   const components = useMemo(() => ({ a: KnowledgeLink }), []);
 
   usePageMeta(
-    course && { title: pageTitle(course.title), description: course.summary, path: courseUrl(course.lang, course.slug) }
+    course && { title: course.title, description: course.summary, path: courseUrl(course.lang, course.slug) }
   );
 
   if (!course || !resolved) return <Navigate to={coursesUrl(lang)} replace />;

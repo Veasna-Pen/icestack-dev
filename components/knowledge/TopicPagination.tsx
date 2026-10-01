@@ -23,7 +23,7 @@ const TopicPagination: React.FC<TopicPaginationProps> = ({ prev, next, lang }) =
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
           {prev ? (
             <Link to={topicUrl(lang, prev)} className={`group flex flex-col p-4 ${cardInteractive} ${focusRing}`}>
-              <span className="flex items-center gap-1.5 text-xs text-zinc-400 group-hover:text-emerald-500 font-medium mb-1">
+              <span className="flex items-center gap-1.5 text-xs text-zinc-500 dark:text-zinc-400 group-hover:text-emerald-500 font-medium mb-1">
                 <ArrowLeft className="w-3.5 h-3.5 group-hover:-translate-x-1 transition-transform" />
                 {t('topic.previous')}
               </span>
@@ -39,7 +39,7 @@ const TopicPagination: React.FC<TopicPaginationProps> = ({ prev, next, lang }) =
               to={topicUrl(lang, next)}
               className={`group flex flex-col items-end p-4 text-right ${cardInteractive} ${focusRing}`}
             >
-              <span className="flex items-center gap-1.5 text-xs text-zinc-400 group-hover:text-emerald-500 font-medium mb-1">
+              <span className="flex items-center gap-1.5 text-xs text-zinc-500 dark:text-zinc-400 group-hover:text-emerald-500 font-medium mb-1">
                 {t('topic.next')}
                 <ArrowRight className="w-3.5 h-3.5 group-hover:translate-x-1 transition-transform" />
               </span>

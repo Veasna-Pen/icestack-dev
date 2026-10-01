@@ -8,7 +8,6 @@ import PreviewSection from '../components/contribute/PreviewSection';
 import TemplateSection from '../components/contribute/TemplateSection';
 import TranslateSection from '../components/contribute/TranslateSection';
 import { useLanguageParam } from '../hooks/useLanguage';
-import { pageTitle } from '../utils/seo';
 import { usePageMeta } from '../hooks/usePageMeta';
 import { contributeUrl } from '../utils/routes';
 import { useT } from '../hooks/useT';
@@ -20,7 +19,7 @@ const ContributePage: React.FC = () => {
   const lang = useLanguageParam();
   const t = useT(lang);
 
-  usePageMeta({ title: pageTitle(t('nav.contribute')), description: t('contribute.lead'), path: contributeUrl(lang) });
+  usePageMeta({ title: t('nav.contribute'), description: t('contribute.lead'), path: contributeUrl(lang) });
 
   useEffect(() => scrollToHashSoon(location.hash), [location.hash]);
 

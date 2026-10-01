@@ -13,7 +13,6 @@ import TranslationNotice from '../components/layout/TranslationNotice';
 import type { AiContext, CollectionId } from '../types';
 import { resolveTopic, listTopics, getRelatedTopics, topicRef } from '../services/knowledgeService';
 import { useLanguageParam } from '../hooks/useLanguage';
-import { pageTitle } from '../utils/seo';
 import { usePageMeta } from '../hooks/usePageMeta';
 import { useMdxContent } from '../hooks/useMdxContent';
 import { useOutline } from '../hooks/useOutline';
@@ -50,7 +49,7 @@ const TopicPage: React.FC<TopicPageProps> = ({
 
   usePageMeta(
     topic && {
-      title: pageTitle(topic.title),
+      title: topic.title,
       description: topic.summary || topic.question,
       path: topicUrl(topic.lang, topic)
     }

@@ -59,7 +59,7 @@ const KnowledgeSidebar: React.FC<KnowledgeSidebarProps> = ({ isOpen, onClose, la
             type="button"
             onClick={onClose}
             aria-label={t('nav.closeNavigation')}
-            className={`p-1.5 text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200 ${radius.chip} hover:bg-zinc-100 dark:hover:bg-zinc-800 cursor-pointer ${focusRing}`}
+            className={`p-1.5 text-zinc-500 dark:text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200 ${radius.chip} hover:bg-zinc-100 dark:hover:bg-zinc-800 cursor-pointer ${focusRing}`}
           >
             <X className="w-4 h-4" />
           </button>
@@ -92,7 +92,7 @@ const KnowledgeSidebar: React.FC<KnowledgeSidebarProps> = ({ isOpen, onClose, la
                 >
                   <Icon className="w-4 h-4 shrink-0 text-zinc-600 dark:text-zinc-300" />
                   <span className="flex-1">{t(collectionKey(id, 'label'))}</span>
-                  <span className="text-[10px] font-mono font-medium text-zinc-400 dark:text-zinc-600 tabular-nums">
+                  <span className="text-[10px] font-mono font-medium text-zinc-500 dark:text-zinc-500 tabular-nums">
                     {topics.length}
                   </span>
                 </Link>
@@ -107,7 +107,7 @@ const KnowledgeSidebar: React.FC<KnowledgeSidebarProps> = ({ isOpen, onClose, la
                           aria-current={isActive ? 'page' : undefined}
                           className={`relative block py-1.5 pr-1 text-[13px] leading-snug transition-colors rounded ${focusRing} ${
                             isActive
-                              ? 'text-emerald-600 dark:text-emerald-400 font-medium'
+                              ? 'text-emerald-700 dark:text-emerald-400 font-medium'
                               : 'text-zinc-600 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-200'
                           }`}
                         >

@@ -22,7 +22,7 @@ const Anchor: React.FC<Target & { className: string; children: React.ReactNode }
     </Link>
   );
 
-const heading = 'px-2.5 mb-1.5 text-[11px] font-medium text-zinc-400 dark:text-zinc-500';
+const heading = 'px-2.5 mb-1.5 text-[11px] font-medium text-zinc-500 dark:text-zinc-500';
 
 type MenuItemProps = Target & {
   icon: IconComponent;
@@ -37,7 +37,7 @@ export const MenuItem: React.FC<MenuItemProps> = ({ icon: Icon, title, descripti
       className={`group flex items-center gap-3 p-2.5 ${radius.control} hover:bg-zinc-100/80 dark:hover:bg-white/[0.04] transition-colors ${focusRing}`}
     >
       <span
-        className={`relative w-9 h-9 shrink-0 ${radius.chip} ${surface.card} border ${border.base} shadow-xs flex items-center justify-center text-zinc-600 dark:text-zinc-300 group-hover:text-emerald-600 dark:group-hover:text-emerald-400 group-hover:border-emerald-500/40 transition-colors`}
+        className={`relative w-9 h-9 shrink-0 ${radius.chip} ${surface.card} border ${border.base} shadow-sm flex items-center justify-center text-zinc-600 dark:text-zinc-300 group-hover:text-emerald-600 dark:group-hover:text-emerald-400 group-hover:border-emerald-500/40 transition-colors`}
       >
         <Icon className="w-4 h-4" />
       </span>
@@ -90,7 +90,7 @@ export const SideList: React.FC<SideListProps> = ({ title, children, footer }) =
     {footer && (
       <Anchor
         {...(footer as Target)}
-        className={`group mt-auto pt-3 px-2.5 inline-flex items-center gap-1 text-[12px] font-semibold text-emerald-600 dark:text-emerald-400 ${radius.chip} ${focusRing}`}
+        className={`group mt-auto pt-3 px-2.5 inline-flex items-center gap-1 text-[12px] font-semibold text-emerald-700 dark:text-emerald-400 ${radius.chip} ${focusRing}`}
       >
         {footer.label}
         <ArrowRight className="w-3.5 h-3.5 group-hover:translate-x-0.5 transition-transform" />

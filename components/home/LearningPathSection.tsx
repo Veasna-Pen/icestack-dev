@@ -60,7 +60,7 @@ const LearningPathSection: React.FC<{ lang: Language }> = ({ lang }) => {
                   className={`group flex flex-col h-full p-4 ${cardInteractive} ${focusRing}`}
                 >
                   <div className="flex items-center justify-between mb-4">
-                    <span className="font-mono text-[11px] font-semibold text-zinc-400 dark:text-zinc-600 tabular-nums">
+                    <span className="font-mono text-[11px] font-semibold text-zinc-500 dark:text-zinc-500 tabular-nums">
                       {stepNumber(i + 1)}
                     </span>
                     <Icon className="w-4 h-4 text-emerald-500" />
@@ -78,15 +78,15 @@ const LearningPathSection: React.FC<{ lang: Language }> = ({ lang }) => {
                       </li>
                     ))}
                   </ul>
-                  <div className="mt-auto pt-4 flex items-center justify-between gap-2 text-[11px] font-mono text-zinc-400 dark:text-zinc-500">
+                  <div className="mt-auto pt-4 flex items-center justify-between gap-2 text-[11px] font-mono text-zinc-500 dark:text-zinc-500">
                     <span className="truncate">{countFor(id)}</span>
-                    <ArrowRight className="w-3.5 h-3.5 shrink-0 text-zinc-300 dark:text-zinc-700 group-hover:text-emerald-500 group-hover:translate-x-0.5 transition-all" />
+                    <ArrowRight className="w-3.5 h-3.5 shrink-0 text-zinc-400 dark:text-zinc-600 group-hover:text-emerald-500 group-hover:translate-x-0.5 transition-all" />
                   </div>
                 </Link>
                 {i < PRIMARY_NAV.length - 1 && (
                   <ChevronRight
                     aria-hidden="true"
-                    className={`hidden lg:block absolute top-1/2 -right-4 -translate-y-1/2 z-10 w-4 h-4 p-0.5 rounded-full ${surface.barSolid} text-zinc-400 dark:text-zinc-600`}
+                    className={`hidden lg:block absolute top-1/2 -right-4 -translate-y-1/2 z-10 w-4 h-4 p-0.5 rounded-full ${surface.bar} text-zinc-400 dark:text-zinc-600`}
                   />
                 )}
               </li>

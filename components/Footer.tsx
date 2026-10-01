@@ -5,7 +5,7 @@ import { Trans } from 'react-i18next';
 import IceStackLogo from './IceStackLogo';
 import type { Language } from '../types';
 import { COLLECTION_IDS } from '../constants/collections';
-import { REPO_URL } from '../constants/site';
+import { AUTHOR_URL, REPO_URL } from '../constants/site';
 import { useT } from '../hooks/useT';
 import { collectionKey } from '../utils/i18n';
 import { howToThinkUrl, contributeUrl, collectionUrl, coursesUrl, homeUrl, roadmapsUrl } from '../utils/routes';
@@ -57,7 +57,7 @@ export const Footer: React.FC<FooterProps> = ({ language, onOpenSearch }) => {
     <footer
       className={`w-full ${surface.bar} border-t border-zinc-200/80 dark:border-zinc-800/80 text-zinc-600 dark:text-zinc-400 transition-colors`}
     >
-      <div className={`${container} py-12 lg:py-16`}>
+      <div data-nosnippet="" className={`${container} py-12 lg:py-16`}>
         <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-10 lg:gap-12">
           <div className="col-span-2 md:col-span-3 lg:col-span-2 space-y-4">
             <Link to={homeUrl(language)} className={`inline-flex items-center group ${radius.chip} ${focusRing}`}>
@@ -73,7 +73,7 @@ export const Footer: React.FC<FooterProps> = ({ language, onOpenSearch }) => {
               href={REPO_URL}
               target="_blank"
               rel="noreferrer"
-              className={`inline-flex items-center gap-2 px-3 py-1.5 ${radius.control} bg-zinc-100 hover:bg-zinc-200/80 dark:bg-zinc-900 dark:hover:bg-zinc-800 border border-zinc-200 dark:border-zinc-800 text-xs font-semibold text-zinc-800 dark:text-zinc-200 transition-colors shadow-2xs ${focusRing}`}
+              className={`inline-flex items-center gap-2 px-3 py-1.5 ${radius.control} bg-zinc-100 hover:bg-zinc-200/80 dark:bg-zinc-900 dark:hover:bg-zinc-800 border border-zinc-200 dark:border-zinc-800 text-xs font-semibold text-zinc-800 dark:text-zinc-200 transition-colors shadow-sm ${focusRing}`}
             >
               <Github className="w-4 h-4" />
               <span>{t('footer.contributeOnGithub')}</span>
@@ -103,20 +103,29 @@ export const Footer: React.FC<FooterProps> = ({ language, onOpenSearch }) => {
           ))}
         </div>
 
-        <div className="mt-12 pt-8 border-t border-zinc-200/80 dark:border-zinc-800/80 flex flex-col sm:flex-row items-center justify-between gap-4 text-xs text-zinc-400 dark:text-zinc-500">
-          <div className="flex flex-wrap items-center justify-center sm:justify-start gap-x-2 gap-y-1 text-center sm:text-left">
-            <span>© {new Date().getFullYear()} IceStack.dev</span>
-            <span>•</span>
-            <span>
+        <div className="mt-12 pt-8 border-t border-zinc-200/80 dark:border-zinc-800/80 flex flex-col lg:flex-row items-center justify-between gap-4 text-xs text-zinc-500 dark:text-zinc-400">
+          <ul className="flex flex-col md:flex-row items-center gap-y-1.5 text-center md:divide-x divide-zinc-200 dark:divide-zinc-800">
+            <li className="md:pr-3">
+              © {new Date().getFullYear()} <span className="uppercase tracking-wide">IceStack.dev</span>
+            </li>
+            <li className="md:px-3">
               <Trans
                 t={t}
                 i18nKey="footer.createdBy"
-                components={{ strong: <strong className="font-semibold text-zinc-700 dark:text-zinc-300" /> }}
+                components={{
+                  strong: (
+                    <a
+                      href={AUTHOR_URL}
+                      target="_blank"
+                      rel="noreferrer"
+                      className={`font-medium text-zinc-700 dark:text-zinc-300 hover:text-emerald-600 dark:hover:text-emerald-400 transition-colors ${radius.chip} ${focusRing}`}
+                    />
+                  )
+                }}
               />
-            </span>
-            <span>•</span>
-            <span>{t('footer.builtIn')}</span>
-          </div>
+            </li>
+            <li className="md:pl-3">{t('footer.builtIn')}</li>
+          </ul>
 
           <div className="flex items-center gap-3">
             {onOpenSearch && (
@@ -132,7 +141,7 @@ export const Footer: React.FC<FooterProps> = ({ language, onOpenSearch }) => {
             <button
               type="button"
               onClick={scrollToTop}
-              className={`inline-flex items-center gap-1.5 px-3 py-1.5 ${radius.control} bg-zinc-100 dark:bg-zinc-800/80 hover:bg-zinc-200 dark:hover:bg-zinc-700/80 border border-zinc-200 dark:border-zinc-700/80 text-zinc-700 dark:text-zinc-300 text-xs font-semibold transition-all cursor-pointer shadow-2xs ${focusRing}`}
+              className={`inline-flex items-center gap-1.5 px-3 py-1.5 ${radius.control} bg-zinc-100 dark:bg-zinc-800/80 hover:bg-zinc-200 dark:hover:bg-zinc-700/80 border border-zinc-200 dark:border-zinc-700/80 text-zinc-700 dark:text-zinc-300 text-xs font-semibold transition-all cursor-pointer shadow-sm ${focusRing}`}
               title={t('footer.backToTop')}
             >
               <span>{t('footer.backToTop')}</span>

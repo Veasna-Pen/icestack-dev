@@ -66,7 +66,7 @@ export const TopicCard: React.FC<TopicCardProps> = ({ topic, lang, compact = fal
             </span>
           ))}
         </div>
-        <ArrowRight className="w-3.5 h-3.5 shrink-0 text-zinc-300 dark:text-zinc-700 group-hover:text-emerald-500 group-hover:translate-x-0.5 transition-all" />
+        <ArrowRight className="w-3.5 h-3.5 shrink-0 text-zinc-400 dark:text-zinc-600 group-hover:text-emerald-500 group-hover:translate-x-0.5 transition-all" />
       </div>
     </Link>
   );

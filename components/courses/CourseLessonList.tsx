@@ -49,9 +49,9 @@ const CourseLessonList: React.FC<CourseLessonListProps> = ({ lessons, done, lang
                   )}
                 </span>
 
-                <span className="hidden sm:flex items-center gap-2 shrink-0 mt-1 text-[11px] font-medium text-zinc-400 dark:text-zinc-500 tabular-nums">
+                <span className="hidden sm:flex items-center gap-2 shrink-0 mt-1 text-[11px] font-medium text-zinc-500 dark:text-zinc-500 tabular-nums">
                   {formatMinutes(t, lesson.minutes)}
-                  <ChevronRight className="w-4 h-4 text-zinc-300 dark:text-zinc-700 group-hover:text-emerald-500 group-hover:translate-x-0.5 transition-all" />
+                  <ChevronRight className="w-4 h-4 text-zinc-400 dark:text-zinc-600 group-hover:text-emerald-500 group-hover:translate-x-0.5 transition-all" />
                 </span>
               </Link>
             </li>

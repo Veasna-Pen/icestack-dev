@@ -174,7 +174,7 @@ const AiAssistant: React.FC<AiAssistantProps> = ({ context, language, isOpen, on
           <button
             onClick={onClose}
             aria-label={t('common.close')}
-            className={`shrink-0 p-1.5 rounded-lg text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200 hover:bg-zinc-200/70 dark:hover:bg-zinc-800 transition-colors ${focusRing}`}
+            className={`shrink-0 p-1.5 rounded-lg text-zinc-500 dark:text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200 hover:bg-zinc-200/70 dark:hover:bg-zinc-800 transition-colors ${focusRing}`}
           >
             <X className="w-4 h-4" />
           </button>

@@ -4,15 +4,17 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>IceStack · Think before you code</title>
+  <title>Think before you code | Ice Stack</title>
   <meta name="description"
     content="Open-source knowledge for better engineering decisions. Work real software problems from context and trade-offs to a decision you can verify, in English and Khmer." />
   <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)" />
   <meta name="theme-color" content="#09090b" media="(prefers-color-scheme: dark)" />
-  <meta property="og:site_name" content="IceStack" />
+  <meta property="og:site_name" content="Ice Stack" />
   <meta name="twitter:card" content="summary" />
+  <link rel="icon" href="/favicon.ico" sizes="48x48" />
+  <link rel="icon" type="image/png" sizes="96x96" href="/favicon-96x96.png" />
   <link rel="icon" type="image/svg+xml" href="/logo/logo-symbol.svg" />
-  <link rel="apple-touch-icon" href="/logo/logo-symbol.png" />
+  <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
   <script src="https://cdn.tailwindcss.com"></script>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -57,24 +59,11 @@
   <style>
     html {
       scroll-behavior: smooth;
+      color-scheme: light;
     }
 
-    body {
-      background-image: repeating-linear-gradient(-45deg,
-          transparent,
-          transparent 4px,
-          rgba(0, 0, 0, 0.035) 4px,
-          rgba(0, 0, 0, 0.035) 5px);
-      background-size: 7.07px 7.07px;
-    }
-
-    .dark body {
-      background-image: repeating-linear-gradient(-45deg,
-          transparent,
-          transparent 4px,
-          rgba(255, 255, 255, 0.035) 4px,
-          rgba(255, 255, 255, 0.035) 5px);
-      background-size: 7.07px 7.07px;
+    html.dark {
+      color-scheme: dark;
     }
 
     /* Firefox only: in Chrome 121+ a global scrollbar-width would override the ::-webkit sizes below. */
@@ -151,7 +140,7 @@
 </head>
 
 <body
-  class="bg-white text-zinc-900 dark:bg-[#09090b] dark:text-zinc-100 antialiased selection:bg-emerald-500/20 selection:text-emerald-500 transition-colors duration-200">
+  class="bg-white text-zinc-900 dark:bg-[#09090b] dark:text-zinc-100 antialiased selection:bg-emerald-500/25 transition-colors duration-200">
   <div id="root"></div>
   <script type="module" src="/index.tsx"></script>
 </body>

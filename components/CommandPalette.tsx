@@ -249,7 +249,7 @@ const CommandPalette: React.FC<CommandPaletteProps> = ({ isOpen, onClose, onNavi
               type="button"
               onClick={() => setQuery('')}
               aria-label={t('search.clear')}
-              className="p-1 text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-300 rounded"
+              className="p-1 text-zinc-500 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100 rounded"
             >
               <X className="w-4 h-4" />
             </button>
@@ -262,7 +262,7 @@ const CommandPalette: React.FC<CommandPaletteProps> = ({ isOpen, onClose, onNavi
             <div className="py-12 text-center text-sm text-zinc-500">
               <Search className="w-8 h-8 text-zinc-400 mx-auto mb-2 opacity-50" />
               <p className="font-medium">{t('search.noResults', { query })}</p>
-              <p className="text-xs text-zinc-400 mt-1.5">{t('search.tryHint')}</p>
+              <p className="text-xs text-zinc-500 dark:text-zinc-400 mt-1.5">{t('search.tryHint')}</p>
             </div>
           ) : (
             filteredItems.map((item, idx) => {
@@ -326,7 +326,7 @@ const CommandPalette: React.FC<CommandPaletteProps> = ({ isOpen, onClose, onNavi
         </div>
 
         <div
-          className={`flex items-center justify-between px-4 py-2.5 ${surface.barSolid} border-t border-zinc-200 dark:border-zinc-800/80 text-[11px] text-zinc-400`}
+          className={`flex items-center justify-between px-4 py-2.5 ${surface.bar} border-t border-zinc-200 dark:border-zinc-800/80 text-[11px] text-zinc-500 dark:text-zinc-400`}
         >
           <div className="flex items-center gap-4">
             <span className="flex items-center gap-1">

@@ -4,7 +4,6 @@ import PageHeader from '../components/layout/PageHeader';
 import RoadmapCard from '../components/roadmaps/RoadmapCard';
 import { ROADMAPS } from '../constants/roadmaps';
 import { useLanguageParam } from '../hooks/useLanguage';
-import { pageTitle } from '../utils/seo';
 import { usePageMeta } from '../hooks/usePageMeta';
 import { roadmapsUrl } from '../utils/routes';
 import { useT } from '../hooks/useT';
@@ -14,7 +13,7 @@ const RoadmapsPage: React.FC = () => {
   const lang = useLanguageParam();
   const t = useT(lang);
 
-  usePageMeta({ title: pageTitle(t('nav.roadmaps')), description: t('roadmaps.lead'), path: roadmapsUrl(lang) });
+  usePageMeta({ title: t('nav.roadmaps'), description: t('roadmaps.lead'), path: roadmapsUrl(lang) });
 
   return (
     <main className={`${container} ${pageY}`}>

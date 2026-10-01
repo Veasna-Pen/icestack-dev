@@ -6,8 +6,7 @@ export const surface = {
   pageBlur: 'bg-white/95 dark:bg-[#09090b]/95',
   card: 'bg-white dark:bg-[#0e0e11]',
   cardBlur: 'bg-white/90 dark:bg-[#0e0e11]/90',
-  bar: 'bg-zinc-50/70 dark:bg-[#0b0b0e]',
-  barSolid: 'bg-zinc-50 dark:bg-[#0b0b0e]',
+  bar: 'bg-zinc-50 dark:bg-[#0b0b0e]',
   inset: 'bg-zinc-50/60 dark:bg-white/[0.015]',
   code: 'bg-[#0c0e14]',
   codeBar: 'bg-[#111520]'
@@ -27,7 +26,7 @@ export const radius = {
 } as const;
 
 /** One container for header, footer and pages, so everything shares a left edge. */
-export const container = 'max-w-7xl mx-auto px-4 sm:px-6 lg:px-8';
+export const container = 'max-w-[90rem] mx-auto px-4 sm:px-6 lg:px-8';
 export const pageY = 'py-10 sm:py-14';
 export const sectionGap = 'mt-16 sm:mt-20';
 export const sectionY = 'py-16 sm:py-20';
@@ -38,14 +37,14 @@ export const focusRing =
   'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/60 focus-visible:ring-offset-2 focus-visible:ring-offset-white dark:focus-visible:ring-offset-[#09090b]';
 
 export const eyebrow =
-  'text-[10px] font-mono font-semibold uppercase tracking-[0.14em] text-zinc-400 dark:text-zinc-500';
+  'text-[10px] font-mono font-semibold uppercase tracking-[0.14em] text-zinc-500 dark:text-zinc-500';
 
 export const eyebrowAccent =
-  'text-[10px] font-mono font-semibold uppercase tracking-[0.14em] text-emerald-600 dark:text-emerald-400';
+  'text-[10px] font-mono font-semibold uppercase tracking-[0.14em] text-emerald-700 dark:text-emerald-400';
 
 export const eyebrowFor = (lang: Language, accent = false): string =>
   lang === 'km'
-    ? `text-[12px] font-semibold ${accent ? 'text-emerald-600 dark:text-emerald-400' : 'text-zinc-500 dark:text-zinc-400'}`
+    ? `text-[12px] font-semibold ${accent ? 'text-emerald-700 dark:text-emerald-400' : 'text-zinc-500 dark:text-zinc-400'}`
     : accent
       ? eyebrowAccent
       : eyebrow;
@@ -70,7 +69,7 @@ export const iconButton = `p-2 ${radius.control} text-zinc-600 hover:text-zinc-9
 export const chip = (selected: boolean) =>
   `inline-flex items-center gap-2 ${radius.control} border text-[13px] font-semibold transition-all cursor-pointer ${focusRing} ${
     selected
-      ? 'border-emerald-500 bg-emerald-500/[0.09] text-zinc-900 dark:text-white shadow-xs'
+      ? 'border-emerald-500 bg-emerald-500/[0.09] text-zinc-900 dark:text-white shadow-sm'
       : 'border-zinc-200 dark:border-zinc-800 text-zinc-600 dark:text-zinc-400 hover:border-zinc-300 dark:hover:border-zinc-700 hover:text-zinc-900 dark:hover:text-zinc-200'
   }`;
 

@@ -27,7 +27,7 @@ const HowItWorks: React.FC<{ lang: Language }> = ({ lang }) => {
             return (
               <li key={step.id} className={`${cardStatic} p-5 flex flex-col`}>
                 <div className="flex items-center justify-between mb-4">
-                  <span className="font-mono text-[11px] font-semibold text-zinc-400 dark:text-zinc-600 tabular-nums">
+                  <span className="font-mono text-[11px] font-semibold text-zinc-500 dark:text-zinc-500 tabular-nums">
                     {stepNumber(i + 1)}
                   </span>
                   <Icon className="w-4 h-4 text-emerald-500" />

@@ -61,7 +61,7 @@ const ChatComposer: React.FC<ChatComposerProps> = ({ language, value, canSend, i
           <Send className="w-3.5 h-3.5" />
         </button>
       </div>
-      <p className="hidden sm:block mt-1.5 px-1 text-[10px] text-zinc-400 dark:text-zinc-500">{t('ai.inputHint')}</p>
+      <p className="hidden sm:block mt-1.5 px-1 text-[10px] text-zinc-500 dark:text-zinc-400">{t('ai.inputHint')}</p>
     </form>
   );
 };

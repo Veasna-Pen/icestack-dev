@@ -5,7 +5,7 @@ import type { Language } from '../types';
 import { DEFAULT_LANGUAGE, LANGUAGES, OG_LOCALES } from '../constants/i18n';
 import { SHARE_IMAGE, SITE_NAME, SITE_URL } from '../constants/site';
 import { homeUrl } from '../utils/routes';
-import { absoluteUrl } from '../utils/seo';
+import { absoluteUrl, pageTitle } from '../utils/seo';
 import { sitePages, type SitePage } from './sitePages';
 
 const escapeHtml = (text: string): string =>
@@ -52,13 +52,13 @@ const renderPage = (template: string, page: SitePage, standalone: boolean): stri
     tags.push(
       meta('property', 'og:url', url),
       link({ rel: 'canonical', href: url }),
-      ...alternateLinks(page.alternates).map(([hreflang, href]) => link({ rel: 'alternate', hreflang, href })),
-      ...page.jsonLd.map(jsonLdScript)
+      ...alternateLinks(page.alternates).map(([hreflang, href]) => link({ rel: 'alternate', hreflang, href }))
     );
   }
+  tags.push(...page.jsonLd.map(jsonLdScript));
 
   let html = replaceOnce(template, /<html lang="[^"]*"/, `<html lang="${page.lang}"`);
-  html = replaceOnce(html, /<title>[\s\S]*?<\/title>/, `<title>${escapeHtml(page.title)}</title>`);
+  html = replaceOnce(html, /<title>[\s\S]*?<\/title>/, `<title>${escapeHtml(pageTitle(page.title))}</title>`);
   html = replaceOnce(html, /<meta name="description"[^>]*>/, meta('name', 'description', page.description));
   return replaceOnce(html, /<\/head>/, `  ${tags.join('\n  ')}\n</head>`);
 };

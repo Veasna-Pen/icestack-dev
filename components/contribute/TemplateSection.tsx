@@ -34,7 +34,7 @@ const TemplateSection: React.FC<{ lang: Language }> = ({ lang }) => {
           href={TEMPLATE_URL}
           target="_blank"
           rel="noreferrer"
-          className={`inline-flex items-center gap-1.5 text-[13px] font-semibold text-emerald-600 dark:text-emerald-400 hover:text-emerald-500 ${radius.chip} ${focusRing}`}
+          className={`inline-flex items-center gap-1.5 text-[13px] font-semibold text-emerald-700 dark:text-emerald-400 hover:text-emerald-500 ${radius.chip} ${focusRing}`}
         >
           {t('contribute.template.open')}
           <ArrowUpRight className="w-3.5 h-3.5" />
@@ -48,7 +48,7 @@ const TemplateSection: React.FC<{ lang: Language }> = ({ lang }) => {
               href={LESSON_TEMPLATE_URL}
               target="_blank"
               rel="noreferrer"
-              className={`mt-1.5 inline-flex items-center gap-1.5 font-semibold text-emerald-600 dark:text-emerald-400 hover:text-emerald-500 ${radius.chip} ${focusRing}`}
+              className={`mt-1.5 inline-flex items-center gap-1.5 font-semibold text-emerald-700 dark:text-emerald-400 hover:text-emerald-500 ${radius.chip} ${focusRing}`}
             >
               {t('contribute.template.openLesson')}
               <ArrowUpRight className="w-3.5 h-3.5" />
@@ -61,7 +61,7 @@ const TemplateSection: React.FC<{ lang: Language }> = ({ lang }) => {
         {TEMPLATE_SECTIONS.map(section => (
           <div key={section.key} className="px-5 py-3.5 grid grid-cols-[2.25rem_1fr] gap-2">
             <span
-              className="font-mono text-[11px] font-semibold text-emerald-600 dark:text-emerald-400 tabular-nums pt-0.5"
+              className="font-mono text-[11px] font-semibold text-emerald-700 dark:text-emerald-400 tabular-nums pt-0.5"
               title={t(stageKey(section.stage, 'label'))}
             >
               {stepNumber(stageIndex(section.stage))}
@@ -70,7 +70,7 @@ const TemplateSection: React.FC<{ lang: Language }> = ({ lang }) => {
               <dt className="text-[13.5px] font-semibold text-zinc-900 dark:text-white">
                 {t(sectionKey(section.key, 'heading'))}
                 {isKm && (
-                  <span className="ml-2 text-[11px] font-mono font-medium text-zinc-400">
+                  <span className="ml-2 text-[11px] font-mono font-medium text-zinc-500 dark:text-zinc-400">
                     {englishHeading(section.key)}
                   </span>
                 )}

@@ -26,7 +26,7 @@ const NavCard: React.FC<{ to: string; label: string; title: string; direction: '
     to={to}
     className={`group flex flex-col p-4 ${cardInteractive} ${focusRing} ${direction === 'next' ? 'items-end text-right' : ''}`}
   >
-    <span className="flex items-center gap-1.5 text-xs text-zinc-400 group-hover:text-emerald-500 font-medium mb-1">
+    <span className="flex items-center gap-1.5 text-xs text-zinc-500 dark:text-zinc-400 group-hover:text-emerald-500 font-medium mb-1">
       {direction === 'prev' && <ArrowLeft className="w-3.5 h-3.5 group-hover:-translate-x-1 transition-transform" />}
       {label}
       {direction === 'next' && <ArrowRight className="w-3.5 h-3.5 group-hover:translate-x-1 transition-transform" />}
@@ -77,7 +77,7 @@ const LessonFooter: React.FC<LessonFooterProps> = ({ course, lesson, prev, next,
             onClick={() => !isDone && onToggleDone()}
             className={`group flex flex-col items-end p-4 text-right ${cardInteractive} ${focusRing}`}
           >
-            <span className="flex items-center gap-1.5 text-xs text-zinc-400 group-hover:text-emerald-500 font-medium mb-1">
+            <span className="flex items-center gap-1.5 text-xs text-zinc-500 dark:text-zinc-400 group-hover:text-emerald-500 font-medium mb-1">
               {t('courses.finish')}
               <Flag className="w-3.5 h-3.5" />
             </span>

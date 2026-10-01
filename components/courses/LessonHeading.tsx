@@ -47,7 +47,7 @@ export const makeLessonHeading = (lang: Language): React.FC<HeadingProps> => {
         </span>
         <span>{t(lessonSectionKey(section, 'heading'))}</span>
         {lang === 'km' && (
-          <span className="text-xs font-mono font-medium text-zinc-400 dark:text-zinc-500">
+          <span className="text-xs font-mono font-medium text-zinc-500 dark:text-zinc-500">
             {englishLessonHeading(section)}
           </span>
         )}

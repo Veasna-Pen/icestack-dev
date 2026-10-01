@@ -13,7 +13,6 @@ import type { AiContext, Topic } from '../types';
 import { listLessons, resolveCourse, resolveLesson } from '../services/courseService';
 import { resolveRef } from '../services/knowledgeService';
 import { useCourseProgress } from '../hooks/useCourseProgress';
-import { pageTitle } from '../utils/seo';
 import { usePageMeta } from '../hooks/usePageMeta';
 import { useLanguageParam } from '../hooks/useLanguage';
 import { useMdxContent } from '../hooks/useMdxContent';
@@ -45,7 +44,7 @@ const LessonPage: React.FC<LessonPageProps> = ({ isSidebarOpen, onCloseSidebar, 
   usePageMeta(
     lesson &&
       course && {
-        title: pageTitle(`${lesson.title} · ${course.title}`),
+        title: `${lesson.title} · ${course.title}`,
         description: lesson.summary,
         path: lessonUrl(lesson.lang, lesson)
       }

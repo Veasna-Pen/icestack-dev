@@ -2,7 +2,7 @@ import React from 'react';
 import { Link, useLocation } from 'react-router-dom';
 import { ExternalLink } from 'lucide-react';
 
-const linkClass = 'text-emerald-600 dark:text-emerald-400 hover:underline font-medium';
+const linkClass = 'text-emerald-700 dark:text-emerald-400 hover:underline font-medium';
 
 export const KnowledgeLink: React.FC<React.AnchorHTMLAttributes<HTMLAnchorElement>> = ({ href = '', children, ...props }) => {
   const { pathname } = useLocation();

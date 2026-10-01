@@ -43,7 +43,7 @@ types/ ← constants/ ← utils/ ← services/ ← hooks/ ← components/ ← pa
 
 ## Styling
 
-Tailwind is loaded from the Play CDN with its config inline in `index.html` (there is no `tailwind.config.js` or PostCSS). `utils/ui.ts` is the design system: surfaces, radii, focus rings, cards, chips and page-title sizes. Use its tokens instead of hand-writing colours or layout, and give every page the shared `container`.
+Tailwind is loaded from the Play CDN with its config inline in `index.html` (there is no `tailwind.config.js` or PostCSS). `utils/ui.ts` is the design system: surfaces, radii, focus rings, cards, chips and page-title sizes. Use its tokens instead of hand-writing colours or layout, and give every page the shared `container`. The page background is flat in both themes. Grey text must stay readable in both: `zinc-500` is the lightest text grey in light mode and the darkest in dark mode (`text-zinc-400 dark:text-zinc-600` is for decorative icons only), and small emerald text is `text-emerald-700 dark:text-emerald-400`.
 
 ## AI assistant
 

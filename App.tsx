@@ -90,7 +90,7 @@ const AppContent: React.FC = () => {
   const closeSidebar = () => setIsSidebarOpen(false);
 
   return (
-    <div className="min-h-screen flex flex-col text-zinc-900 dark:text-zinc-100 font-sans selection:bg-emerald-500/20 selection:text-emerald-500 transition-colors duration-200">
+    <div className="min-h-screen flex flex-col text-zinc-900 dark:text-zinc-100 font-sans selection:bg-emerald-500/25 transition-colors duration-200">
       <Header
         isScrolled={isScrolled}
         hasSidebar={hasSidebar}

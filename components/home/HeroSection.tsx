@@ -64,7 +64,7 @@ const HeroSection: React.FC<HeroSectionProps> = ({ lang, onOpenSearch, onOpenAi 
               <Trans
                 t={t}
                 i18nKey="home.heroTitle"
-                components={{ br: <br />, muted: <span className="text-zinc-400 dark:text-zinc-600" /> }}
+                components={{ br: <br />, muted: <span className="text-zinc-400 dark:text-zinc-500" /> }}
               />
             </h1>
 

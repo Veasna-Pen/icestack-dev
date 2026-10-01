@@ -7,7 +7,6 @@ import type { CollectionId } from '../types';
 import { listTopics, topicRef } from '../services/knowledgeService';
 import { PRIMARY_NAV } from '../constants/navigation';
 import { useLanguageParam } from '../hooks/useLanguage';
-import { pageTitle } from '../utils/seo';
 import { usePageMeta } from '../hooks/usePageMeta';
 import { collectionUrl } from '../utils/routes';
 import { useT } from '../hooks/useT';
@@ -27,7 +26,7 @@ const CollectionPage: React.FC<CollectionPageProps> = ({ collection }) => {
   const position = PRIMARY_NAV.indexOf(collection) + 1;
 
   usePageMeta({
-    title: pageTitle(label),
+    title: label,
     description: t(collectionKey(collection, 'description')),
     path: collectionUrl(lang, collection)
   });

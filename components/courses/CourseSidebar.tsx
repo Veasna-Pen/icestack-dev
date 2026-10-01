@@ -43,7 +43,7 @@ const CourseSidebar: React.FC<CourseSidebarProps> = ({ course, lessons, activeSl
             type="button"
             onClick={onClose}
             aria-label={t('nav.closeNavigation')}
-            className={`p-1.5 text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200 ${radius.chip} hover:bg-zinc-100 dark:hover:bg-zinc-800 cursor-pointer ${focusRing}`}
+            className={`p-1.5 text-zinc-500 dark:text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200 ${radius.chip} hover:bg-zinc-100 dark:hover:bg-zinc-800 cursor-pointer ${focusRing}`}
           >
             <X className="w-4 h-4" />
           </button>
@@ -84,8 +84,8 @@ const CourseSidebar: React.FC<CourseSidebarProps> = ({ course, lessons, activeSl
                         isDone
                           ? 'bg-emerald-500 border-emerald-500 text-white'
                           : isActive
-                            ? 'border-emerald-500 text-emerald-600 dark:text-emerald-400'
-                            : 'border-zinc-300 dark:border-zinc-700 text-zinc-400'
+                            ? 'border-emerald-500 text-emerald-700 dark:text-emerald-400'
+                            : 'border-zinc-300 dark:border-zinc-700 text-zinc-500 dark:text-zinc-400'
                       }`}
                     >
                       {isDone ? <Check className="w-3 h-3" aria-label={t('courses.completed')} /> : stepNumber(lesson.number)}

@@ -24,9 +24,9 @@ const DOT: Record<StageState, string> = {
 
 const LABEL: Record<StageState, string> = {
   done: 'text-zinc-600 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-200',
-  active: 'text-emerald-600 dark:text-emerald-400 font-semibold',
+  active: 'text-emerald-700 dark:text-emerald-400 font-semibold',
   todo: 'text-zinc-500 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-200',
-  missing: 'text-zinc-300 dark:text-zinc-700'
+  missing: 'text-zinc-400 dark:text-zinc-600'
 };
 
 const scrollToId = (id: string) => {
@@ -79,7 +79,7 @@ const ReasoningRail: React.FC<ReasoningRailProps> = ({ entries, activeId, lang, 
         onClick={() => scrollToId(entry.id)}
         className={`block w-full text-left py-1 border-l -ml-px pl-3 transition-colors ${small ? 'text-[11.5px]' : 'text-xs'} ${focusRing} ${
           isActive
-            ? 'border-emerald-500 text-emerald-600 dark:text-emerald-400 font-medium'
+            ? 'border-emerald-500 text-emerald-700 dark:text-emerald-400 font-medium'
             : 'border-transparent text-zinc-500 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-200 hover:border-zinc-400'
         }`}
       >
@@ -142,7 +142,7 @@ const ReasoningRail: React.FC<ReasoningRailProps> = ({ entries, activeId, lang, 
                             onClick={() => scrollToId(s.id)}
                             className={`text-left text-[11.5px] rounded transition-colors ${focusRing} ${
                               s.id === activeId
-                                ? 'text-emerald-600 dark:text-emerald-400 font-medium'
+                                ? 'text-emerald-700 dark:text-emerald-400 font-medium'
                                 : 'text-zinc-500 dark:text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-200'
                             }`}
                           >

@@ -20,7 +20,7 @@ export const FlowChain: React.FC<FlowChainProps> = ({ steps, tone = 'muted' }) =
           {step}
         </span>
         {i < steps.length - 1 && (
-          <ChevronRight aria-hidden="true" className="w-3 h-3 shrink-0 text-zinc-300 dark:text-zinc-600" />
+          <ChevronRight aria-hidden="true" className="w-3 h-3 shrink-0 text-zinc-400 dark:text-zinc-600" />
         )}
       </li>
     ))}

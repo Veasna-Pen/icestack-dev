@@ -49,7 +49,7 @@ const CourseCard: React.FC<CourseCardProps> = ({ course, lang, compact = false }
 
       <div className="mt-auto pt-4 flex items-center justify-between gap-2 text-[12px] font-semibold text-zinc-500 dark:text-zinc-400">
         <span>{t('courses.open')}</span>
-        <ArrowRight className="w-3.5 h-3.5 shrink-0 text-zinc-300 dark:text-zinc-700 group-hover:text-emerald-500 group-hover:translate-x-0.5 transition-all" />
+        <ArrowRight className="w-3.5 h-3.5 shrink-0 text-zinc-400 dark:text-zinc-600 group-hover:text-emerald-500 group-hover:translate-x-0.5 transition-all" />
       </div>
     </Link>
   );

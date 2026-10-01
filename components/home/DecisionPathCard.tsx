@@ -27,7 +27,7 @@ const DecisionPathCard: React.FC<{ lang: Language; example?: Topic }> = ({ lang,
               <div className="text-2xl font-extrabold text-zinc-900 dark:text-white tabular-nums leading-none">
                 {WORKFLOW.length}
               </div>
-              <div className="text-[10px] font-mono uppercase tracking-wider text-zinc-400 dark:text-zinc-500 mt-1">
+              <div className="text-[10px] font-mono uppercase tracking-wider text-zinc-500 dark:text-zinc-500 mt-1">
                 {t('home.stepsLabel')}
               </div>
             </div>
@@ -45,7 +45,7 @@ const DecisionPathCard: React.FC<{ lang: Language; example?: Topic }> = ({ lang,
               </span>
               <div className="min-w-0 flex-1">
                 <div className="flex items-baseline gap-2">
-                  <span className="text-[10px] font-mono font-semibold text-zinc-400 dark:text-zinc-600 tabular-nums">
+                  <span className="text-[10px] font-mono font-semibold text-zinc-500 dark:text-zinc-500 tabular-nums">
                     {stepNumber(idx + 1)}
                   </span>
                   <span className="text-[11px] font-semibold text-zinc-500 dark:text-zinc-400">

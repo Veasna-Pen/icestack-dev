@@ -5,7 +5,14 @@ import { COLLECTION_IDS, KNOWLEDGE_PATH_PATTERN, isCollectionId } from '../const
 import { COURSE_PATH_PATTERN, DEFAULT_LESSON_MINUTES } from '../constants/courses';
 import { DEFAULT_LANGUAGE, LANGUAGES } from '../constants/i18n';
 import { ROADMAP_IDS } from '../constants/roadmaps';
-import { CONTENT_LICENSE_URL, SHARE_IMAGE, SITE_NAME, SITE_URL } from '../constants/site';
+import {
+  CONTENT_LICENSE_URL,
+  SEARCH_ALTERNATE_NAMES,
+  SEARCH_SITE_NAME,
+  SHARE_IMAGE,
+  SITE_NAME,
+  SITE_URL
+} from '../constants/site';
 import { asDate, asNumber, asString, asStrings } from '../utils/frontmatter';
 import { collectionKey, roadmapKey } from '../utils/i18n';
 import {
@@ -20,7 +27,7 @@ import {
   roadmapsUrl,
   topicUrl
 } from '../utils/routes';
-import { absoluteUrl, metaDescription, pageTitle } from '../utils/seo';
+import { absoluteUrl, metaDescription } from '../utils/seo';
 import { readEntries } from './contentIndexPlugin';
 
 export interface SitePage {
@@ -152,8 +159,10 @@ export const sitePages = (root: string): SitePage[] => {
         {
           '@context': 'https://schema.org',
           '@type': 'WebSite',
-          name: SITE_NAME,
-          url: absoluteUrl(homeUrl(lang)),
+          name: SEARCH_SITE_NAME,
+          alternateName: SEARCH_ALTERNATE_NAMES,
+          // Google reads a site name only from the domain root, so every home page names that URL.
+          url: absoluteUrl('/'),
           inLanguage: lang,
           description: metaDescription(t(lang, 'home.heroLead')),
           publisher: organization
@@ -165,7 +174,7 @@ export const sitePages = (root: string): SitePage[] => {
   const navPage = (url: (lang: Language) => string, label: string, lead: string): void =>
     addStatic(
       url,
-      lang => pageTitle(t(lang, label)),
+      lang => t(lang, label),
       lang => t(lang, lead),
       lang => [home(lang), [t(lang, label), url(lang)]]
     );
@@ -178,7 +187,7 @@ export const sitePages = (root: string): SitePage[] => {
   for (const id of ROADMAP_IDS as readonly RoadmapId[]) {
     addStatic(
       lang => roadmapUrl(lang, id),
-      lang => pageTitle(t(lang, roadmapKey(id, 'label'))),
+      lang => t(lang, roadmapKey(id, 'label')),
       lang => t(lang, roadmapKey(id, 'summary')),
       lang => [
         home(lang),
@@ -191,7 +200,7 @@ export const sitePages = (root: string): SitePage[] => {
   for (const id of COLLECTION_IDS) {
     addStatic(
       lang => collectionUrl(lang, id),
-      lang => pageTitle(t(lang, collectionKey(id, 'label'))),
+      lang => t(lang, collectionKey(id, 'label')),
       lang => t(lang, collectionKey(id, 'description')),
       lang => [home(lang), [t(lang, collectionKey(id, 'label')), collectionUrl(lang, id)]]
     );
@@ -215,7 +224,7 @@ export const sitePages = (root: string): SitePage[] => {
       pages.push({
         path: url(lang),
         lang,
-        title: pageTitle(page.title),
+        title: page.title,
         description,
         canonical: url(shown),
         alternates: availableIn(byLang, url),
@@ -274,7 +283,7 @@ export const sitePages = (root: string): SitePage[] => {
       pages.push({
         path: url(lang),
         lang,
-        title: pageTitle(page.title),
+        title: page.title,
         description,
         canonical: url(shown),
         alternates: availableIn(byLang, url),
@@ -306,7 +315,7 @@ export const sitePages = (root: string): SitePage[] => {
         pages.push({
           path: lessonPath(lang),
           lang,
-          title: pageTitle(`${page.title} · ${course.page.title}`),
+          title: `${page.title} · ${course.page.title}`,
           description,
           canonical: lessonPath(shown),
           alternates: availableIn(lessonByLang, lessonPath),

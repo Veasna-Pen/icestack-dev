@@ -46,7 +46,7 @@ const CommunityMenu: React.FC<{ lang: Language }> = ({ lang }) => {
             <span className="block text-[12px] text-zinc-600 dark:text-zinc-400">
               {t('header.menu.translateLabel', { count: waiting })}
             </span>
-            <span className="mt-3 inline-flex items-center gap-1 text-[12px] font-semibold text-emerald-600 dark:text-emerald-400">
+            <span className="mt-3 inline-flex items-center gap-1 text-[12px] font-semibold text-emerald-700 dark:text-emerald-400">
               {t('header.menu.translateCta')}
               <ArrowRight className="w-3.5 h-3.5 group-hover:translate-x-0.5 transition-transform" />
             </span>

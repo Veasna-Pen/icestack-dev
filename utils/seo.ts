@@ -1,8 +1,8 @@
-import { SITE_NAME, SITE_URL } from '../constants/site';
+import { SEARCH_SITE_NAME, SITE_URL } from '../constants/site';
 
 const DESCRIPTION_MAX = 160;
 
-export const pageTitle = (name: string): string => `${name} · ${SITE_NAME}`;
+export const pageTitle = (name: string): string => `${name} | ${SEARCH_SITE_NAME}`;
 
 export const absoluteUrl = (path: string): string => `${SITE_URL}${path}`;
 

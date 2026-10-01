@@ -95,7 +95,7 @@ const Header: React.FC<HeaderProps> = ({
               {t(navLabelKey(id))}
             </Link>
             {i < PRIMARY_NAV.length - 1 && (
-              <ChevronRight aria-hidden="true" className="w-3 h-3 shrink-0 text-zinc-300 dark:text-zinc-700" />
+              <ChevronRight aria-hidden="true" className="w-3 h-3 shrink-0 text-zinc-400 dark:text-zinc-600" />
             )}
           </React.Fragment>
         );
@@ -171,7 +171,7 @@ const Header: React.FC<HeaderProps> = ({
           >
             <span className="flex items-center gap-2 truncate">
               <Search className="w-3.5 h-3.5 text-zinc-400 group-hover:text-zinc-600 dark:group-hover:text-zinc-300 transition-colors shrink-0" />
-              <span className="truncate text-xs text-zinc-400 dark:text-zinc-500 font-medium">
+              <span className="truncate text-xs text-zinc-500 dark:text-zinc-400 font-medium">
                 {t('common.search')}
               </span>
             </span>

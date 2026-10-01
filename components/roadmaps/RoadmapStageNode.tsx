@@ -72,7 +72,7 @@ const RoadmapStageNode: React.FC<RoadmapStageNodeProps> = ({
           onClick={onToggleExpanded}
           aria-expanded={isExpanded}
           aria-controls={detailsId}
-          className={`mt-3 inline-flex items-center gap-1 text-[12px] font-semibold text-emerald-600 dark:text-emerald-400 hover:text-emerald-500 transition-colors cursor-pointer ${radius.chip} ${focusRing}`}
+          className={`mt-3 inline-flex items-center gap-1 text-[12px] font-semibold text-emerald-700 dark:text-emerald-400 hover:text-emerald-500 transition-colors cursor-pointer ${radius.chip} ${focusRing}`}
         >
           {isExpanded ? t('roadmaps.hideDetails') : t('roadmaps.showDetails')}
           <ChevronDown className={`w-3.5 h-3.5 transition-transform ${isExpanded ? 'rotate-180' : ''}`} />

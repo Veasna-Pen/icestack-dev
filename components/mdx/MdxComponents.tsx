@@ -134,7 +134,7 @@ export const mdxComponents = {
         href={href}
         target={isExternal ? '_blank' : undefined}
         rel={isExternal ? 'noopener noreferrer' : undefined}
-        className="text-emerald-600 dark:text-emerald-400 hover:underline font-medium inline-flex items-center gap-1"
+        className="text-emerald-700 dark:text-emerald-400 hover:underline font-medium inline-flex items-center gap-1"
         {...props}
       >
         <span>{children}</span>
@@ -185,7 +185,7 @@ export const mdxComponents = {
     if (!className) {
       return (
         <code
-          className="px-1.5 py-0.5 rounded-md bg-zinc-100 dark:bg-zinc-800/80 text-emerald-600 dark:text-emerald-400 font-mono text-[0.875em] border border-zinc-200/60 dark:border-zinc-700/50"
+          className="px-1.5 py-0.5 rounded-md bg-zinc-100 dark:bg-zinc-800/80 text-emerald-700 dark:text-emerald-400 font-mono text-[0.875em] border border-zinc-200/60 dark:border-zinc-700/50"
           {...props}
         >
           {children}

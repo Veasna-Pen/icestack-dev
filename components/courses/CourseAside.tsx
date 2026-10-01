@@ -68,7 +68,7 @@ const CourseAside: React.FC<{ course: Course; lang: Language }> = ({ course, lan
                       {topic.title}
                     </span>
                   </span>
-                  <ArrowUpRight className="w-3.5 h-3.5 mt-1 shrink-0 text-zinc-300 dark:text-zinc-600 group-hover:text-emerald-500" />
+                  <ArrowUpRight className="w-3.5 h-3.5 mt-1 shrink-0 text-zinc-400 dark:text-zinc-600 group-hover:text-emerald-500" />
                 </Link>
               </li>
             ))}

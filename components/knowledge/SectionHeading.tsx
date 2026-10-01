@@ -54,7 +54,7 @@ export const makeSectionHeading = (lang: Language): React.FC<HeadingProps> => {
         <h2 className="flex flex-wrap items-baseline gap-x-2.5 text-2xl font-bold tracking-tight text-zinc-900 dark:text-zinc-100">
           <span>{label}</span>
           {lang === 'km' && (
-            <span className="text-xs font-mono font-medium text-zinc-400 dark:text-zinc-500">
+            <span className="text-xs font-mono font-medium text-zinc-500 dark:text-zinc-500">
               {englishHeading(section.key)}
             </span>
           )}

@@ -26,7 +26,7 @@ const components: Components = {
       {...props}
       target="_blank"
       rel="noopener noreferrer"
-      className="font-medium text-emerald-600 dark:text-emerald-400 underline underline-offset-2 decoration-emerald-500/40 hover:decoration-emerald-500"
+      className="font-medium text-emerald-700 dark:text-emerald-400 underline underline-offset-2 decoration-emerald-500/40 hover:decoration-emerald-500"
     />
   ),
   table: ({ node, ...props }) => (

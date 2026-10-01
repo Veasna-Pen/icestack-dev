@@ -31,7 +31,9 @@ const TranslateSection: React.FC<{ lang: Language }> = ({ lang }) => {
           <h3 className="text-[15px] font-bold text-zinc-900 dark:text-white">
             {t('contribute.translate.queueTitle')}
           </h3>
-          <span className="text-[11px] font-mono text-zinc-400 tabular-nums">{reviewQueue.length}</span>
+          <span className="text-[11px] font-mono text-zinc-500 dark:text-zinc-400 tabular-nums">
+            {reviewQueue.length}
+          </span>
         </div>
         {reviewQueue.length === 0 ? (
           <p className="px-5 py-6 text-sm text-zinc-500">{t('contribute.translate.allReviewed')}</p>
@@ -49,7 +51,7 @@ const TranslateSection: React.FC<{ lang: Language }> = ({ lang }) => {
                     <span className="block text-[13px] font-medium text-zinc-800 dark:text-zinc-200 truncate group-hover:text-emerald-600 dark:group-hover:text-emerald-400">
                       {item.title}
                     </span>
-                    <span className="block text-[11px] font-mono text-zinc-400 truncate">
+                    <span className="block text-[11px] font-mono text-zinc-500 dark:text-zinc-400 truncate">
                       {item.folder.replace(/^knowledge\//, '')}
                     </span>
                   </span>
@@ -65,7 +67,7 @@ const TranslateSection: React.FC<{ lang: Language }> = ({ lang }) => {
                         ? t('contribute.translate.draft')
                         : t('contribute.translate.notTranslated')}
                     </span>
-                    <ArrowUpRight className="w-3.5 h-3.5 text-zinc-300 dark:text-zinc-600 group-hover:text-emerald-500" />
+                    <ArrowUpRight className="w-3.5 h-3.5 text-zinc-400 dark:text-zinc-600 group-hover:text-emerald-500" />
                   </span>
                 </a>
               </li>
